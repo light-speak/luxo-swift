@@ -50,16 +50,17 @@ public struct Encoder {
     public mutating func writeField(_ fieldID: Int, value: Any, type: String) {
         writeVarint(UInt64(fieldID))
         switch type {
-        case "Int":
+        case "Int", "Duration":
             writeSvarint(value as? Int64 ?? Int64(value as? Int ?? 0))
         case "Float":
             writeFixed64(value as? Double ?? 0)
         case "Boolean":
             writeBool(value as? Bool ?? false)
-        case "String":
+        case "String", "Enum", "UUID", "Decimal":
+            writeString(value as? String ?? "")
+        case "DateTime":
             writeString(value as? String ?? "")
         default:
-            // Complex type — skip for now
             break
         }
     }

@@ -134,16 +134,25 @@ public final class LuxoCodegen {
             let swiftReturn = mapType(returnType, nullable: false, list: api.returnList ?? false)
             let hasModel = schema.models[returnType] != nil
 
-            // Build params
+            // Build params — page/pageSize always optional for list APIs
+            let isPaginated = api.name.hasPrefix("list") && (api.paginated ?? false)
+            let paginationNames: Set<String> = ["page", "pageSize"]
             var paramList = ""
             var paramMap = ""
             if let params = api.params {
                 let parts = params.map { p in
-                    let t = mapType(p.type, nullable: !(p.required ?? true), list: false)
-                    return "\(p.name): \(t)"
+                    let forceOptional = isPaginated && paginationNames.contains(p.name)
+                    let nullable = forceOptional || !(p.required ?? true)
+                    let t = mapType(p.type, nullable: nullable, list: false)
+                    return "\(p.name): \(t)\(nullable ? " = nil" : "")"
                 }
                 paramList = parts.joined(separator: ", ")
-                paramMap = params.map { "\"\($0.name)\": \($0.name)" }.joined(separator: ", ")
+                paramMap = params.map { p in
+                    if isPaginated && paginationNames.contains(p.name) {
+                        return "\"\(p.name)\": \(p.name) as Any"
+                    }
+                    return "\"\(p.name)\": \(p.name)"
+                }.joined(separator: ", ")
             }
 
             out += "    public func \(api.name)(\(paramList)) async throws -> \(swiftReturn) {\n"
