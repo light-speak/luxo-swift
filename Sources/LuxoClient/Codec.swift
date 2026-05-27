@@ -43,8 +43,22 @@ public struct Encoder {
         data.append(value)
     }
 
+    /// Write a fixed 16-byte UUID without a length prefix.
+    public mutating func writeUUID(_ value: UUID) {
+        let u = value.uuid
+        data.append(contentsOf: [
+            u.0, u.1, u.2, u.3, u.4, u.5, u.6, u.7,
+            u.8, u.9, u.10, u.11, u.12, u.13, u.14, u.15,
+        ])
+    }
+
     public mutating func writeEnd() {
         data.append(0x00)
+    }
+
+    /// Write the array header (varint element count).
+    public mutating func writeArrayHeader(_ count: Int) {
+        writeVarint(UInt64(count))
     }
 
     public mutating func writeField(_ fieldID: Int, value: Any, type: String) {
@@ -56,12 +70,50 @@ public struct Encoder {
             writeFixed64(value as? Double ?? 0)
         case "Boolean":
             writeBool(value as? Bool ?? false)
-        case "String", "Enum", "UUID", "Decimal":
+        case "UUID":
+            // UUID is a fixed 16-byte value; accept Foundation.UUID or canonical string.
+            if let u = value as? UUID {
+                writeUUID(u)
+            } else if let s = value as? String, let u = UUID(uuidString: s) {
+                writeUUID(u)
+            } else {
+                writeUUID(UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)))
+            }
+        case "String", "Enum", "Decimal":
             writeString(value as? String ?? "")
         case "DateTime":
             writeString(value as? String ?? "")
         default:
             break
+        }
+    }
+
+    /// Write a list param field: [fieldID][varint count][item0][item1]...
+    /// Each item is encoded by its element type (no per-item field ID).
+    public mutating func writeFieldList(_ fieldID: Int, values: [Any], type: String) {
+        writeVarint(UInt64(fieldID))
+        writeArrayHeader(values.count)
+        for value in values {
+            switch type {
+            case "Int", "Duration", "DateTime":
+                writeSvarint(value as? Int64 ?? Int64(value as? Int ?? 0))
+            case "Float":
+                writeFixed64(value as? Double ?? 0)
+            case "Boolean":
+                writeBool(value as? Bool ?? false)
+            case "UUID":
+                if let u = value as? UUID {
+                    writeUUID(u)
+                } else if let s = value as? String, let u = UUID(uuidString: s) {
+                    writeUUID(u)
+                } else {
+                    writeUUID(UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)))
+                }
+            case "Bytes":
+                writeBytes(value as? Data ?? Data())
+            default:
+                writeString(value as? String ?? "")
+            }
         }
     }
 }
@@ -126,6 +178,31 @@ public struct Decoder {
         let bytes = data[offset..<offset+len]
         offset += len
         return Data(bytes)
+    }
+
+    /// Read a fixed 16-byte UUID (no length prefix). Returns a zero UUID on truncation.
+    public mutating func readUUID() -> UUID {
+        guard offset + 16 <= data.count else {
+            return UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        }
+        let b = data[offset..<offset+16]
+        offset += 16
+        let a = Array(b)
+        return UUID(uuid: (
+            a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+            a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]
+        ))
+    }
+
+    /// Read a nullable UUID (null flag + 16 bytes).
+    public mutating func readUUIDPtr() -> UUID? {
+        if !readNullFlag() { return nil }
+        return readUUID()
+    }
+
+    /// Skip the arena header (totalStringLen varint) that prefixes each model's binary data.
+    public mutating func skipArenaHeader() {
+        _ = readVarint()
     }
 
     /// Read next field ID. Returns 0 for end marker.
@@ -330,6 +407,46 @@ public struct ColumnarDecoder {
         return result
     }
 
+    /// Read `count` fixed 16-byte UUID values.
+    public mutating func readColumnUUID() -> [UUID] {
+        var result = [UUID]()
+        result.reserveCapacity(count)
+        for _ in 0..<count {
+            result.append(readUUIDInternal())
+        }
+        return result
+    }
+
+    /// Read `count` nullable UUID values (0x00=null, 0x01+16 bytes).
+    public mutating func readColumnUUIDPtr() -> [UUID?] {
+        var result = [UUID?]()
+        result.reserveCapacity(count)
+        for _ in 0..<count {
+            guard off < data.count else { result.append(nil); continue }
+            let flag = data[off]; off += 1
+            if flag == 0x00 { result.append(nil); continue }
+            result.append(readUUIDInternal())
+        }
+        return result
+    }
+
+    /// Read `count` length-prefixed byte blobs.
+    /// Used for scalar array-field columns: each cell is an inline `[count][items...]`
+    /// array wrapped as a length-prefixed blob.
+    public mutating func readColumnBytes() -> [Data] {
+        var result = [Data]()
+        result.reserveCapacity(count)
+        for _ in 0..<count {
+            let len = Int(readVarintInternal())
+            if len == 0 { result.append(Data()); continue }
+            guard off + len <= data.count else { result.append(Data()); continue }
+            let bytes = data[off..<off+len]
+            off += len
+            result.append(Data(bytes))
+        }
+        return result
+    }
+
     /// Current read position (for reading pagination metadata after 0x00).
     public var offset: Int { off }
 
@@ -352,6 +469,19 @@ public struct ColumnarDecoder {
             shift += 7
         }
         return result
+    }
+
+    /// Read a fixed 16-byte UUID at the current position. Zero UUID on truncation.
+    private mutating func readUUIDInternal() -> UUID {
+        guard off + 16 <= data.count else {
+            return UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        }
+        let a = Array(data[off..<off+16])
+        off += 16
+        return UUID(uuid: (
+            a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+            a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]
+        ))
     }
 }
 

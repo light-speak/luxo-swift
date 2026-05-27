@@ -143,7 +143,7 @@ public final class LuxoCodegen {
                 let parts = params.map { p in
                     let forceOptional = isPaginated && paginationNames.contains(p.name)
                     let nullable = forceOptional || !(p.required ?? true)
-                    let t = mapType(p.type, nullable: nullable, list: false)
+                    let t = mapType(p.type, nullable: nullable, list: p.isList ?? false)
                     return "\(p.name): \(t)\(nullable ? " = nil" : "")"
                 }
                 paramList = parts.joined(separator: ", ")
@@ -204,6 +204,7 @@ public final class LuxoCodegen {
                 }
             }
 
+            out += "    decoder.skipArenaHeader()\n"
             out += "    while true {\n"
             out += "        let fieldID = decoder.nextField()\n"
             out += "        if fieldID == 0 { break }\n"
@@ -243,6 +244,7 @@ public final class LuxoCodegen {
             case "Float": return "decoder.readFloatPtr()"
             case "String": return "decoder.readStringPtr()"
             case "Boolean": return "decoder.readBoolPtr()"
+            case "UUID": return "decoder.readUUIDPtr()"
             default: return "decoder.readStringPtr()"
             }
         }
@@ -251,6 +253,7 @@ public final class LuxoCodegen {
         case "Float": return "decoder.readFixed64()"
         case "String": return "decoder.readString()"
         case "Boolean": return "decoder.readBool()"
+        case "UUID": return "decoder.readUUID()"
         default: return "decoder.readString()"
         }
     }
@@ -280,7 +283,8 @@ public final class LuxoCodegen {
             var paramsStr = "nil"
             if let params = api.params, !params.isEmpty {
                 let paramItems = params.enumerated().map { (idx, p) in
-                    "APISchema.ParamSchema(fieldID: \(idx + 1), name: \"\(p.name)\", type: \"\(p.type)\")"
+                    let isList = p.isList ?? false
+                    return "APISchema.ParamSchema(fieldID: \(idx + 1), name: \"\(p.name)\", type: \"\(p.type)\", isList: \(isList))"
                 }
                 paramsStr = "[\(paramItems.joined(separator: ", "))]"
             }

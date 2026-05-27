@@ -333,6 +333,207 @@ final class CodecTests: XCTestCase {
         data.append(contentsOf: bytes)
     }
 
+    // MARK: - UUID (fixed 16-byte)
+
+    func testUUIDRoundTrip() {
+        let uuid = UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!
+        var encoder = Encoder()
+        encoder.writeUUID(uuid)
+        // UUID must be exactly 16 bytes — no length prefix.
+        XCTAssertEqual(encoder.data.count, 16)
+        var decoder = Decoder(encoder.data)
+        XCTAssertEqual(decoder.readUUID(), uuid)
+        XCTAssertTrue(decoder.isAtEnd)
+    }
+
+    func testUUIDWireBytes() {
+        let uuid = UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!
+        var encoder = Encoder()
+        encoder.writeUUID(uuid)
+        XCTAssertEqual(encoder.data, Data([
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        ]))
+    }
+
+    func testUUIDTruncated() {
+        var decoder = Decoder(Data([0x01, 0x02, 0x03])) // < 16 bytes
+        let zero = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        XCTAssertEqual(decoder.readUUID(), zero)
+    }
+
+    func testUUIDPtr() {
+        let uuid = UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!
+        var encoder = Encoder()
+        encoder.writeBool(true) // present flag (0x01)
+        encoder.writeUUID(uuid)
+        encoder.writeBool(false) // null flag (0x00)
+        var decoder = Decoder(encoder.data)
+        XCTAssertEqual(decoder.readUUIDPtr(), uuid)
+        XCTAssertNil(decoder.readUUIDPtr())
+    }
+
+    func testWriteFieldUUID() {
+        let uuid = UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!
+        var encoder = Encoder()
+        encoder.writeField(7, value: uuid, type: "UUID")
+        var decoder = Decoder(encoder.data)
+        XCTAssertEqual(decoder.readVarint(), 7) // field ID
+        XCTAssertEqual(decoder.readUUID(), uuid)
+    }
+
+    func testWriteFieldUUIDFromString() {
+        let str = "01234567-89AB-CDEF-0123-456789ABCDEF"
+        var encoder = Encoder()
+        encoder.writeField(1, value: str, type: "UUID")
+        var decoder = Decoder(encoder.data)
+        _ = decoder.readVarint()
+        XCTAssertEqual(decoder.readUUID(), UUID(uuidString: str)!)
+    }
+
+    // MARK: - Scalar Arrays (row form)
+
+    func testUUIDArrayRowForm() {
+        let u1 = UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!
+        let u2 = UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!
+        var encoder = Encoder()
+        encoder.writeArrayHeader(2)
+        encoder.writeUUID(u1)
+        encoder.writeUUID(u2)
+        var decoder = Decoder(encoder.data)
+        let got = decoder.readArray { d in d.readUUID() }
+        XCTAssertEqual(got, [u1, u2])
+    }
+
+    func testStringArrayRowForm() {
+        var encoder = Encoder()
+        encoder.writeArrayHeader(3)
+        encoder.writeString("a")
+        encoder.writeString("b")
+        encoder.writeString("c")
+        var decoder = Decoder(encoder.data)
+        let got = decoder.readArray { d in d.readString() }
+        XCTAssertEqual(got, ["a", "b", "c"])
+    }
+
+    func testIntArrayRowForm() {
+        var encoder = Encoder()
+        encoder.writeArrayHeader(3)
+        encoder.writeSvarint(-1)
+        encoder.writeSvarint(0)
+        encoder.writeSvarint(42)
+        var decoder = Decoder(encoder.data)
+        let got = decoder.readArray { d in d.readSvarint() }
+        XCTAssertEqual(got, [-1, 0, 42])
+    }
+
+    func testFieldListUUID() {
+        let u1 = UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!
+        let u2 = UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!
+        var encoder = Encoder()
+        encoder.writeFieldList(3, values: [u1, u2], type: "UUID")
+        var decoder = Decoder(encoder.data)
+        XCTAssertEqual(decoder.readVarint(), 3) // field ID
+        let got = decoder.readArray { d in d.readUUID() }
+        XCTAssertEqual(got, [u1, u2])
+    }
+
+    func testFieldListInt() {
+        var encoder = Encoder()
+        encoder.writeFieldList(2, values: [Int64(1), Int64(-2), Int64(3)], type: "Int")
+        var decoder = Decoder(encoder.data)
+        XCTAssertEqual(decoder.readVarint(), 2)
+        let got = decoder.readArray { d in d.readSvarint() }
+        XCTAssertEqual(got, [1, -2, 3])
+    }
+
+    // MARK: - Columnar UUID + scalar-array cells
+
+    func testColumnarUUIDColumn() {
+        let u1 = UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!
+        let u2 = UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!
+        var enc = Encoder()
+        enc.writeVarint(2) // count
+        enc.writeVarint(1) // fieldID=1
+        enc.writeUUID(u1)
+        enc.writeUUID(u2)
+        enc.writeEnd()
+
+        var dec = ColumnarDecoder(data: enc.data)
+        XCTAssertEqual(dec.count, 2)
+        XCTAssertTrue(dec.nextColumn())
+        XCTAssertEqual(dec.readColumnUUID(), [u1, u2])
+        XCTAssertFalse(dec.nextColumn())
+    }
+
+    func testColumnarUUIDPtrColumn() {
+        let u1 = UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!
+        var enc = Encoder()
+        enc.writeVarint(3) // count
+        enc.writeVarint(1) // fieldID=1
+        enc.writeBool(false)          // null
+        enc.writeBool(true); enc.writeUUID(u1) // present
+        enc.writeBool(false)          // null
+        enc.writeEnd()
+
+        var dec = ColumnarDecoder(data: enc.data)
+        XCTAssertTrue(dec.nextColumn())
+        let got = dec.readColumnUUIDPtr()
+        XCTAssertNil(got[0])
+        XCTAssertEqual(got[1], u1)
+        XCTAssertNil(got[2])
+    }
+
+    func testColumnarScalarArrayCells() {
+        // A [String] field becomes a Bytes column: each cell is a length-prefixed
+        // blob containing an inline [count][items...] array.
+        var cell0 = Encoder()
+        cell0.writeArrayHeader(2)
+        cell0.writeString("x")
+        cell0.writeString("y")
+        var cell1 = Encoder()
+        cell1.writeArrayHeader(1)
+        cell1.writeString("z")
+
+        var enc = Encoder()
+        enc.writeVarint(2) // count
+        enc.writeVarint(1) // fieldID=1
+        enc.writeBytes(cell0.data) // length-prefixed blob
+        enc.writeBytes(cell1.data)
+        enc.writeEnd()
+
+        var dec = ColumnarDecoder(data: enc.data)
+        XCTAssertTrue(dec.nextColumn())
+        let cells = dec.readColumnBytes()
+        XCTAssertEqual(cells.count, 2)
+
+        var d0 = Decoder(cells[0])
+        XCTAssertEqual(d0.readArray { d in d.readString() }, ["x", "y"])
+        var d1 = Decoder(cells[1])
+        XCTAssertEqual(d1.readArray { d in d.readString() }, ["z"])
+    }
+
+    func testColumnarUUIDArrayCells() {
+        let u1 = UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!
+        let u2 = UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!
+        var cell0 = Encoder()
+        cell0.writeArrayHeader(2)
+        cell0.writeUUID(u1)
+        cell0.writeUUID(u2)
+
+        var enc = Encoder()
+        enc.writeVarint(1) // count
+        enc.writeVarint(1) // fieldID=1
+        enc.writeBytes(cell0.data)
+        enc.writeEnd()
+
+        var dec = ColumnarDecoder(data: enc.data)
+        XCTAssertTrue(dec.nextColumn())
+        let cells = dec.readColumnBytes()
+        var d0 = Decoder(cells[0])
+        XCTAssertEqual(d0.readArray { d in d.readUUID() }, [u1, u2])
+    }
+
     func testMultipleStrings() {
         var encoder = Encoder()
         encoder.writeString("alpha")

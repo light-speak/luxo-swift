@@ -24,6 +24,19 @@ public struct APISchema: Sendable {
         public let fieldID: Int
         public let name: String
         public let type: String
+        public let isList: Bool
+
+        public init(fieldID: Int, name: String, type: String, isList: Bool = false) {
+            self.fieldID = fieldID
+            self.name = name
+            self.type = type
+            self.isList = isList
+        }
+    }
+
+    public init(id: Int, params: [ParamSchema]?) {
+        self.id = id
+        self.params = params
     }
 }
 
@@ -133,7 +146,11 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
         if let params = params, let paramSchemas = apiSchema.params {
             for ps in paramSchemas {
                 if let value = params[ps.name] {
-                    encoder.writeField(ps.fieldID, value: value, type: ps.type)
+                    if ps.isList, let arr = value as? [Any] {
+                        encoder.writeFieldList(ps.fieldID, values: arr, type: ps.type)
+                    } else {
+                        encoder.writeField(ps.fieldID, value: value, type: ps.type)
+                    }
                 }
             }
         }

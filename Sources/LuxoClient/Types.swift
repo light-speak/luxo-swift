@@ -65,4 +65,5 @@ public struct LuxoParam: Codable, Sendable {
     public let name: String
     public let type: String
     public let required: Bool?
+    public let isList: Bool?
 }
