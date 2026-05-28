@@ -82,7 +82,19 @@ public struct Encoder {
         case "String", "Enum", "Decimal":
             writeString(value as? String ?? "")
         case "DateTime":
-            writeString(value as? String ?? "")
+            // Per protocol: DateTime = svarint(unix seconds). Accept Date or ISO string.
+            let sec: Int64
+            if let d = value as? Date {
+                sec = Int64(d.timeIntervalSince1970)
+            } else if let s = value as? String,
+                      let d = ISO8601DateFormatter().date(from: s) {
+                sec = Int64(d.timeIntervalSince1970)
+            } else if let i = value as? Int64 {
+                sec = i
+            } else {
+                sec = 0
+            }
+            writeSvarint(sec)
         default:
             break
         }
@@ -199,6 +211,37 @@ public struct Decoder {
         if !readNullFlag() { return nil }
         return readUUID()
     }
+
+    // MARK: - DateTime
+
+    /// Read a DateTime field: svarint(unix seconds) → RFC3339/ISO-8601 UTC `String`.
+    ///
+    /// Go's wire format (`FieldDateTime`) is an int64 unix timestamp; in JSON mode Go
+    /// emits the same instant as an RFC3339 string. Converting here keeps the DateTime
+    /// field type identical (`String`) across JSON and binary modes, matching the
+    /// TS/Dart/Kotlin SDKs.
+    public mutating func readDateTime() -> String {
+        return Decoder.dateTimeString(fromUnixSeconds: readSvarint())
+    }
+
+    /// Read a nullable DateTime field (null flag + svarint(unix seconds)) → `String?`.
+    public mutating func readDateTimePtr() -> String? {
+        if !readNullFlag() { return nil }
+        return Decoder.dateTimeString(fromUnixSeconds: readSvarint())
+    }
+
+    /// Format unix seconds as an RFC3339/ISO-8601 UTC string (e.g. `2021-07-14T02:40:00Z`).
+    static func dateTimeString(fromUnixSeconds seconds: Int64) -> String {
+        let date = Date(timeIntervalSince1970: TimeInterval(seconds))
+        return Decoder.iso8601Formatter.string(from: date)
+    }
+
+    private static let iso8601Formatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        f.timeZone = TimeZone(secondsFromGMT: 0)
+        return f
+    }()
 
     /// Skip the arena header (totalStringLen varint) that prefixes each model's binary data.
     public mutating func skipArenaHeader() {
@@ -445,6 +488,19 @@ public struct ColumnarDecoder {
             result.append(Data(bytes))
         }
         return result
+    }
+
+    /// Read `count` DateTime values (svarint unix seconds) as RFC3339/ISO-8601 strings.
+    /// DateTime columns are Int columns on the wire; convert to match JSON mode.
+    public mutating func readColumnDateTime() -> [String] {
+        let seconds = readColumnInt()
+        return seconds.map { Decoder.dateTimeString(fromUnixSeconds: $0) }
+    }
+
+    /// Read `count` nullable DateTime values (0x00=null, 0x01+svarint seconds) as `String?`.
+    public mutating func readColumnDateTimePtr() -> [String?] {
+        let seconds = readColumnIntPtr()
+        return seconds.map { $0.map { Decoder.dateTimeString(fromUnixSeconds: $0) } }
     }
 
     /// Current read position (for reading pagination metadata after 0x00).

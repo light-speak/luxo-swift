@@ -544,4 +544,108 @@ final class CodecTests: XCTestCase {
         XCTAssertEqual(decoder.readString(), "beta")
         XCTAssertEqual(decoder.readString(), "gamma")
     }
+
+    // MARK: - DateTime decode (svarint unix seconds -> RFC3339 String)
+
+    func testReadDateTimeEpoch() {
+        // unix 0 = 1970-01-01T00:00:00Z
+        var encoder = Encoder()
+        encoder.writeSvarint(0)
+        var decoder = Decoder(encoder.data)
+        XCTAssertEqual(decoder.readDateTime(), "1970-01-01T00:00:00Z")
+    }
+
+    func testReadDateTimeKnownTimestamp() {
+        // unix 1626230400 = 2021-07-14T02:40:00Z
+        var encoder = Encoder()
+        encoder.writeSvarint(1_626_230_400)
+        var decoder = Decoder(encoder.data)
+        XCTAssertEqual(decoder.readDateTime(), "2021-07-14T02:40:00Z")
+    }
+
+    func testReadDateTimePtrPresent() {
+        var encoder = Encoder()
+        encoder.writeBool(true) // null flag = present
+        encoder.writeSvarint(1_626_230_400)
+        var decoder = Decoder(encoder.data)
+        XCTAssertEqual(decoder.readDateTimePtr(), "2021-07-14T02:40:00Z")
+    }
+
+    func testReadDateTimePtrNull() {
+        var encoder = Encoder()
+        encoder.writeBool(false) // null flag = absent
+        var decoder = Decoder(encoder.data)
+        XCTAssertNil(decoder.readDateTimePtr())
+    }
+
+    // MARK: - Duration decode (svarint nanoseconds -> Int64 raw nanos)
+
+    func testReadDurationSvarint() {
+        // 1.5s = 1_500_000_000 ns; decoded as raw nanoseconds (Int64), matching JSON mode.
+        var encoder = Encoder()
+        encoder.writeSvarint(1_500_000_000)
+        var decoder = Decoder(encoder.data)
+        XCTAssertEqual(decoder.readSvarint(), 1_500_000_000)
+    }
+
+    func testReadDurationPtr() {
+        var encoder = Encoder()
+        encoder.writeBool(true)
+        encoder.writeSvarint(250_000_000) // 0.25s in nanos
+        var decoder = Decoder(encoder.data)
+        XCTAssertEqual(decoder.readIntPtr(), 250_000_000)
+
+        var enc2 = Encoder()
+        enc2.writeBool(false)
+        var dec2 = Decoder(enc2.data)
+        XCTAssertNil(dec2.readIntPtr())
+    }
+
+    // MARK: - Columnar DateTime / Duration
+
+    func testColumnarDateTimeColumn() {
+        var enc = Encoder()
+        enc.writeArrayHeader(2) // row count
+        enc.writeVarint(7)      // field ID
+        enc.writeSvarint(0)
+        enc.writeSvarint(1_626_230_400)
+        enc.writeEnd()
+
+        var dec = ColumnarDecoder(data: enc.data)
+        XCTAssertEqual(dec.count, 2)
+        XCTAssertTrue(dec.nextColumn())
+        XCTAssertEqual(dec.fieldID, 7)
+        XCTAssertEqual(dec.readColumnDateTime(), ["1970-01-01T00:00:00Z", "2021-07-14T02:40:00Z"])
+    }
+
+    func testColumnarDateTimePtrColumn() {
+        var enc = Encoder()
+        enc.writeArrayHeader(2)
+        enc.writeVarint(7)
+        enc.writeBool(false) // null
+        enc.writeBool(true)  // present
+        enc.writeSvarint(1_626_230_400)
+        enc.writeEnd()
+
+        var dec = ColumnarDecoder(data: enc.data)
+        _ = dec.nextColumn()
+        let got = dec.readColumnDateTimePtr()
+        XCTAssertEqual(got.count, 2)
+        XCTAssertNil(got[0])
+        XCTAssertEqual(got[1], "2021-07-14T02:40:00Z")
+    }
+
+    func testColumnarDurationColumn() {
+        // Duration columns are plain Int columns (raw nanoseconds).
+        var enc = Encoder()
+        enc.writeArrayHeader(2)
+        enc.writeVarint(8)
+        enc.writeSvarint(1_500_000_000)
+        enc.writeSvarint(250_000_000)
+        enc.writeEnd()
+
+        var dec = ColumnarDecoder(data: enc.data)
+        _ = dec.nextColumn()
+        XCTAssertEqual(dec.readColumnInt(), [1_500_000_000, 250_000_000])
+    }
 }

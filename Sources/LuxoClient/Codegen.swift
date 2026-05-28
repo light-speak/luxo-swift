@@ -245,6 +245,10 @@ public final class LuxoCodegen {
             case "String": return "decoder.readStringPtr()"
             case "Boolean": return "decoder.readBoolPtr()"
             case "UUID": return "decoder.readUUIDPtr()"
+            // DateTime: svarint(unix seconds) → RFC3339/ISO-8601 String? (matches JSON mode)
+            case "DateTime": return "decoder.readDateTimePtr()"
+            // Duration: svarint(nanoseconds) → Int64? raw nanos (matches JSON mode)
+            case "Duration": return "decoder.readIntPtr()"
             default: return "decoder.readStringPtr()"
             }
         }
@@ -254,6 +258,10 @@ public final class LuxoCodegen {
         case "String": return "decoder.readString()"
         case "Boolean": return "decoder.readBool()"
         case "UUID": return "decoder.readUUID()"
+        // DateTime: svarint(unix seconds) → RFC3339/ISO-8601 String (matches JSON mode)
+        case "DateTime": return "decoder.readDateTime()"
+        // Duration: svarint(nanoseconds) → Int64 raw nanos (matches JSON mode)
+        case "Duration": return "decoder.readSvarint()"
         default: return "decoder.readString()"
         }
     }
@@ -266,7 +274,10 @@ public final class LuxoCodegen {
         case "Float": return "0.0"
         case "String": return "\"\""
         case "Boolean": return "false"
-        case "DateTime": return "Date()"
+        // DateTime is an RFC3339 String — default to empty string like other strings.
+        case "DateTime": return "\"\""
+        // Duration is raw nanoseconds (Int64).
+        case "Duration": return "0"
         case "UUID": return "UUID()"
         default: return "\"\""
         }
@@ -302,8 +313,13 @@ public final class LuxoCodegen {
         case "Float": base = "Double"
         case "String": base = "String"
         case "Boolean": base = "Bool"
-        case "DateTime": base = "Date"
-        case "Duration": base = "TimeInterval"
+        // DateTime surfaces as an RFC3339/ISO-8601 String in both JSON and binary
+        // modes (Go emits an RFC3339 string in JSON, svarint(unix seconds) in binary
+        // which the decoder converts to the same string). Matches TS/Dart/Kotlin SDKs.
+        case "DateTime": base = "String"
+        // Duration surfaces as raw nanoseconds (Int64) in both modes (Go emits a
+        // nanosecond number in JSON, svarint(nanos) in binary). Matches other SDKs.
+        case "Duration": base = "Int64"
         case "UUID": base = "UUID"
         default: base = type
         }
