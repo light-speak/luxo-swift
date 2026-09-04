@@ -103,12 +103,12 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(decoders.contains("decodeColumnarPayload(_ data: Data) throws -> [Payload]"))
         XCTAssertTrue(decoders.contains("decodePaginatedPayload(_ data: Data) throws -> Page<Payload>"))
         XCTAssertTrue(decoders.contains("readColumnBytes()"))
-        XCTAssertTrue(client.contains("return try decodeColumnarPayload(rawData)"))
-        XCTAssertTrue(client.contains("return try decodePaginatedPayload(rawData)"))
+        XCTAssertTrue(client.contains("return try decodeColumnarPayload(result)"))
+        XCTAssertTrue(client.contains("return try decodePaginatedPayload(result)"))
         XCTAssertTrue(client.contains("async throws -> Page<Payload>"))
         XCTAssertTrue(client.contains("filters: [LuxoFilter]? = nil, sorters: [LuxoSorter]? = nil"))
-        XCTAssertTrue(client.contains("callParams[\"$filters\"] = filters.map(\\.jsonObject)"))
-        XCTAssertTrue(client.contains("callParams[\"$sorters\"] = sorters.map(\\.jsonObject)"))
+        XCTAssertTrue(client.contains("callParams[\"$filters\"] = .array(filters.map(\\.transportValue))"))
+        XCTAssertTrue(client.contains("callParams[\"$sorters\"] = .array(sorters.map(\\.transportValue))"))
     }
 
     func testClientKeepsStructuredParamsStronglyTypedAndJSONEncodesThem() throws {
@@ -139,9 +139,9 @@ final class CodegenTests: XCTestCase {
         let source = try makeCodegen().generateClient(schema)
 
         XCTAssertTrue(source.contains("input: CreateInput"))
-        XCTAssertTrue(source.contains("try jsonValue(input)"))
+        XCTAssertTrue(source.contains("try LuxoValue.encode(input)"))
         XCTAssertTrue(source.contains("input: CreateInput, select: String? = nil"))
-        XCTAssertTrue(source.contains("callParams[\"$select\"] = select"))
+        XCTAssertTrue(source.contains("callParams[\"$select\"] = .string(select)"))
     }
 
     func testClientDistinguishesRequiredNullFromAbsentPatchValue() throws {
@@ -170,8 +170,9 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(source.contains("note: String?"))
         XCTAssertFalse(source.contains("note: String? = nil"))
         XCTAssertTrue(source.contains("caption: LuxoOptional<String> = .absent"))
-        XCTAssertTrue(
-            source.contains("case .present(let value): callParams[\"caption\"] = value.map { $0 as Any } ?? NSNull()"))
+        XCTAssertTrue(source.contains("case .present(let value):"))
+        XCTAssertTrue(source.contains("callParams[\"caption\"] = try LuxoValue.encode(value)"))
+        XCTAssertTrue(source.contains("callParams[\"caption\"] = .null"))
     }
 
     func testClientGeneratesTypedStreamSubscription() throws {
@@ -201,7 +202,7 @@ final class CodegenTests: XCTestCase {
 
         XCTAssertTrue(
             source.contains(
-                "public func subscribeWatchOrders(status: String, select: String? = nil, handler: @escaping (OrderEvent) -> Void) async throws -> () -> Void"
+                "public func subscribeWatchOrders(status: String, select: String? = nil, handler: @escaping @Sendable (OrderEvent) -> Void) async throws -> () -> Void"
             ))
         XCTAssertTrue(source.contains("try await transport.subscribe(\"watchOrders\", params: callParams)"))
         XCTAssertTrue(source.contains("guard let decoded = try? decodeOrderEvent(&decoder) else { return }"))

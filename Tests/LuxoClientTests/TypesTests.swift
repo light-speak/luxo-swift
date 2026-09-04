@@ -2,6 +2,13 @@ import XCTest
 @testable import LuxoClient
 
 final class TypesTests: XCTestCase {
+    private struct EncodedInput: Codable, Sendable {
+        let count: Int64
+        let ratio: Double
+        let enabled: Bool
+        let names: [String]
+    }
+
     private struct SelectedRecord: Codable {
         let name: Selected<String>
         let note: Selected<String?>
@@ -37,6 +44,50 @@ final class TypesTests: XCTestCase {
         let data = try JSONEncoder().encode(value)
 
         XCTAssertEqual(try JSONDecoder().decode(JSONValue.self, from: data), value)
+    }
+
+    func testLuxoValueIsSendableAndPreservesWireTypes() throws {
+        let value = LuxoValue.object([
+            "null": .null,
+            "bool": .bool(true),
+            "int": .int(9_007_199_254_740_993),
+            "float": .float(1.5),
+            "string": .string("luxo"),
+            "bytes": .bytes(Data([0, 1, 2])),
+            "array": .array([.int(1), .string("two")]),
+        ])
+
+        func requireSendable<T: Sendable>(_: T) {}
+        requireSendable(value)
+        let wireValue = try LuxoValue.decodeJSONData(value.jsonData())
+        XCTAssertEqual(
+            wireValue,
+            .object([
+                "null": .null,
+                "bool": .bool(true),
+                "int": .int(9_007_199_254_740_993),
+                "float": .float(1.5),
+                "string": .string("luxo"),
+                "bytes": .string("AAEC"),
+                "array": .array([.int(1), .string("two")]),
+            ])
+        )
+    }
+
+    func testLuxoValueEncodesStructuredInputsWithoutLosingIntegers() throws {
+        let value = try LuxoValue.encode(
+            EncodedInput(count: 9_007_199_254_740_993, ratio: 1.25, enabled: true, names: ["a", "b"])
+        )
+
+        XCTAssertEqual(
+            value,
+            .object([
+                "count": .int(9_007_199_254_740_993),
+                "ratio": .float(1.25),
+                "enabled": .bool(true),
+                "names": .array([.string("a"), .string("b")]),
+            ])
+        )
     }
 
     func testPageCanBeConstructedAndDecoded() throws {

@@ -103,6 +103,119 @@ public enum JSONValue: Codable, Sendable, Equatable {
     }
 }
 
+/// Sendable value representation used at transport boundaries.
+///
+/// Unlike `Any`, this preserves integer precision and makes values safe to move
+/// between Swift concurrency domains. Binary payloads remain raw `Data`.
+public enum LuxoValue: Sendable, Equatable {
+    case null
+    case bool(Bool)
+    case int(Int64)
+    case float(Double)
+    case string(String)
+    case bytes(Data)
+    case array([LuxoValue])
+    case object([String: LuxoValue])
+
+    public init(_ value: Int) { self = .int(Int64(value)) }
+    public init(_ value: Int64) { self = .int(value) }
+    public init(_ value: Double) { self = .float(value) }
+    public init(_ value: String) { self = .string(value) }
+    public init(_ value: Bool) { self = .bool(value) }
+    public init(_ value: Data) { self = .bytes(value) }
+    public init(_ value: UUID) { self = .string(value.uuidString) }
+
+    public init(_ value: JSONValue) {
+        switch value {
+        case .null: self = .null
+        case .bool(let value): self = .bool(value)
+        case .number(let value): self = .float(value)
+        case .string(let value): self = .string(value)
+        case .array(let values): self = .array(values.map(LuxoValue.init))
+        case .object(let values): self = .object(values.mapValues(LuxoValue.init))
+        }
+    }
+
+    public static func encode<Value: Encodable & Sendable>(_ value: Value) throws -> LuxoValue {
+        try decodeJSONData(JSONEncoder().encode(value))
+    }
+
+    static func decodeJSONData(_ data: Data) throws -> LuxoValue {
+        try fromFoundation(
+            JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        )
+    }
+
+    func jsonData() throws -> Data {
+        try JSONSerialization.data(
+            withJSONObject: foundationValue,
+            options: [.fragmentsAllowed, .sortedKeys]
+        )
+    }
+
+    var foundationValue: Any {
+        switch self {
+        case .null: return NSNull()
+        case .bool(let value): return value
+        case .int(let value): return value
+        case .float(let value): return value
+        case .string(let value): return value
+        case .bytes(let value): return value.base64EncodedString()
+        case .array(let values): return values.map(\.foundationValue)
+        case .object(let values): return values.mapValues(\.foundationValue)
+        }
+    }
+
+    private static func fromFoundation(_ value: Any) throws -> LuxoValue {
+        if value is NSNull { return .null }
+        if let value = value as? NSNumber {
+            switch String(cString: value.objCType) {
+            case "c": return .bool(value.boolValue)
+            case "f", "d": return .float(value.doubleValue)
+            default: return .int(value.int64Value)
+            }
+        }
+        if let value = value as? String { return .string(value) }
+        if let values = value as? [Any] {
+            return .array(try values.map(fromFoundation))
+        }
+        if let values = value as? [String: Any] {
+            return .object(try values.mapValues(fromFoundation))
+        }
+        throw LuxoError(code: 0, message: "unsupported transport value", name: "EncodingError")
+    }
+}
+
+extension LuxoValue: ExpressibleByNilLiteral {
+    public init(nilLiteral: ()) { self = .null }
+}
+
+extension LuxoValue: ExpressibleByBooleanLiteral {
+    public init(booleanLiteral value: Bool) { self = .bool(value) }
+}
+
+extension LuxoValue: ExpressibleByIntegerLiteral {
+    public init(integerLiteral value: Int64) { self = .int(value) }
+}
+
+extension LuxoValue: ExpressibleByFloatLiteral {
+    public init(floatLiteral value: Double) { self = .float(value) }
+}
+
+extension LuxoValue: ExpressibleByStringLiteral {
+    public init(stringLiteral value: String) { self = .string(value) }
+}
+
+extension LuxoValue: ExpressibleByArrayLiteral {
+    public init(arrayLiteral elements: LuxoValue...) { self = .array(elements) }
+}
+
+extension LuxoValue: ExpressibleByDictionaryLiteral {
+    public init(dictionaryLiteral elements: (String, LuxoValue)...) {
+        self = .object(Dictionary(uniqueKeysWithValues: elements))
+    }
+}
+
 // MARK: - Pagination
 
 /// Offset-based page response.

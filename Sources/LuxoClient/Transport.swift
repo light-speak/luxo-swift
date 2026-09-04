@@ -8,11 +8,11 @@ import Foundation
 
 /// Transport protocol — all transports implement this.
 public protocol Transport: Sendable {
-    func call(_ api: String, params: [String: Any]?) async throws -> Any
+    func call(_ api: String, params: [String: LuxoValue]?) async throws -> Data
     func subscribe(
         _ api: String,
-        params: [String: Any]?,
-        handler: @escaping (Any) -> Void
+        params: [String: LuxoValue]?,
+        handler: @escaping @Sendable (Data) -> Void
     ) async throws -> () -> Void
     func setToken(_ token: String)
     func setMode(_ mode: TransportMode)
@@ -22,8 +22,8 @@ public protocol Transport: Sendable {
 public extension Transport {
     func subscribe(
         _ api: String,
-        params: [String: Any]? = nil,
-        handler: @escaping (Any) -> Void
+        params: [String: LuxoValue]? = nil,
+        handler: @escaping @Sendable (Data) -> Void
     ) async throws -> () -> Void {
         throw LuxoError(
             code: 0,
@@ -61,6 +61,15 @@ public enum LuxoFilterValue: Sendable {
         case .bool(let value): return value
         }
     }
+
+    var transportValue: LuxoValue {
+        switch self {
+        case .string(let value): return .string(value)
+        case .int(let value): return .int(Int64(value))
+        case .double(let value): return .float(value)
+        case .bool(let value): return .bool(value)
+        }
+    }
 }
 
 public struct LuxoFilter: Sendable {
@@ -77,6 +86,10 @@ public struct LuxoFilter: Sendable {
     public var jsonObject: [String: Any] {
         ["field": field, "op": op, "value": value.jsonValue]
     }
+
+    public var transportValue: LuxoValue {
+        .object(["field": .string(field), "op": .string(op), "value": value.transportValue])
+    }
 }
 
 public struct LuxoSorter: Sendable {
@@ -90,6 +103,10 @@ public struct LuxoSorter: Sendable {
 
     public var jsonObject: [String: Any] {
         ["field": field, "order": order]
+    }
+
+    public var transportValue: LuxoValue {
+        .object(["field": .string(field), "order": .string(order)])
     }
 }
 
@@ -241,25 +258,31 @@ enum LuxoBinaryProtocol {
     static let subscribeSuccess: UInt64 = 0x07
     static let subscribeError: UInt64 = 0x08
 
-    static func encodeRequest(schema: APISchema, params: [String: Any]?) throws -> Data {
+    static func encodeRequest(schema: APISchema, params: [String: LuxoValue]?) throws -> Data {
         var encoder = Encoder()
         encoder.writeVarint(UInt64(schema.id))
-        try writeFieldMask(&encoder, schema: schema, selection: params?["$select"] as? String)
+        let selection: String?
+        if case .string(let value) = params?["$select"] {
+            selection = value
+        } else {
+            selection = nil
+        }
+        try writeFieldMask(&encoder, schema: schema, selection: selection)
         if let params, let paramSchemas = schema.params {
             for param in paramSchemas {
                 guard params.keys.contains(param.name), let value = params[param.name] else { continue }
                 encoder.writeVarint(UInt64(param.fieldID))
                 if param.nullable {
-                    if value is NSNull {
+                    if value == .null {
                         encoder.writeBool(false)
                         continue
                     }
                     encoder.writeBool(true)
-                } else if value is NSNull {
+                } else if value == .null {
                     throw LuxoError(code: 0, message: "parameter \(param.name) is not nullable", name: "ConfigError")
                 }
                 if param.isList {
-                    guard let values = value as? [Any] else {
+                    guard case .array(let values) = value else {
                         throw LuxoError(code: 0, message: "parameter \(param.name) must be a list", name: "ConfigError")
                     }
                     try encodeList(&encoder, param: param, values: values)
@@ -415,8 +438,8 @@ enum LuxoBinaryProtocol {
         LuxoError(code: 0, message: message, name: "ConfigError")
     }
 
-    private static func encodeFilters(_ encoder: inout Encoder, value: Any) throws {
-        guard let values = value as? [Any], values.count <= 1000 else {
+    private static func encodeFilters(_ encoder: inout Encoder, value: LuxoValue) throws {
+        guard case .array(let values) = value, values.count <= 1000 else {
             throw configError("$filters must contain at most 1000 entries")
         }
         encoder.writeVarint(filtersFieldID)
@@ -433,8 +456,8 @@ enum LuxoBinaryProtocol {
         }
     }
 
-    private static func encodeSorters(_ encoder: inout Encoder, value: Any) throws {
-        guard let values = value as? [Any], values.count <= 100 else {
+    private static func encodeSorters(_ encoder: inout Encoder, value: LuxoValue) throws {
+        guard case .array(let values) = value, values.count <= 100 else {
             throw configError("$sorters must contain at most 100 entries")
         }
         encoder.writeVarint(sortersFieldID)
@@ -450,41 +473,40 @@ enum LuxoBinaryProtocol {
         }
     }
 
-    private static func filterParts(_ value: Any) -> (field: String, op: String, value: String)? {
-        if let filter = value as? LuxoFilter {
-            if case .double(let number) = filter.value, !number.isFinite { return nil }
-            return (filter.field, filter.op, filter.value.wireText)
-        }
-        guard let item = value as? [String: Any], let field = item["field"] as? String,
-            let op = item["op"] as? String, let raw = item["value"], let text = filterValueText(raw)
+    private static func filterParts(_ value: LuxoValue) -> (field: String, op: String, value: String)? {
+        guard case .object(let item) = value,
+            case .string(let field) = item["field"],
+            case .string(let op) = item["op"],
+            let raw = item["value"],
+            let text = filterValueText(raw)
         else {
             return nil
         }
         return (field, op, text)
     }
 
-    private static func sorterParts(_ value: Any) -> (field: String, order: String)? {
-        if let sorter = value as? LuxoSorter { return (sorter.field, sorter.order) }
-        guard let item = value as? [String: Any], let field = item["field"] as? String,
-            let order = item["order"] as? String
+    private static func sorterParts(_ value: LuxoValue) -> (field: String, order: String)? {
+        guard case .object(let item) = value,
+            case .string(let field) = item["field"],
+            case .string(let order) = item["order"]
         else { return nil }
         return (field, order)
     }
 
-    private static func filterValueText(_ value: Any) -> String? {
-        if let string = value as? String { return string }
-        if let bool = value as? Bool { return bool ? "true" : "false" }
-        if let number = value as? NSNumber {
-            let double = number.doubleValue
-            return double.isFinite ? number.stringValue : nil
+    private static func filterValueText(_ value: LuxoValue) -> String? {
+        switch value {
+        case .string(let value): return value
+        case .bool(let value): return value ? "true" : "false"
+        case .int(let value): return String(value)
+        case .float(let value): return value.isFinite ? String(value) : nil
+        default: return nil
         }
-        return nil
     }
 
     private static func encodeScalar(
         _ encoder: inout Encoder,
         param: APISchema.ParamSchema,
-        value: Any
+        value: LuxoValue
     ) throws {
         try encodeValue(&encoder, type: param.type, value: value)
     }
@@ -492,7 +514,7 @@ enum LuxoBinaryProtocol {
     private static func encodeList(
         _ encoder: inout Encoder,
         param: APISchema.ParamSchema,
-        values: [Any]
+        values: [LuxoValue]
     ) throws {
         encoder.writeVarint(UInt64(values.count))
         for value in values {
@@ -500,51 +522,48 @@ enum LuxoBinaryProtocol {
         }
     }
 
-    private static func encodeValue(_ encoder: inout Encoder, type: String, value: Any) throws {
+    private static func encodeValue(_ encoder: inout Encoder, type: String, value: LuxoValue) throws {
         switch type {
         case "Int", "Duration":
-            guard let number = value as? NSNumber else { throw invalidValue(type) }
-            encoder.writeSvarint(number.int64Value)
+            guard case .int(let number) = value else { throw invalidValue(type) }
+            encoder.writeSvarint(number)
         case "Float":
-            guard let number = value as? NSNumber else { throw invalidValue(type) }
-            encoder.writeFixed64(number.doubleValue)
+            switch value {
+            case .float(let number): encoder.writeFixed64(number)
+            case .int(let number): encoder.writeFixed64(Double(number))
+            default: throw invalidValue(type)
+            }
         case "String", "Enum", "Decimal":
-            guard let string = value as? String else { throw invalidValue(type) }
+            guard case .string(let string) = value else { throw invalidValue(type) }
             encoder.writeString(string)
         case "Boolean":
-            guard let boolean = value as? Bool else { throw invalidValue(type) }
+            guard case .bool(let boolean) = value else { throw invalidValue(type) }
             encoder.writeBool(boolean)
         case "DateTime":
             encoder.writeSvarint(try unixSeconds(value))
         case "UUID":
-            if let uuid = value as? UUID {
-                encoder.writeUUID(uuid)
-            } else if let string = value as? String, let uuid = UUID(uuidString: string) {
+            if case .string(let string) = value, let uuid = UUID(uuidString: string) {
                 encoder.writeUUID(uuid)
             } else {
                 throw invalidValue(type)
             }
         case "Bytes":
-            guard let bytes = value as? Data else { throw invalidValue(type) }
-            encoder.writeBytes(bytes)
-        case "JSON":
-            let bytes: Data
-            if let jsonValue = value as? JSONValue {
-                bytes = try JSONEncoder().encode(jsonValue)
-            } else {
-                bytes = try JSONSerialization.data(
-                    withJSONObject: value,
-                    options: [.fragmentsAllowed, .sortedKeys]
-                )
+            switch value {
+            case .bytes(let bytes): encoder.writeBytes(bytes)
+            case .string(let text):
+                guard let bytes = Data(base64Encoded: text) else { throw invalidValue(type) }
+                encoder.writeBytes(bytes)
+            default: throw invalidValue(type)
             }
-            encoder.writeBytes(bytes)
+        case "JSON":
+            encoder.writeBytes(try value.jsonData())
         default:
             throw LuxoError(code: 0, message: "unsupported binary param type: \(type)", name: "ConfigError")
         }
     }
 
-    private static func unixSeconds(_ value: Any) throws -> Int64 {
-        if let text = value as? String,
+    private static func unixSeconds(_ value: LuxoValue) throws -> Int64 {
+        if case .string(let text) = value,
             let date = ISO8601DateFormatter().date(from: text)
         {
             return Int64(date.timeIntervalSince1970)
@@ -664,7 +683,7 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
         lock.withLock { self.schema = schema }
     }
 
-    public func call(_ api: String, params: [String: Any]? = nil) async throws -> Any {
+    public func call(_ api: String, params: [String: LuxoValue]? = nil) async throws -> Data {
         do {
             return try await doCall(api, params: params)
         } catch let error as LuxoError where error.code == 401 {
@@ -678,7 +697,7 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
         }
     }
 
-    private func doCall(_ api: String, params: [String: Any]?) async throws -> Any {
+    private func doCall(_ api: String, params: [String: LuxoValue]?) async throws -> Data {
         let state = lock.withLock {
             State(headers: headers, mode: mode, schema: schema)
         }
@@ -697,10 +716,10 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
 
     private func jsonCall(
         _ api: String,
-        params: [String: Any]?,
+        params: [String: LuxoValue]?,
         headers: [String: String]
-    ) async throws -> Any {
-        var body: [String: Any] = ["$api": api]
+    ) async throws -> Data {
+        var body: [String: LuxoValue] = ["$api": .string(api)]
         if let params = params {
             for (k, v) in params { body[k] = v }
         }
@@ -710,7 +729,7 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
         request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.httpBody = try LuxoValue.object(body).jsonData()
 
         let (data, response) = try await session.data(for: request)
 
@@ -733,7 +752,10 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
             }
             throw error
         }
-        return json["data"] ?? NSNull()
+        return try JSONSerialization.data(
+            withJSONObject: json["data"] ?? NSNull(),
+            options: [.fragmentsAllowed, .sortedKeys]
+        )
     }
 
     private func decodeJSONEnvelope(_ data: Data, statusCode: Int) throws -> [String: Any] {
@@ -749,10 +771,10 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
 
     private func binaryCall(
         _ api: String,
-        params: [String: Any]?,
+        params: [String: LuxoValue]?,
         headers: [String: String],
         schema: [String: APISchema]
-    ) async throws -> Any {
+    ) async throws -> Data {
         guard let apiSchema = schema[api] else {
             throw LuxoError(
                 code: 0,
@@ -813,12 +835,12 @@ extension URLSession: LuxoWebSocketSession {
 /// Supports exponential backoff auto-reconnect on disconnect.
 public final class WebSocketTransport: Transport, @unchecked Sendable {
     private struct Subscription {
-        let params: [String: Any]
-        let handler: (Any) -> Void
+        let params: [String: LuxoValue]
+        let handler: @Sendable (Data) -> Void
     }
 
     private struct PendingCall {
-        let continuation: CheckedContinuation<Any, Error>
+        let continuation: CheckedContinuation<Data, Error>
         let timeoutTask: DispatchWorkItem
     }
 
@@ -910,7 +932,7 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
         openConnection()
     }
 
-    public func call(_ api: String, params: [String: Any]? = nil) async throws -> Any {
+    public func call(_ api: String, params: [String: LuxoValue]? = nil) async throws -> Data {
         let request = try lock.withLock { () throws -> (UInt64, LuxoWebSocketTask, URLSessionWebSocketTask.Message) in
             guard let socket = task else {
                 throw LuxoError(code: 0, message: "WebSocket not connected", name: "ConnectionError")
@@ -929,9 +951,9 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
                 return (requestID, socket, .data(LuxoBinaryProtocol.callFrame(sequence: requestID, body: body)))
             }
             var body = params ?? [:]
-            body["$id"] = requestID
-            body["$api"] = api
-            let data = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+            body["$id"] = .int(Int64(requestID))
+            body["$api"] = .string(api)
+            let data = try LuxoValue.object(body).jsonData()
             return (requestID, socket, .string(String(decoding: data, as: UTF8.self)))
         }
 
@@ -968,8 +990,8 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
 
     public func subscribe(
         _ api: String,
-        params: [String: Any]? = nil,
-        handler: @escaping (Any) -> Void
+        params: [String: LuxoValue]? = nil,
+        handler: @escaping @Sendable (Data) -> Void
     ) async throws -> () -> Void {
         let values = params ?? [:]
         let request = try subscriptionMessage(api, params: values)
@@ -1120,7 +1142,12 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
         }
         if let api = json["$stream"] as? String {
             let handler = lock.withLock { subscriptions[api]?.handler }
-            handler?(json["data"] ?? NSNull())
+            if let data = try? JSONSerialization.data(
+                withJSONObject: json["data"] ?? NSNull(),
+                options: [.fragmentsAllowed, .sortedKeys]
+            ) {
+                handler?(data)
+            }
             return
         }
         guard let number = json["$id"] as? NSNumber else { return }
@@ -1130,7 +1157,17 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
         if json["error"] != nil {
             state.continuation.resume(throwing: LuxoError.from(json: json))
         } else {
-            state.continuation.resume(returning: json["data"] ?? NSNull())
+            do {
+                let data = try JSONSerialization.data(
+                    withJSONObject: json["data"] ?? NSNull(),
+                    options: [.fragmentsAllowed, .sortedKeys]
+                )
+                state.continuation.resume(returning: data)
+            } catch {
+                state.continuation.resume(
+                    throwing: LuxoError(code: 0, message: "invalid JSON response", name: "ParseError")
+                )
+            }
         }
     }
 
@@ -1160,7 +1197,7 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
                 )
             }
         case LuxoBinaryProtocol.stream:
-            let handler = lock.withLock { () -> ((Any) -> Void)? in
+            let handler = lock.withLock { () -> (@Sendable (Data) -> Void)? in
                 guard let api = apiByID[id] else { return nil }
                 return subscriptions[api]?.handler
             }
@@ -1172,7 +1209,7 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
 
     private func subscriptionMessage(
         _ api: String,
-        params: [String: Any]
+        params: [String: LuxoValue]
     ) throws -> (LuxoWebSocketTask, URLSessionWebSocketTask.Message) {
         try lock.withLock {
             guard let socket = task else {
@@ -1186,15 +1223,15 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
                 return (socket, .data(LuxoBinaryProtocol.subscribeFrame(body: body)))
             }
             var body = params
-            body["$sub"] = api
-            let data = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+            body["$sub"] = .string(api)
+            let data = try LuxoValue.object(body).jsonData()
             return (socket, .string(String(decoding: data, as: UTF8.self)))
         }
     }
 
     private func sendConfirmedSubscription(
         _ api: String,
-        params: [String: Any],
+        params: [String: LuxoValue],
         socket: LuxoWebSocketTask
     ) {
         guard let request = try? subscriptionMessage(api, params: params), request.0 === socket else { return }

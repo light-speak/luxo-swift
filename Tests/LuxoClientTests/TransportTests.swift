@@ -72,7 +72,7 @@ final class TransportTests: XCTestCase {
 
         let body = try LuxoBinaryProtocol.encodeRequest(
             schema: schema,
-            params: ["blob": Data([0, 0xff]), "metadata": ["ok": true]]
+            params: ["blob": .bytes(Data([0, 0xff])), "metadata": ["ok": true]]
         )
 
         XCTAssertEqual(
@@ -90,8 +90,12 @@ final class TransportTests: XCTestCase {
         let body = try LuxoBinaryProtocol.encodeRequest(
             schema: schema,
             params: [
-                "$filters": [LuxoFilter(field: "age", op: "gte", value: .int(18))],
-                "$sorters": [LuxoSorter(field: "createdAt", order: "desc")],
+                "$filters": .array([
+                    LuxoFilter(field: "age", op: "gte", value: .int(18)).transportValue
+                ]),
+                "$sorters": .array([
+                    LuxoSorter(field: "createdAt", order: "desc").transportValue
+                ]),
             ]
         )
 
@@ -109,17 +113,29 @@ final class TransportTests: XCTestCase {
         XCTAssertThrowsError(
             try LuxoBinaryProtocol.encodeRequest(
                 schema: APISchema(id: 1),
-                params: ["$filters": [LuxoFilter(field: "age", op: "invalid", value: .int(18))]]
+                params: [
+                    "$filters": .array([
+                        LuxoFilter(field: "age", op: "invalid", value: .int(18)).transportValue
+                    ])
+                ]
             ))
         XCTAssertThrowsError(
             try LuxoBinaryProtocol.encodeRequest(
                 schema: APISchema(id: 1),
-                params: ["$sorters": [LuxoSorter(field: "age", order: "sideways")]]
+                params: [
+                    "$sorters": .array([
+                        LuxoSorter(field: "age", order: "sideways").transportValue
+                    ])
+                ]
             ))
         XCTAssertThrowsError(
             try LuxoBinaryProtocol.encodeRequest(
                 schema: APISchema(id: 1),
-                params: ["$filters": [LuxoFilter(field: "score", op: "eq", value: .double(.infinity))]]
+                params: [
+                    "$filters": .array([
+                        LuxoFilter(field: "score", op: "eq", value: .double(.infinity)).transportValue
+                    ])
+                ]
             ))
     }
 
@@ -171,18 +187,18 @@ final class TransportTests: XCTestCase {
             schema: schema,
             params: [
                 "int": -3,
-                "duration": Int64(9),
+                "duration": .int(9),
                 "float": 1.25,
                 "string": "text",
                 "enum": "OPEN",
                 "decimal": "12.50",
                 "bool": true,
                 "date": "1970-01-01T00:01:00Z",
-                "uuid": uuid,
-                "uuidText": uuid.uuidString,
-                "bytes": Data([1, 2]),
+                "uuid": LuxoValue(uuid),
+                "uuidText": .string(uuid.uuidString),
+                "bytes": .bytes(Data([1, 2])),
                 "json": ["ok": true],
-                "jsonValue": JSONValue.string("value"),
+                "jsonValue": LuxoValue(.string("value")),
                 "items": ["a", "b"],
             ])
 
@@ -222,7 +238,7 @@ final class TransportTests: XCTestCase {
     }
 
     func testBinaryRequestRejectsInvalidParamsAndSelections() {
-        let invalidParams: [(APISchema.ParamSchema, Any)] = [
+        let invalidParams: [(APISchema.ParamSchema, LuxoValue)] = [
             (.init(fieldID: 1, name: "value", type: "Int"), "bad"),
             (.init(fieldID: 1, name: "value", type: "Float"), "bad"),
             (.init(fieldID: 1, name: "value", type: "String"), 1),
@@ -232,7 +248,7 @@ final class TransportTests: XCTestCase {
             (.init(fieldID: 1, name: "value", type: "DateTime"), "bad"),
             (.init(fieldID: 1, name: "value", type: "Unknown"), "bad"),
             (.init(fieldID: 1, name: "value", type: "String", isList: true), "bad"),
-            (.init(fieldID: 1, name: "value", type: "String"), NSNull()),
+            (.init(fieldID: 1, name: "value", type: "String"), .null),
         ]
         for (param, value) in invalidParams {
             XCTAssertThrowsError(
@@ -250,14 +266,14 @@ final class TransportTests: XCTestCase {
             XCTAssertThrowsError(
                 try LuxoBinaryProtocol.encodeRequest(
                     schema: schema,
-                    params: ["$select": selection]
+                    params: ["$select": .string(selection)]
                 ))
         }
         let nested = String(repeating: "child{", count: 32) + "id" + String(repeating: "}", count: 32)
         XCTAssertThrowsError(
             try LuxoBinaryProtocol.encodeRequest(
                 schema: schema,
-                params: ["$select": nested]
+                params: ["$select": .string(nested)]
             ))
     }
 
@@ -277,12 +293,22 @@ final class TransportTests: XCTestCase {
         XCTAssertThrowsError(
             try LuxoBinaryProtocol.encodeRequest(
                 schema: APISchema(id: 1),
-                params: ["$filters": Array(repeating: ["field": "x", "op": "eq", "value": 1], count: 1001)]
+                params: [
+                    "$filters": .array(
+                        Array(
+                            repeating: ["field": "x", "op": "eq", "value": 1],
+                            count: 1001
+                        ))
+                ]
             ))
         XCTAssertThrowsError(
             try LuxoBinaryProtocol.encodeRequest(
                 schema: APISchema(id: 1),
-                params: ["$sorters": Array(repeating: ["field": "x", "order": "asc"], count: 101)]
+                params: [
+                    "$sorters": .array(
+                        Array(repeating: ["field": "x", "order": "asc"], count: 101)
+                    )
+                ]
             ))
     }
 
@@ -308,7 +334,7 @@ final class TransportTests: XCTestCase {
             ])
         let body = try LuxoBinaryProtocol.encodeRequest(
             schema: schema,
-            params: ["nickname": NSNull(), "age": 42]
+            params: ["nickname": .null, "age": 42]
         )
         XCTAssertEqual(body, Data([9, 0, 1, 0, 2, 1, 84, 0]))
         XCTAssertEqual(try LuxoBinaryProtocol.encodeRequest(schema: schema, params: [:]), Data([9, 0, 0]))
@@ -476,7 +502,10 @@ final class TransportTests: XCTestCase {
 
         let result = try await transport.call("getUser", params: ["id": 7])
 
-        XCTAssertEqual((result as? [String: Int])?["id"], 7)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: result) as? [String: Int]
+        )
+        XCTAssertEqual(object["id"], 7)
     }
 
     func testURLSessionTransportJSONErrorUsesHTTPStatus() async throws {
@@ -522,7 +551,7 @@ final class TransportTests: XCTestCase {
 
         let result = try await transport.call("viewer")
 
-        XCTAssertEqual(result as? String, "ok")
+        XCTAssertEqual(try JSONDecoder().decode(String.self, from: result), "ok")
         XCTAssertEqual(
             requestLock.withLock { authorizations },
             ["Bearer expired", "Bearer fresh"]
@@ -566,7 +595,7 @@ final class TransportTests: XCTestCase {
 
         let result = try await transport.call("getUser", params: ["id": 3])
 
-        XCTAssertEqual(result as? Data, Data([1, 2, 3]))
+        XCTAssertEqual(result, Data([1, 2, 3]))
     }
 
     func testURLSessionTransportBinaryCallRequiresSchema() async throws {
@@ -704,7 +733,10 @@ final class TransportTests: XCTestCase {
         XCTAssertEqual(json["$id"] as? Int, 1)
         XCTAssertEqual(json["$api"] as? String, "getUser")
         XCTAssertEqual(json["id"] as? Int, 7)
-        XCTAssertEqual((result as? [String: String])?["name"], "Ada")
+        XCTAssertEqual(
+            (try JSONSerialization.jsonObject(with: result) as? [String: String])?["name"],
+            "Ada"
+        )
 
         transport.close()
         XCTAssertEqual(socket.cancelCode, .normalClosure)
@@ -724,7 +756,7 @@ final class TransportTests: XCTestCase {
             socket?.deliver(.success(.data(Data([2, 1, 9, 8]))))
         }
         let successValue = try await transport.call("getUser")
-        XCTAssertEqual(successValue as? Data, Data([9, 8]))
+        XCTAssertEqual(successValue, Data([9, 8]))
 
         let errorBody = Data([
             1, 0xa0, 0x06,
@@ -760,7 +792,10 @@ final class TransportTests: XCTestCase {
             "watchOrders",
             params: ["status": "OPEN"]
         ) { value in
-            XCTAssertEqual((value as? [String: Int])?["id"], 9)
+            XCTAssertEqual(
+                (try? JSONSerialization.jsonObject(with: value) as? [String: Int])?["id"],
+                9
+            )
             streamReceived.fulfill()
         }
         socket.onSend = nil
@@ -929,7 +964,7 @@ final class TransportTests: XCTestCase {
         }
 
         let unsubscribe = try await transport.subscribe("watchOrders") { value in
-            XCTAssertEqual(value as? Data, Data([9, 8]))
+            XCTAssertEqual(value, Data([9, 8]))
             streamed.fulfill()
         }
         socket.onSend = nil
