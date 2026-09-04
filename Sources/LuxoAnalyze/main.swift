@@ -29,8 +29,9 @@ let fm = FileManager.default
 if let enumerator = fm.enumerator(atPath: sourceDir) {
     while let file = enumerator.nextObject() as? String {
         guard file.hasSuffix(".swift"),
-              !file.contains("SelectHints"),
-              !file.contains(".build/") else { continue }
+            !file.contains("SelectHints"),
+            !file.contains(".build/")
+        else { continue }
         let path = (sourceDir as NSString).appendingPathComponent(file)
         do {
             try analyzer.analyzeFile(at: path)

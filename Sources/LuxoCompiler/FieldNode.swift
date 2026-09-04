@@ -27,7 +27,8 @@ public final class FieldNode {
 
     public func toSelectString() -> String {
         if children.isEmpty { return "" }
-        return children.values.map { child in
+        return children.keys.sorted().compactMap { key in
+            guard let child = children[key] else { return nil }
             let nested = child.toSelectString()
             return nested.isEmpty ? child.name : "\(child.name){\(nested)}"
         }.joined(separator: ",")

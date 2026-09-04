@@ -13,12 +13,20 @@ final class ErrorTests: XCTestCase {
 
     func testConstructorWithAllFields() {
         let data: [String: Any] = ["field": "email"]
-        let err = LuxoError(code: 422, message: "Validation failed", name: "ValidationError", traceId: "abc-123", data: data)
+        let err = LuxoError(
+            code: 422,
+            message: "Validation failed",
+            name: "ValidationError",
+            traceId: "abc-123",
+            data: data,
+            cause: "database constraint"
+        )
         XCTAssertEqual(err.code, 422)
         XCTAssertEqual(err.message, "Validation failed")
         XCTAssertEqual(err.name, "ValidationError")
         XCTAssertEqual(err.traceId, "abc-123")
-        XCTAssertEqual(err.data?["field"] as? String, "email")
+        XCTAssertEqual((err.data as? [String: Any])?["field"] as? String, "email")
+        XCTAssertEqual(err.cause, "database constraint")
     }
 
     func testLocalizedDescription() {
@@ -49,7 +57,7 @@ final class ErrorTests: XCTestCase {
         XCTAssertEqual(err.message, "Forbidden")
         XCTAssertEqual(err.name, "Forbidden")
         XCTAssertEqual(err.traceId, "req-456")
-        XCTAssertEqual(err.data?["reason"] as? String, "insufficient_permissions")
+        XCTAssertEqual((err.data as? [String: Any])?["reason"] as? String, "insufficient_permissions")
     }
 
     func testFromJSONWithErrorField() {

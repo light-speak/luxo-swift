@@ -10,7 +10,7 @@ let package = Package(
         .executable(name: "LuxoAnalyze", targets: ["LuxoAnalyze"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-syntax.git", from: "510.0.0"),
+        .package(url: "https://github.com/apple/swift-syntax.git", from: "510.0.0")
     ],
     targets: [
         .target(name: "LuxoClient"),
@@ -26,5 +26,6 @@ let package = Package(
             dependencies: ["LuxoCompiler"]
         ),
         .testTarget(name: "LuxoClientTests", dependencies: ["LuxoClient"]),
+        .testTarget(name: "LuxoCompilerTests", dependencies: ["LuxoCompiler"]),
     ]
 )

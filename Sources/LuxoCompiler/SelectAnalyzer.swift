@@ -12,6 +12,7 @@ import SwiftParser
 /// Run as build phase:
 ///   swift run LuxoAnalyze --source-dir Sources/ --output Sources/Generated/SelectHints.swift
 public final class SelectAnalyzer: SyntaxVisitor {
+    private static let selectedValueAccessor = "requireValue"
 
     /// API name → field tree
     private var trees: [String: FieldNode] = [:]
@@ -32,6 +33,8 @@ public final class SelectAnalyzer: SyntaxVisitor {
 
     /// Analyze a Swift source string.
     public func analyzeSource(_ source: String) {
+        varToAPI.removeAll(keepingCapacity: true)
+        varToParent.removeAll(keepingCapacity: true)
         let tree = Parser.parse(source: source)
         walk(tree)
     }
@@ -48,7 +51,9 @@ public final class SelectAnalyzer: SyntaxVisitor {
         for (api, tree) in trees {
             let depth = tree.maxDepth()
             if depth > Self.maxNestingDepth {
-                print("[luxo] Warning: \(api) has \(depth)-level nested field selection (max recommended: \(Self.maxNestingDepth)). Consider restructuring your query.")
+                print(
+                    "[luxo] Warning: \(api) has \(depth)-level nested field selection (max recommended: \(Self.maxNestingDepth)). Consider restructuring your query."
+                )
             }
             let selectStr = tree.toSelectString()
             if !selectStr.isEmpty {
@@ -79,7 +84,8 @@ public final class SelectAnalyzer: SyntaxVisitor {
     public override func visit(_ node: VariableDeclSyntax) -> SyntaxVisitorContinueKind {
         for binding in node.bindings {
             guard let pattern = binding.pattern.as(IdentifierPatternSyntax.self),
-                  let init_ = binding.initializer?.value else { continue }
+                let init_ = binding.initializer?.value
+            else { continue }
 
             let varName = pattern.identifier.text
 
@@ -88,10 +94,13 @@ public final class SelectAnalyzer: SyntaxVisitor {
 
             // Check if it's a method call on a client
             if let call = expr.as(FunctionCallExprSyntax.self),
-               let member = call.calledExpression.as(MemberAccessExprSyntax.self) {
+                let member = call.calledExpression.as(MemberAccessExprSyntax.self)
+            {
                 let apiName = member.declName.baseName.text
-                varToAPI[varName] = apiName
-                trees[apiName] = trees[apiName] ?? FieldNode.root()
+                if apiName != Self.selectedValueAccessor {
+                    varToAPI[varName] = apiName
+                    trees[apiName] = trees[apiName] ?? FieldNode.root()
+                }
             }
 
             // Check if it's a member access alias: let author = post.user
@@ -110,6 +119,11 @@ public final class SelectAnalyzer: SyntaxVisitor {
 
     /// Track: post.user.name (member access chains)
     public override func visit(_ node: MemberAccessExprSyntax) -> SyntaxVisitorContinueKind {
+        if let call = node.parent?.as(FunctionCallExprSyntax.self),
+            call.calledExpression.id == node.id
+        {
+            return .visitChildren
+        }
         let chain = extractChain(ExprSyntax(node))
         if chain.count >= 2 {
             processChain(chain)
@@ -150,19 +164,21 @@ public final class SelectAnalyzer: SyntaxVisitor {
         // Get param name (explicit or $0)
         var paramName = "$0"
         if let sig = closure.signature,
-           let params = sig.parameterClause?.as(ClosureParameterClauseSyntax.self) {
+            let params = sig.parameterClause?.as(ClosureParameterClauseSyntax.self)
+        {
             if let first = params.parameters.first {
                 paramName = first.firstName.text
             }
         } else if let sig = closure.signature,
-                  let shorthand = sig.parameterClause?.as(ClosureShorthandParameterListSyntax.self) {
+            let shorthand = sig.parameterClause?.as(ClosureShorthandParameterListSyntax.self)
+        {
             if let first = shorthand.first {
                 paramName = first.name.text
             }
         }
 
         // Link param to source field
-        let sourceField = sourceChain.last!
+        guard let sourceField = sourceChain.last else { return .visitChildren }
         varToParent[paramName] = (parentVar: rootVar, field: sourceField)
 
         return .visitChildren
@@ -196,6 +212,13 @@ public final class SelectAnalyzer: SyntaxVisitor {
             } else if let subscript_ = current.as(SubscriptCallExprSyntax.self) {
                 // arr[0] → skip index, continue with arr
                 current = subscript_.calledExpression
+            } else if let call = current.as(FunctionCallExprSyntax.self),
+                call.arguments.isEmpty,
+                let member = call.calledExpression.as(MemberAccessExprSyntax.self),
+                member.declName.baseName.text == Self.selectedValueAccessor,
+                let base = member.base
+            {
+                current = base
             } else if let ref = current.as(DeclReferenceExprSyntax.self) {
                 chain.insert(ref.baseName.text, at: 0)
                 break

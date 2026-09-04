@@ -1,0 +1,50 @@
+{
+  "models": {
+    "Record": {
+      "name": "Record",
+      "usage": "output",
+      "fields": [
+        {"id": 1, "name": "id", "type": "Int"},
+        {"id": 2, "name": "status", "type": "Enum", "typeName": "Status"},
+        {"id": 3, "name": "profile", "type": "Model", "typeName": "Profile", "nullable": true, "relation": true}
+      ]
+    }
+  },
+  "types": {
+    "Profile": {
+      "name": "Profile",
+      "usage": "inputOutput",
+      "fields": [
+        {"id": 1, "name": "name", "type": "String"},
+        {"id": 2, "name": "bio", "type": "String", "nullable": true}
+      ]
+    }
+  },
+  "enums": {
+    "Status": {"name": "Status", "values": ["OPEN", "CLOSED"]}
+  },
+  "apis": {
+    "updateProfile": {
+      "id": 1,
+      "name": "updateProfile",
+      "module": "profile",
+      "returnType": "Profile",
+      "params": [
+        {"id": 1, "name": "profile", "type": "Model", "typeName": "Profile"}
+      ]
+    },
+    "listRecords": {
+      "id": 2,
+      "name": "listRecords",
+      "module": "record",
+      "returnType": "Record",
+      "returnList": true
+    },
+    "getRecord": {
+      "id": 3,
+      "name": "getRecord",
+      "module": "record",
+      "returnType": "Record"
+    }
+  }
+}
