@@ -1,5 +1,221 @@
 import Foundation
 
+/// Three-state argument for patch APIs: absent, explicit null, or a value.
+public enum LuxoOptional<Value> {
+    case absent
+    case present(Value?)
+}
+
+/// A field-selected output value.
+///
+/// `unselected` means the server did not return the field. For nullable
+/// fields, `value(nil)` represents a field that was selected and returned null.
+public enum Selected<Value: Sendable>: Sendable {
+    case unselected
+    case value(Value)
+
+    /// Returns the selected value or throws when the field was not requested.
+    public func requireValue() throws -> Value {
+        switch self {
+        case .unselected:
+            throw LuxoError(code: 0, message: "field was not selected", name: "SelectionError")
+        case .value(let value):
+            return value
+        }
+    }
+}
+
+extension Selected: Codable where Value: Codable {
+    public init(from decoder: Swift.Decoder) throws {
+        self = .value(try decoder.singleValueContainer().decode(Value.self))
+    }
+
+    public func encode(to encoder: Swift.Encoder) throws {
+        switch self {
+        case .unselected:
+            throw EncodingError.invalidValue(
+                self,
+                .init(codingPath: encoder.codingPath, debugDescription: "unselected fields must be omitted")
+            )
+        case .value(let value):
+            var container = encoder.singleValueContainer()
+            try container.encode(value)
+        }
+    }
+}
+
+public extension KeyedDecodingContainer {
+    func decode<Value>(
+        _ type: Selected<Value>.Type,
+        forKey key: Key
+    ) throws -> Selected<Value> where Value: Codable & Sendable {
+        guard contains(key) else { return .unselected }
+        return .value(try decode(Value.self, forKey: key))
+    }
+}
+
+public extension KeyedEncodingContainer {
+    mutating func encode<Value>(
+        _ selected: Selected<Value>,
+        forKey key: Key
+    ) throws where Value: Codable & Sendable {
+        guard case .value(let value) = selected else { return }
+        try encode(value, forKey: key)
+    }
+}
+
+/// Codable, Sendable representation of an arbitrary JSON value.
+public enum JSONValue: Codable, Sendable, Equatable {
+    case null
+    case bool(Bool)
+    case number(Double)
+    case string(String)
+    case array([JSONValue])
+    case object([String: JSONValue])
+
+    public init(from decoder: Swift.Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let value = try? container.decode(Bool.self) {
+            self = .bool(value)
+        } else if let value = try? container.decode(Double.self) {
+            self = .number(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode([JSONValue].self) {
+            self = .array(value)
+        } else {
+            self = .object(try container.decode([String: JSONValue].self))
+        }
+    }
+
+    public func encode(to encoder: Swift.Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .null: try container.encodeNil()
+        case .bool(let value): try container.encode(value)
+        case .number(let value): try container.encode(value)
+        case .string(let value): try container.encode(value)
+        case .array(let value): try container.encode(value)
+        case .object(let value): try container.encode(value)
+        }
+    }
+}
+
+/// Sendable value representation used at transport boundaries.
+///
+/// Unlike `Any`, this preserves integer precision and makes values safe to move
+/// between Swift concurrency domains. Binary payloads remain raw `Data`.
+public enum LuxoValue: Sendable, Equatable {
+    case null
+    case bool(Bool)
+    case int(Int64)
+    case float(Double)
+    case string(String)
+    case bytes(Data)
+    case array([LuxoValue])
+    case object([String: LuxoValue])
+
+    public init(_ value: Int) { self = .int(Int64(value)) }
+    public init(_ value: Int64) { self = .int(value) }
+    public init(_ value: Double) { self = .float(value) }
+    public init(_ value: String) { self = .string(value) }
+    public init(_ value: Bool) { self = .bool(value) }
+    public init(_ value: Data) { self = .bytes(value) }
+    public init(_ value: UUID) { self = .string(value.uuidString) }
+
+    public init(_ value: JSONValue) {
+        switch value {
+        case .null: self = .null
+        case .bool(let value): self = .bool(value)
+        case .number(let value): self = .float(value)
+        case .string(let value): self = .string(value)
+        case .array(let values): self = .array(values.map(LuxoValue.init))
+        case .object(let values): self = .object(values.mapValues(LuxoValue.init))
+        }
+    }
+
+    public static func encode<Value: Encodable & Sendable>(_ value: Value) throws -> LuxoValue {
+        try decodeJSONData(JSONEncoder().encode(value))
+    }
+
+    static func decodeJSONData(_ data: Data) throws -> LuxoValue {
+        try fromFoundation(
+            JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        )
+    }
+
+    func jsonData() throws -> Data {
+        try JSONSerialization.data(
+            withJSONObject: foundationValue,
+            options: [.fragmentsAllowed, .sortedKeys]
+        )
+    }
+
+    var foundationValue: Any {
+        switch self {
+        case .null: return NSNull()
+        case .bool(let value): return value
+        case .int(let value): return value
+        case .float(let value): return value
+        case .string(let value): return value
+        case .bytes(let value): return value.base64EncodedString()
+        case .array(let values): return values.map(\.foundationValue)
+        case .object(let values): return values.mapValues(\.foundationValue)
+        }
+    }
+
+    private static func fromFoundation(_ value: Any) throws -> LuxoValue {
+        if value is NSNull { return .null }
+        if let value = value as? NSNumber {
+            switch String(cString: value.objCType) {
+            case "c": return .bool(value.boolValue)
+            case "f", "d": return .float(value.doubleValue)
+            default: return .int(value.int64Value)
+            }
+        }
+        if let value = value as? String { return .string(value) }
+        if let values = value as? [Any] {
+            return .array(try values.map(fromFoundation))
+        }
+        if let values = value as? [String: Any] {
+            return .object(try values.mapValues(fromFoundation))
+        }
+        throw LuxoError(code: 0, message: "unsupported transport value", name: "EncodingError")
+    }
+}
+
+extension LuxoValue: ExpressibleByNilLiteral {
+    public init(nilLiteral: ()) { self = .null }
+}
+
+extension LuxoValue: ExpressibleByBooleanLiteral {
+    public init(booleanLiteral value: Bool) { self = .bool(value) }
+}
+
+extension LuxoValue: ExpressibleByIntegerLiteral {
+    public init(integerLiteral value: Int64) { self = .int(value) }
+}
+
+extension LuxoValue: ExpressibleByFloatLiteral {
+    public init(floatLiteral value: Double) { self = .float(value) }
+}
+
+extension LuxoValue: ExpressibleByStringLiteral {
+    public init(stringLiteral value: String) { self = .string(value) }
+}
+
+extension LuxoValue: ExpressibleByArrayLiteral {
+    public init(arrayLiteral elements: LuxoValue...) { self = .array(elements) }
+}
+
+extension LuxoValue: ExpressibleByDictionaryLiteral {
+    public init(dictionaryLiteral elements: (String, LuxoValue)...) {
+        self = .object(Dictionary(uniqueKeysWithValues: elements))
+    }
+}
+
 // MARK: - Pagination
 
 /// Offset-based page response.
@@ -8,6 +224,13 @@ public struct Page<T: Decodable>: Decodable {
     public let total: Int
     public let page: Int
     public let pageSize: Int
+
+    public init(items: [T], total: Int, page: Int, pageSize: Int) {
+        self.items = items
+        self.total = total
+        self.page = page
+        self.pageSize = pageSize
+    }
 }
 
 /// Cursor-based page response.
@@ -31,14 +254,35 @@ public struct LuxoEnum: Codable, Sendable {
     public let values: [String]
 }
 
+public enum TypeUsage: String, Codable, Sendable {
+    case input
+    case output
+    case inputOutput
+    case unused
+}
+
 public struct LuxoTypeDecl: Codable, Sendable {
     public let name: String
+    public let usage: TypeUsage?
     public let fields: [LuxoField]
+
+    public init(name: String, usage: TypeUsage? = nil, fields: [LuxoField]) {
+        self.name = name
+        self.usage = usage
+        self.fields = fields
+    }
 }
 
 public struct LuxoModel: Codable, Sendable {
     public let name: String
+    public let usage: TypeUsage?
     public let fields: [LuxoField]
+
+    public init(name: String, usage: TypeUsage? = nil, fields: [LuxoField]) {
+        self.name = name
+        self.usage = usage
+        self.fields = fields
+    }
 }
 
 public struct LuxoField: Codable, Sendable {
@@ -58,12 +302,16 @@ public struct LuxoAPI: Codable, Sendable {
     public let returnType: String?
     public let returnList: Bool?
     public let paginated: Bool?
+    public let stream: Bool?
     public let params: [LuxoParam]?
 }
 
 public struct LuxoParam: Codable, Sendable {
+    public let id: Int
     public let name: String
     public let type: String
-    public let required: Bool?
+    public let typeName: String?
+    public let nullable: Bool?
+    public let hasDefault: Bool?
     public let isList: Bool?
 }

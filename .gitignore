@@ -1,3 +1,6 @@
+.DS_Store
+.tmp/
+coverage.lcov
 .build/
 .swiftpm/
 *.xcodeproj/

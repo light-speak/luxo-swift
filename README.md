@@ -93,16 +93,15 @@ Or in Xcode: **File → Add Package Dependencies → paste the URL above.**
 ```swift
 import LuxoClient
 
-let transport = URLSessionTransport(
+let transport = try URLSessionTransport(
     endpoint: "https://api.example.com/luvia",
     token: "your-jwt-token",
-    timeout: 30,
-    onTokenExpired: {
-        // Auto-refresh on 401
-        let newToken = await refreshToken()
-        return newToken
-    }
+    timeout: 30
 )
+transport.onTokenExpired = {
+    // Auto-refresh on 401
+    await refreshToken()
+}
 
 // Every API call is one line
 let user = try await transport.call("getUser", params: ["id": 1])
@@ -116,7 +115,7 @@ let posts = try await transport.call("listPosts", params: ["page": 1, "pageSize"
 Native `URLSession` with HTTP/2 multiplexing. Works on iOS 15+, macOS 13+:
 
 ```swift
-let transport = URLSessionTransport(endpoint: "https://api.example.com/luvia")
+let transport = try URLSessionTransport(endpoint: "https://api.example.com/luvia")
 ```
 
 ### WebSocket — Real-time Subscriptions
@@ -124,14 +123,16 @@ let transport = URLSessionTransport(endpoint: "https://api.example.com/luvia")
 Auto-reconnect with exponential backoff (1s → 2s → 4s → ... → 30s max):
 
 ```swift
-let ws = WebSocketTransport(
-    endpoint: "wss://api.example.com/ws",
+let ws = try WebSocketTransport(
+    url: "wss://api.example.com/ws",
     token: "jwt-token"
 )
-ws.onMessage = { data in
-    print("Received: \(data)")
-}
 ws.connect()
+let unsubscribe = try await ws.subscribe("postCreated") { value in
+    print("Received: \(value)")
+}
+
+// Later: unsubscribe()
 ```
 
 ### Binary Mode — 3x Smaller Than JSON
@@ -148,12 +149,10 @@ transport.setSchema(LUXO_SCHEMA) // from codegen
 Token expires? The SDK calls your callback, gets a new token, retries automatically:
 
 ```swift
-let transport = URLSessionTransport(
-    endpoint: endpoint,
-    onTokenExpired: {
-        return await myAuthService.refresh() // nil = give up
-    }
-)
+let transport = try URLSessionTransport(endpoint: endpoint)
+transport.onTokenExpired = {
+    await myAuthService.refresh() // nil = give up
+}
 ```
 
 ### Binary Codec
@@ -167,8 +166,8 @@ encoder.writeString("hello")
 encoder.writeSvarint(-100)
 encoder.writeFixed64(3.14)
 
-var decoder = Decoder(data: encoder.data)
-decoder.readSvarint() // 42
+var decoder = Decoder(encoder.data)
+decoder.readVarint()  // 42
 decoder.readString()  // "hello"
 decoder.readSvarint() // -100
 decoder.readFixed64() // 3.14
@@ -196,14 +195,13 @@ Compile-time field tracking via SwiftSyntax AST analysis:
 Generate typed client from schema introspection:
 
 ```swift
-import LuxoCompiler
+import LuxoClient
 
-let codegen = LuxoCodegen(
+let codegen = try LuxoCodegen(
     endpoint: "http://localhost:4000/luvia",
-    key: "YOUR_KEY",
-    outputDir: "Sources/YourApp/Luxo"
+    introspectionKey: "YOUR_KEY"
 )
-try await codegen.generate()
+try await codegen.generate(outputDir: "Sources/YourApp/Luxo")
 ```
 
 Generates:
@@ -212,12 +210,18 @@ Generates:
 - `Schema.swift` — API schema map
 - `Client.swift` — typed client with async/await methods
 
+Generated output fields use `Selected<Value>` to distinguish unselected,
+selected `nil`, and selected value without fabricated defaults. Input DTOs are
+strict; a schema type used for both input and output generates `Foo` and
+`FooInput`. Call `try field.requireValue()` after selecting a field; attempting
+to read an unselected field throws `SelectionError`.
+
 ## Products
 
 | Product | Description |
 |---------|-------------|
-| **LuxoClient** | Core library — transport, codec, types, error |
-| **LuxoCompiler** | Codegen + SwiftSyntax analyzer |
+| **LuxoClient** | Transport, codec, types, errors, and code generation |
+| **LuxoCompiler** | SwiftSyntax field-selection analyzer |
 | **LuxoAnalyze** | CLI tool for field tracking analysis |
 
 ## Ecosystem

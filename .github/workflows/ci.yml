@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v5
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-swiftpm-${{ hashFiles('Package.swift') }}
+
+      - name: Resolve dependencies
+        run: swift package resolve
+
+      - name: Check formatting
+        run: swift format lint --recursive --strict Sources Tests Package.swift
+
+      - name: Build release with strict concurrency
+        run: swift build -c release -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete
+
+      - name: Test with coverage
+        run: swift test --parallel --enable-code-coverage -Xswiftc -warnings-as-errors
+
+      - name: Enforce source coverage
+        run: bash Scripts/check-coverage.sh 90.0 coverage.lcov
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          files: coverage.lcov
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  thread-sanitizer:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Test transport concurrency
+        run: swift test --sanitize=thread --filter TransportTests
+
+  external-consumer:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build package as an external consumer
+        run: |
+          mkdir -p Tests/Consumer/.tmp/generated-consumer
+          cp Tests/Consumer/Fixtures/GeneratedMain.swift Tests/Consumer/.tmp/generated-consumer/main.swift
+          swift build \
+            --package-path Tests/Consumer \
+            --product LuxoConsumer \
+            --scratch-path .tmp/consumer-build \
+            -Xswiftc -warnings-as-errors \
+            -Xswiftc -strict-concurrency=complete
+
+      - name: Generate and compile a schema consumer
+        run: |
+          python3 -m http.server 18080 --bind 127.0.0.1 --directory Tests/Consumer/Fixtures &
+          server_pid=$!
+          trap 'kill "${server_pid}"' EXIT
+          curl --retry 20 --retry-connrefused --retry-delay 1 -fsS -o /dev/null http://127.0.0.1:18080/luxo.schema.json
+          .tmp/consumer-build/debug/LuxoConsumer --generate http://127.0.0.1:18080/luxo.schema.json Tests/Consumer/.tmp/generated-consumer
+          cp Tests/Consumer/Fixtures/GeneratedMain.swift Tests/Consumer/.tmp/generated-consumer/main.swift
+          swift build \
+            --package-path Tests/Consumer \
+            --product LuxoGeneratedConsumer \
+            --scratch-path .tmp/generated-consumer-build \
+            -Xswiftc -warnings-as-errors \
+            -Xswiftc -strict-concurrency=complete
+          swift run LuxoAnalyze \
+            --source-dir Tests/Consumer/.tmp/generated-consumer \
+            --output Tests/Consumer/.tmp/SelectHints.swift
+          grep -F '"getRecord": "profile{name}"' Tests/Consumer/.tmp/SelectHints.swift

@@ -1,5 +1,11 @@
 import Foundation
 
+private enum CodecLimits {
+    static let maxArrayElements: UInt64 = 1_000_000
+    static let maxColumnarRecords: UInt64 = 10_000_000
+    static let maxArenaSize: UInt64 = 64 * 1024 * 1024
+}
+
 // MARK: - Encoder
 
 /// Binary encoder for Luxo protocol. Zero-copy, varint-based.
@@ -40,6 +46,10 @@ public struct Encoder {
 
     public mutating func writeBytes(_ value: Data) {
         writeVarint(UInt64(value.count))
+        writeRawBytes(value)
+    }
+
+    public mutating func writeRawBytes(_ value: Data) {
         data.append(value)
     }
 
@@ -61,72 +71,95 @@ public struct Encoder {
         writeVarint(UInt64(count))
     }
 
-    public mutating func writeField(_ fieldID: Int, value: Any, type: String) {
+    public mutating func writeField(_ fieldID: Int, value: Any, type: String) throws {
+        var encoded = Encoder()
+        try encoded.writeValue(value, type: type)
         writeVarint(UInt64(fieldID))
-        switch type {
-        case "Int", "Duration":
-            writeSvarint(value as? Int64 ?? Int64(value as? Int ?? 0))
-        case "Float":
-            writeFixed64(value as? Double ?? 0)
-        case "Boolean":
-            writeBool(value as? Bool ?? false)
-        case "UUID":
-            // UUID is a fixed 16-byte value; accept Foundation.UUID or canonical string.
-            if let u = value as? UUID {
-                writeUUID(u)
-            } else if let s = value as? String, let u = UUID(uuidString: s) {
-                writeUUID(u)
-            } else {
-                writeUUID(UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)))
-            }
-        case "String", "Enum", "Decimal":
-            writeString(value as? String ?? "")
-        case "DateTime":
-            // Per protocol: DateTime = svarint(unix seconds). Accept Date or ISO string.
-            let sec: Int64
-            if let d = value as? Date {
-                sec = Int64(d.timeIntervalSince1970)
-            } else if let s = value as? String,
-                      let d = ISO8601DateFormatter().date(from: s) {
-                sec = Int64(d.timeIntervalSince1970)
-            } else if let i = value as? Int64 {
-                sec = i
-            } else {
-                sec = 0
-            }
-            writeSvarint(sec)
-        default:
-            break
-        }
+        writeRawBytes(encoded.data)
     }
 
     /// Write a list param field: [fieldID][varint count][item0][item1]...
     /// Each item is encoded by its element type (no per-item field ID).
-    public mutating func writeFieldList(_ fieldID: Int, values: [Any], type: String) {
-        writeVarint(UInt64(fieldID))
-        writeArrayHeader(values.count)
+    public mutating func writeFieldList(_ fieldID: Int, values: [Any], type: String) throws {
+        var encoded = Encoder()
+        encoded.writeArrayHeader(values.count)
         for value in values {
-            switch type {
-            case "Int", "Duration", "DateTime":
-                writeSvarint(value as? Int64 ?? Int64(value as? Int ?? 0))
-            case "Float":
-                writeFixed64(value as? Double ?? 0)
-            case "Boolean":
-                writeBool(value as? Bool ?? false)
-            case "UUID":
-                if let u = value as? UUID {
-                    writeUUID(u)
-                } else if let s = value as? String, let u = UUID(uuidString: s) {
-                    writeUUID(u)
-                } else {
-                    writeUUID(UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)))
-                }
-            case "Bytes":
-                writeBytes(value as? Data ?? Data())
-            default:
-                writeString(value as? String ?? "")
-            }
+            try encoded.writeValue(value, type: type)
         }
+        writeVarint(UInt64(fieldID))
+        writeRawBytes(encoded.data)
+    }
+
+    private mutating func writeValue(_ value: Any, type: String) throws {
+        switch type {
+        case "Int", "Duration":
+            if let value = value as? Int64 {
+                writeSvarint(value)
+            } else if let value = value as? Int {
+                writeSvarint(Int64(value))
+            } else {
+                throw invalidValue(type)
+            }
+        case "Float":
+            if let value = value as? Double {
+                writeFixed64(value)
+            } else if let value = value as? Float {
+                writeFixed64(Double(value))
+            } else {
+                throw invalidValue(type)
+            }
+        case "Boolean":
+            guard let value = value as? Bool else { throw invalidValue(type) }
+            writeBool(value)
+        case "UUID":
+            if let value = value as? UUID {
+                writeUUID(value)
+            } else if let value = value as? String, let uuid = UUID(uuidString: value) {
+                writeUUID(uuid)
+            } else {
+                throw invalidValue(type)
+            }
+        case "String", "Enum", "Decimal":
+            guard let value = value as? String else { throw invalidValue(type) }
+            writeString(value)
+        case "DateTime":
+            if let value = value as? Date {
+                writeSvarint(Int64(value.timeIntervalSince1970))
+            } else if let value = value as? String,
+                let date = ISO8601DateFormatter().date(from: value)
+            {
+                writeSvarint(Int64(date.timeIntervalSince1970))
+            } else if let value = value as? Int64 {
+                writeSvarint(value)
+            } else {
+                throw invalidValue(type)
+            }
+        case "Bytes":
+            guard let value = value as? Data else { throw invalidValue(type) }
+            writeBytes(value)
+        case "JSON":
+            if let value = value as? JSONValue {
+                writeBytes(try JSONEncoder().encode(value))
+            } else {
+                guard
+                    JSONSerialization.isValidJSONObject(value) || value is String || value is NSNumber
+                        || value is NSNull
+                else {
+                    throw invalidValue(type)
+                }
+                let encoded = try JSONSerialization.data(
+                    withJSONObject: value,
+                    options: [.fragmentsAllowed, .sortedKeys]
+                )
+                writeBytes(encoded)
+            }
+        default:
+            throw LuxoError(code: 0, message: "unsupported binary type: \(type)", name: "ConfigError")
+        }
+    }
+
+    private func invalidValue(_ type: String) -> LuxoError {
+        LuxoError(code: 0, message: "invalid \(type) value", name: "ConfigError")
     }
 }
 
@@ -137,23 +170,39 @@ public struct Decoder {
     private let data: Data
     private var offset: Int = 0
 
+    /// The first wire-format error encountered while decoding.
+    public private(set) var error: String?
+
     public init(_ data: Data) {
         self.data = data
     }
 
     public var isAtEnd: Bool { offset >= data.count }
+    public var remaining: Int { data.count - offset }
+
+    public mutating func readRemainingData() -> Data {
+        let remaining = Data(data[offset...])
+        offset = data.count
+        return remaining
+    }
 
     public mutating func readVarint() -> UInt64 {
+        let start = offset
         var result: UInt64 = 0
         var shift: UInt64 = 0
         while offset < data.count {
             let byte = data[offset]
             offset += 1
+            if shift >= 64 || (shift == 63 && byte & 0x7E != 0) {
+                if error == nil { error = "varint overflow at offset \(start)" }
+                return 0
+            }
             result |= UInt64(byte & 0x7F) << shift
-            if byte & 0x80 == 0 { break }
+            if byte & 0x80 == 0 { return result }
             shift += 7
         }
-        return result
+        if error == nil { error = "truncated varint at offset \(start)" }
+        return 0
     }
 
     public mutating func readSvarint() -> Int64 {
@@ -163,31 +212,44 @@ public struct Decoder {
     }
 
     public mutating func readFixed64() -> Double {
-        guard offset + 8 <= data.count else { return 0 }
-        let bits = data[offset..<offset+8].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+        guard offset + 8 <= data.count else {
+            if error == nil { error = "truncated fixed64 at offset \(offset)" }
+            return 0
+        }
+        let bits = data[offset..<offset + 8].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
         offset += 8
         return Double(bitPattern: bits)
     }
 
     public mutating func readBool() -> Bool {
-        guard offset < data.count else { return false }
-        let v = data[offset]
-        offset += 1
-        return v != 0
+        return readCanonicalMarker("bool")
     }
 
     public mutating func readString() -> String {
-        let len = Int(readVarint())
-        guard offset + len <= data.count else { return "" }
-        let str = String(data: data[offset..<offset+len], encoding: .utf8) ?? ""
+        let rawLength = readVarint()
+        guard error == nil, rawLength <= UInt64(Int.max) else { return "" }
+        let len = Int(rawLength)
+        guard len <= data.count - offset else {
+            if error == nil { error = "truncated string at offset \(offset)" }
+            return ""
+        }
+        guard let str = String(data: data[offset..<offset + len], encoding: .utf8) else {
+            if error == nil { error = "invalid UTF-8 string at offset \(offset)" }
+            return ""
+        }
         offset += len
         return str
     }
 
     public mutating func readBytes() -> Data {
-        let len = Int(readVarint())
-        guard offset + len <= data.count else { return Data() }
-        let bytes = data[offset..<offset+len]
+        let rawLength = readVarint()
+        guard error == nil, rawLength <= UInt64(Int.max) else { return Data() }
+        let len = Int(rawLength)
+        guard len <= data.count - offset else {
+            if error == nil { error = "truncated bytes at offset \(offset)" }
+            return Data()
+        }
+        let bytes = data[offset..<offset + len]
         offset += len
         return Data(bytes)
     }
@@ -195,15 +257,17 @@ public struct Decoder {
     /// Read a fixed 16-byte UUID (no length prefix). Returns a zero UUID on truncation.
     public mutating func readUUID() -> UUID {
         guard offset + 16 <= data.count else {
+            if error == nil { error = "truncated uuid at offset \(offset)" }
             return UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
         }
-        let b = data[offset..<offset+16]
+        let b = data[offset..<offset + 16]
         offset += 16
         let a = Array(b)
-        return UUID(uuid: (
-            a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
-            a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]
-        ))
+        return UUID(
+            uuid: (
+                a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]
+            ))
     }
 
     /// Read a nullable UUID (null flag + 16 bytes).
@@ -233,15 +297,10 @@ public struct Decoder {
     /// Format unix seconds as an RFC3339/ISO-8601 UTC string (e.g. `2021-07-14T02:40:00Z`).
     static func dateTimeString(fromUnixSeconds seconds: Int64) -> String {
         let date = Date(timeIntervalSince1970: TimeInterval(seconds))
-        return Decoder.iso8601Formatter.string(from: date)
+        return date.formatted(Decoder.iso8601Format)
     }
 
-    private static let iso8601Formatter: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        f.timeZone = TimeZone(secondsFromGMT: 0)
-        return f
-    }()
+    private static let iso8601Format = Date.ISO8601FormatStyle(timeZone: .gmt)
 
     /// Skip the arena header (totalStringLen varint) that prefixes each model's binary data.
     public mutating func skipArenaHeader() {
@@ -251,18 +310,38 @@ public struct Decoder {
     /// Read next field ID. Returns 0 for end marker.
     public mutating func nextField() -> Int {
         guard !isAtEnd else { return 0 }
-        let id = Int(readVarint())
-        return id
+        let rawID = readVarint()
+        guard error == nil, rawID <= UInt64(Int.max) else {
+            if error == nil { error = "field ID exceeds platform integer range" }
+            return 0
+        }
+        return Int(rawID)
     }
 
     // MARK: - Nullable Readers
 
     /// Read nullable flag byte. Returns true if value is present (0x01).
     private mutating func readNullFlag() -> Bool {
-        guard offset < data.count else { return false }
-        let flag = data[offset]
+        return readCanonicalMarker("nullable")
+    }
+
+    private mutating func readCanonicalMarker(_ kind: String) -> Bool {
+        guard offset < data.count else {
+            if error == nil { error = "truncated \(kind) marker at offset \(offset)" }
+            return false
+        }
+        let markerOffset = offset
+        let marker = data[offset]
         offset += 1
-        return flag != 0x00
+        switch marker {
+        case 0x00:
+            return false
+        case 0x01:
+            return true
+        default:
+            if error == nil { error = "invalid \(kind) marker at offset \(markerOffset)" }
+            return false
+        }
     }
 
     /// Read a nullable Int64 (null flag + zigzag varint).
@@ -289,16 +368,26 @@ public struct Decoder {
         return readBool()
     }
 
+    public mutating func readNullable<T>(_ decode: (inout Decoder) throws -> T) rethrows -> T? {
+        if !readNullFlag() { return nil }
+        return try decode(&self)
+    }
+
     // MARK: - Array Reader
 
     /// Read an array of items using a decoder closure.
     /// Format: varint count, then count items decoded by the closure.
-    public mutating func readArray<T>(_ decode: (inout Decoder) -> T) -> [T] {
-        let count = Int(readVarint())
+    public mutating func readArray<T>(_ decode: (inout Decoder) throws -> T) rethrows -> [T] {
+        let rawCount = readVarint()
+        guard error == nil, rawCount <= CodecLimits.maxArrayElements else {
+            if error == nil { error = "array count \(rawCount) exceeds limit \(CodecLimits.maxArrayElements)" }
+            return []
+        }
+        let count = Int(rawCount)
         var items: [T] = []
         items.reserveCapacity(count)
         for _ in 0..<count {
-            items.append(decode(&self))
+            items.append(try decode(&self))
         }
         return items
     }
@@ -311,6 +400,7 @@ public struct Decoder {
 /// Columnar format:
 /// ```
 /// [count varint]
+/// [arena size varint]
 /// [fieldID varint][val0][val1]...[valN]  // column 1
 /// [fieldID varint][val0][val1]...[valN]  // column 2
 /// ...
@@ -323,171 +413,137 @@ public struct ColumnarDecoder {
     /// Number of rows in this columnar batch.
     public private(set) var count: Int = 0
 
+    /// Total UTF-8 string bytes advertised for arena allocation.
+    public private(set) var arenaSize: Int = 0
+
     /// The current column's field ID after calling [nextColumn].
     public private(set) var fieldID: Int = 0
+
+    /// The first wire-format error encountered while decoding.
+    public private(set) var error: String?
 
     /// Creates a columnar decoder from raw bytes. Reads the row count varint.
     public init(data: Data) {
         self.data = data
-        self.count = Int(readVarintInternal())
+        guard let rawCount = readVarintValue("columnar record count") else { return }
+        guard rawCount <= CodecLimits.maxColumnarRecords else {
+            fail("columnar count \(rawCount) exceeds limit \(CodecLimits.maxColumnarRecords)")
+            return
+        }
+        count = Int(rawCount)
+
+        guard let rawArenaSize = readVarintValue("columnar arena size") else { return }
+        guard rawArenaSize <= CodecLimits.maxArenaSize else {
+            fail("columnar arena size \(rawArenaSize) exceeds limit \(CodecLimits.maxArenaSize)")
+            return
+        }
+        arenaSize = Int(rawArenaSize)
     }
 
     /// Advance to next column. Returns false at end marker (0x00) or EOF.
     public mutating func nextColumn() -> Bool {
-        if off >= data.count { return false }
-        let id = Int(readVarintInternal())
-        fieldID = id
-        return id != 0
+        if error != nil { return false }
+        guard off < data.count else {
+            fail("missing columnar end marker at offset \(off)")
+            return false
+        }
+        guard let rawID = readVarintValue("column field ID") else { return false }
+        if rawID == 0 {
+            fieldID = 0
+            return false
+        }
+        guard rawID <= UInt64(Int.max) else {
+            fail("column field ID exceeds platform integer range")
+            return false
+        }
+        fieldID = Int(rawID)
+        return true
     }
 
     /// Read `count` zigzag-encoded signed int64 values.
     public mutating func readColumnInt() -> [Int64] {
-        var result = [Int64]()
-        result.reserveCapacity(count)
-        for _ in 0..<count {
-            let n = readVarintInternal()
-            result.append(Int64(bitPattern: (n >> 1) ^ (UInt64(bitPattern: -Int64(n & 1)))))
+        readColumn("int") { decoder, index in
+            decoder.readSvarintValue("int column at record \(index)")
         }
-        return result
     }
 
     /// Read `count` fixed64 (8-byte LE) float values.
     public mutating func readColumnFloat() -> [Double] {
-        var result = [Double]()
-        result.reserveCapacity(count)
-        for _ in 0..<count {
-            guard off + 8 <= data.count else { result.append(0); continue }
-            let bits = data[off..<off+8].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
-            off += 8
-            result.append(Double(bitPattern: bits))
+        readColumn("float") { decoder, index in
+            decoder.readFixed64Value("float column at record \(index)")
         }
-        return result
     }
 
     /// Read `count` length-prefixed UTF-8 string values.
     public mutating func readColumnString() -> [String] {
-        var result = [String]()
-        result.reserveCapacity(count)
-        for _ in 0..<count {
-            let len = Int(readVarintInternal())
-            if len == 0 { result.append(""); continue }
-            guard off + len <= data.count else { result.append(""); continue }
-            let str = String(data: data[off..<off+len], encoding: .utf8) ?? ""
-            off += len
-            result.append(str)
+        readColumn("string") { decoder, index in
+            decoder.readStringValue("string column at record \(index)")
         }
-        return result
     }
 
     /// Read `count` boolean values (varint 0/1).
     public mutating func readColumnBool() -> [Bool] {
-        var result = [Bool]()
-        result.reserveCapacity(count)
-        for _ in 0..<count {
-            result.append(readVarintInternal() != 0)
+        readColumn("bool") { decoder, index in
+            decoder.readMarker("bool column at record \(index)")
         }
-        return result
     }
 
     /// Read `count` nullable int values (0x00=null, 0x01+svarint).
     public mutating func readColumnIntPtr() -> [Int64?] {
-        var result = [Int64?]()
-        result.reserveCapacity(count)
-        for _ in 0..<count {
-            guard off < data.count else { result.append(nil); continue }
-            let flag = data[off]; off += 1
-            if flag == 0x00 { result.append(nil); continue }
-            let n = readVarintInternal()
-            result.append(Int64(bitPattern: (n >> 1) ^ (UInt64(bitPattern: -Int64(n & 1)))))
+        readNullableColumn("int") { decoder, index in
+            decoder.readSvarintValue("nullable int value at record \(index)")
         }
-        return result
     }
 
     /// Read `count` nullable float values (0x00=null, 0x01+fixed64).
     public mutating func readColumnFloatPtr() -> [Double?] {
-        var result = [Double?]()
-        result.reserveCapacity(count)
-        for _ in 0..<count {
-            guard off < data.count else { result.append(nil); continue }
-            let flag = data[off]; off += 1
-            if flag == 0x00 { result.append(nil); continue }
-            guard off + 8 <= data.count else { result.append(nil); continue }
-            let bits = data[off..<off+8].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
-            off += 8
-            result.append(Double(bitPattern: bits))
+        readNullableColumn("float") { decoder, index in
+            decoder.readFixed64Value("nullable float value at record \(index)")
         }
-        return result
     }
 
     /// Read `count` nullable string values (0x00=null, 0x01+string).
     public mutating func readColumnStringPtr() -> [String?] {
-        var result = [String?]()
-        result.reserveCapacity(count)
-        for _ in 0..<count {
-            guard off < data.count else { result.append(nil); continue }
-            let flag = data[off]; off += 1
-            if flag == 0x00 { result.append(nil); continue }
-            let len = Int(readVarintInternal())
-            if len == 0 { result.append(""); continue }
-            guard off + len <= data.count else { result.append(nil); continue }
-            let str = String(data: data[off..<off+len], encoding: .utf8) ?? ""
-            off += len
-            result.append(str)
+        readNullableColumn("string") { decoder, index in
+            decoder.readStringValue("nullable string value at record \(index)")
         }
-        return result
     }
 
     /// Read `count` nullable boolean values (0x00=null, 0x01+varint).
     public mutating func readColumnBoolPtr() -> [Bool?] {
-        var result = [Bool?]()
-        result.reserveCapacity(count)
-        for _ in 0..<count {
-            guard off < data.count else { result.append(nil); continue }
-            let flag = data[off]; off += 1
-            if flag == 0x00 { result.append(nil); continue }
-            result.append(readVarintInternal() != 0)
+        readNullableColumn("bool") { decoder, index in
+            decoder.readMarker("nullable bool value at record \(index)")
         }
-        return result
     }
 
     /// Read `count` fixed 16-byte UUID values.
     public mutating func readColumnUUID() -> [UUID] {
-        var result = [UUID]()
-        result.reserveCapacity(count)
-        for _ in 0..<count {
-            result.append(readUUIDInternal())
+        readColumn("UUID") { decoder, index in
+            decoder.readUUIDValue("UUID column at record \(index)")
         }
-        return result
     }
 
     /// Read `count` nullable UUID values (0x00=null, 0x01+16 bytes).
     public mutating func readColumnUUIDPtr() -> [UUID?] {
-        var result = [UUID?]()
-        result.reserveCapacity(count)
-        for _ in 0..<count {
-            guard off < data.count else { result.append(nil); continue }
-            let flag = data[off]; off += 1
-            if flag == 0x00 { result.append(nil); continue }
-            result.append(readUUIDInternal())
+        readNullableColumn("UUID") { decoder, index in
+            decoder.readUUIDValue("nullable UUID value at record \(index)")
         }
-        return result
     }
 
     /// Read `count` length-prefixed byte blobs.
     /// Used for scalar array-field columns: each cell is an inline `[count][items...]`
     /// array wrapped as a length-prefixed blob.
     public mutating func readColumnBytes() -> [Data] {
-        var result = [Data]()
-        result.reserveCapacity(count)
-        for _ in 0..<count {
-            let len = Int(readVarintInternal())
-            if len == 0 { result.append(Data()); continue }
-            guard off + len <= data.count else { result.append(Data()); continue }
-            let bytes = data[off..<off+len]
-            off += len
-            result.append(Data(bytes))
+        readColumn("bytes") { decoder, index in
+            decoder.readBytesValue("bytes column at record \(index)")
         }
-        return result
+    }
+
+    /// Read `count` nullable byte blobs (0x00=null, 0x01+length+bytes).
+    public mutating func readColumnBytesPtr() -> [Data?] {
+        readNullableColumn("bytes") { decoder, index in
+            decoder.readBytesValue("nullable bytes value at record \(index)")
+        }
     }
 
     /// Read `count` DateTime values (svarint unix seconds) as RFC3339/ISO-8601 strings.
@@ -508,36 +564,141 @@ public struct ColumnarDecoder {
 
     /// Read one signed zigzag-encoded varint at current position.
     public mutating func readSvarint() -> Int64 {
-        let n = readVarintInternal()
-        return Int64(bitPattern: (n >> 1) ^ (UInt64(bitPattern: -Int64(n & 1))))
+        readSvarintValue("signed varint") ?? 0
     }
 
     // MARK: - Internal
 
-    private mutating func readVarintInternal() -> UInt64 {
+    private mutating func readColumn<T>(
+        _ name: String,
+        read: (inout ColumnarDecoder, Int) -> T?
+    ) -> [T] {
+        guard error == nil else { return [] }
+        var result: [T] = []
+        result.reserveCapacity(count)
+        for index in 0..<count {
+            guard let value = read(&self, index) else {
+                fail("invalid \(name) column at record \(index)")
+                return []
+            }
+            result.append(value)
+        }
+        return result
+    }
+
+    private mutating func readNullableColumn<T>(
+        _ name: String,
+        read: (inout ColumnarDecoder, Int) -> T?
+    ) -> [T?] {
+        guard error == nil else { return [] }
+        var result: [T?] = []
+        result.reserveCapacity(count)
+        for index in 0..<count {
+            guard let present = readMarker("nullable \(name) marker at record \(index)") else { return [] }
+            guard present else {
+                result.append(nil)
+                continue
+            }
+            guard let value = read(&self, index) else { return [] }
+            result.append(value)
+        }
+        return result
+    }
+
+    private mutating func readVarintValue(_ context: String) -> UInt64? {
+        let start = off
         var result: UInt64 = 0
         var shift: UInt64 = 0
         while off < data.count {
             let byte = data[off]
             off += 1
+            if shift >= 64 || (shift == 63 && byte & 0x7E != 0) {
+                fail("varint overflow in \(context) at offset \(start)")
+                return nil
+            }
             result |= UInt64(byte & 0x7F) << shift
-            if byte & 0x80 == 0 { break }
+            if byte & 0x80 == 0 { return result }
             shift += 7
         }
+        fail("truncated varint in \(context) at offset \(start)")
+        return nil
+    }
+
+    private mutating func readSvarintValue(_ context: String) -> Int64? {
+        guard let value = readVarintValue(context) else { return nil }
+        return Int64(bitPattern: (value >> 1) ^ UInt64(bitPattern: -Int64(value & 1)))
+    }
+
+    private mutating func readFixed64Value(_ context: String) -> Double? {
+        guard off <= data.count, data.count - off >= 8 else {
+            fail("truncated \(context) at offset \(off)")
+            return nil
+        }
+        let bits = data[off..<off + 8].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+        off += 8
+        return Double(bitPattern: bits)
+    }
+
+    private mutating func readBytesValue(_ context: String) -> Data? {
+        guard let rawLength = readVarintValue("\(context) length"), rawLength <= UInt64(Int.max) else {
+            if error == nil { fail("\(context) length exceeds platform integer range") }
+            return nil
+        }
+        let length = Int(rawLength)
+        guard off <= data.count, length <= data.count - off else {
+            fail("truncated \(context) at offset \(off)")
+            return nil
+        }
+        let result = Data(data[off..<off + length])
+        off += length
         return result
     }
 
-    /// Read a fixed 16-byte UUID at the current position. Zero UUID on truncation.
-    private mutating func readUUIDInternal() -> UUID {
-        guard off + 16 <= data.count else {
-            return UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+    private mutating func readStringValue(_ context: String) -> String? {
+        let start = off
+        guard let bytes = readBytesValue(context) else { return nil }
+        guard let value = String(data: bytes, encoding: .utf8) else {
+            fail("invalid UTF-8 in \(context) at offset \(start)")
+            return nil
         }
-        let a = Array(data[off..<off+16])
+        return value
+    }
+
+    private mutating func readMarker(_ context: String) -> Bool? {
+        guard off < data.count else {
+            fail("truncated \(context) at offset \(off)")
+            return nil
+        }
+        let markerOffset = off
+        let marker = data[off]
+        off += 1
+        switch marker {
+        case 0x00:
+            return false
+        case 0x01:
+            return true
+        default:
+            fail("invalid \(context) at offset \(markerOffset)")
+            return nil
+        }
+    }
+
+    private mutating func readUUIDValue(_ context: String) -> UUID? {
+        guard off <= data.count, data.count - off >= 16 else {
+            fail("truncated \(context) at offset \(off)")
+            return nil
+        }
+        let a = Array(data[off..<off + 16])
         off += 16
-        return UUID(uuid: (
-            a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
-            a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]
-        ))
+        return UUID(
+            uuid: (
+                a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]
+            ))
+    }
+
+    private mutating func fail(_ message: String) {
+        if error == nil { error = message }
     }
 }
 
@@ -545,8 +706,10 @@ public struct ColumnarDecoder {
 
 /// Set a field as selected in a bitmask.
 public func fieldMaskSet(_ mask: inout [UInt8], fieldID: Int) {
-    let byteIndex = fieldID / 8
-    let bitIndex = fieldID % 8
+    guard fieldID > 0 else { return }
+    let bit = fieldID - 1
+    let byteIndex = bit / 8
+    let bitIndex = bit % 8
     while mask.count <= byteIndex {
         mask.append(0)
     }
@@ -555,8 +718,10 @@ public func fieldMaskSet(_ mask: inout [UInt8], fieldID: Int) {
 
 /// Check if a field is selected in a bitmask.
 public func fieldMaskHas(_ mask: [UInt8], fieldID: Int) -> Bool {
-    let byteIndex = fieldID / 8
-    let bitIndex = fieldID % 8
+    guard fieldID > 0 else { return false }
+    let bit = fieldID - 1
+    let byteIndex = bit / 8
+    let bitIndex = bit % 8
     guard byteIndex < mask.count else { return false }
     return mask[byteIndex] & (1 << bitIndex) != 0
 }
