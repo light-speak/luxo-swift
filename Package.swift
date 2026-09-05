@@ -25,7 +25,11 @@ let package = Package(
             name: "LuxoAnalyze",
             dependencies: ["LuxoCompiler"]
         ),
-        .testTarget(name: "LuxoClientTests", dependencies: ["LuxoClient"]),
+        .testTarget(
+            name: "LuxoClientTests",
+            dependencies: ["LuxoClient"],
+            resources: [.copy("Fixtures")]
+        ),
         .testTarget(name: "LuxoCompilerTests", dependencies: ["LuxoCompiler"]),
     ]
 )
