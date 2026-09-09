@@ -46,7 +46,9 @@ final class CodegenTests: XCTestCase {
         let source = codegen.generateSchema(schema)
 
         XCTAssertTrue(source.contains("fieldID: 9"))
-        XCTAssertTrue(source.contains("\"data\": .init(fieldID: 4)"))
+        XCTAssertTrue(
+            source.contains("\"data\": .init(fieldID: 4, type: \"Bytes\", isList: false, nullable: false)")
+        )
         XCTAssertTrue(source.contains("fields: LUXO_SELECTION_FIELDS_Payload"))
         XCTAssertFalse(source.contains("LUXO_SELECTION_TYPES[\"Payload\"]!"))
     }
@@ -111,7 +113,7 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(client.contains("callParams[\"$sorters\"] = .array(sorters.map(\\.transportValue))"))
     }
 
-    func testClientKeepsStructuredParamsStronglyTypedAndJSONEncodesThem() throws {
+    func testClientKeepsStructuredParamsStronglyTypedAndUsesNativeBinaryEncoding() throws {
         let input = LuxoTypeDecl(
             name: "CreateInput",
             fields: [
@@ -129,19 +131,126 @@ final class CodegenTests: XCTestCase {
             stream: false,
             params: [
                 LuxoParam(
-                    id: 1, name: "input", type: "JSON", typeName: "CreateInput", nullable: false, hasDefault: false,
+                    id: 1, name: "input", type: "Model", typeName: "CreateInput", nullable: false, hasDefault: false,
                     isList: false)
             ]
         )
         let payload = LuxoModel(name: "Payload", fields: [])
         let schema = LuxoSchema(
             models: ["Payload": payload], apis: ["createPayload": api], enums: nil, types: ["CreateInput": input])
-        let source = try makeCodegen().generateClient(schema)
+        let codegen = try makeCodegen()
+        let source = codegen.generateClient(schema)
+        let models = codegen.generateModels(schema)
+        let generatedSchema = codegen.generateSchema(schema)
 
         XCTAssertTrue(source.contains("input: CreateInput"))
-        XCTAssertTrue(source.contains("try LuxoValue.encode(input)"))
+        XCTAssertTrue(source.contains("callParams[\"input\"] = .structured(input)"))
         XCTAssertTrue(source.contains("input: CreateInput, select: String? = nil"))
         XCTAssertTrue(source.contains("callParams[\"$select\"] = .string(select)"))
+        XCTAssertTrue(models.contains("public struct CreateInput: Codable, Sendable, LuxoBinaryEncodable"))
+        XCTAssertTrue(models.contains("public func writeLuxo(to encoder: inout Encoder) throws"))
+        XCTAssertTrue(models.contains("encoder.writeString(name)"))
+        XCTAssertTrue(
+            generatedSchema.contains(
+                "type: \"Model\", typeName: \"CreateInput\", isList: false, nullable: false"
+            )
+        )
+    }
+
+    func testStructuredInputGeneratesNestedListsNullableValuesAndArenaLength() throws {
+        let role = LuxoEnum(name: "Role", values: ["ADMIN", "USER"])
+        let child = LuxoTypeDecl(
+            name: "ChildInput",
+            fields: [field(1, "label", "String")]
+        )
+        let input = LuxoTypeDecl(
+            name: "CreateInput",
+            fields: [
+                field(1, "name", "String"),
+                field(2, "role", "Enum", typeName: "Role"),
+                field(3, "child", "Model", typeName: "ChildInput"),
+                field(4, "tags", "String", isList: true),
+                field(5, "note", "String", nullable: true),
+            ]
+        )
+        let api = LuxoAPI(
+            id: 1, name: "create", module: "test", returnType: "Boolean", returnList: false, paginated: false,
+            stream: false,
+            params: [
+                LuxoParam(
+                    id: 1, name: "input", type: "Model", typeName: "CreateInput", nullable: false,
+                    hasDefault: false, isList: false)
+            ]
+        )
+        let schema = LuxoSchema(
+            models: [:], apis: ["create": api], enums: ["Role": role],
+            types: ["CreateInput": input, "ChildInput": child]
+        )
+
+        let source = try makeCodegen().generateModels(schema)
+        for expected in [
+            "encoder.writeVarint(UInt64(name.utf8.count + role.rawValue.utf8.count + (note.map { $0.utf8.count } ?? 0)))",
+            "encoder.writeString(role.rawValue)",
+            "try child.writeLuxo(to: &encoder)",
+            "encoder.writeArrayHeader(tags.count)",
+            "for item in tags",
+            "encoder.writeBool(false)",
+            "encoder.writeBool(true)",
+        ] {
+            XCTAssertTrue(source.contains(expected), "missing \(expected):\n\(source)")
+        }
+    }
+
+    func testStructuredParamListsAndOptionalStatesStayNative() throws {
+        let input = LuxoTypeDecl(name: "Input", fields: [field(1, "name", "String")])
+        let api = LuxoAPI(
+            id: 1, name: "write", module: "test", returnType: "Boolean", returnList: false, paginated: false,
+            stream: false,
+            params: [
+                LuxoParam(
+                    id: 1, name: "inputs", type: "Model", typeName: "Input", nullable: false, hasDefault: false,
+                    isList: true),
+                LuxoParam(
+                    id: 2, name: "optional", type: "Model", typeName: "Input", nullable: true, hasDefault: false,
+                    isList: false),
+                LuxoParam(
+                    id: 3, name: "defaulted", type: "Model", typeName: "Input", nullable: false, hasDefault: true,
+                    isList: false),
+                LuxoParam(
+                    id: 4, name: "patch", type: "Model", typeName: "Input", nullable: true, hasDefault: true,
+                    isList: false),
+            ]
+        )
+        let schema = LuxoSchema(models: [:], apis: ["write": api], enums: nil, types: ["Input": input])
+        let source = try makeCodegen().generateClient(schema)
+
+        for expected in [
+            "callParams[\"inputs\"] = .array(inputs.map { .structured($0) })",
+            "if let optional { callParams[\"optional\"] = .structured(optional) }",
+            "if let defaulted { callParams[\"defaulted\"] = .structured(defaulted) }",
+            "case .present(let value):",
+            "if let value { callParams[\"patch\"] = .structured(value) }",
+        ] {
+            XCTAssertTrue(source.contains(expected), "missing \(expected):\n\(source)")
+        }
+    }
+
+    func testUnsupportedStructuredFieldGeneratesExplicitError() throws {
+        let input = LuxoTypeDecl(name: "Input", fields: [field(1, "value", "Unsupported")])
+        let api = LuxoAPI(
+            id: 1, name: "write", module: "test", returnType: "Boolean", returnList: false, paginated: false,
+            stream: false,
+            params: [
+                LuxoParam(
+                    id: 1, name: "input", type: "Model", typeName: "Input", nullable: false, hasDefault: false,
+                    isList: false)
+            ]
+        )
+        let schema = LuxoSchema(models: [:], apis: ["write": api], enums: nil, types: ["Input": input])
+        let source = try makeCodegen().generateModels(schema)
+
+        XCTAssertTrue(
+            source.contains("throw LuxoError(code: 0, message: \"unsupported binary field type: Unsupported\""))
     }
 
     func testClientDistinguishesRequiredNullFromAbsentPatchValue() throws {

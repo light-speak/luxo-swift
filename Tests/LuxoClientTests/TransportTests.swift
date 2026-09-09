@@ -6,6 +6,17 @@ import XCTest
 #endif
 
 final class TransportTests: XCTestCase {
+    private struct TestInput: Codable, Sendable, LuxoBinaryEncodable {
+        let value: String
+
+        func writeLuxo(to encoder: inout Encoder) throws {
+            encoder.writeVarint(UInt64(value.utf8.count))
+            encoder.writeVarint(1)
+            encoder.writeString(value)
+            encoder.writeEnd()
+        }
+    }
+
     // MARK: - TransportMode
 
     func testTransportModeRawValues() {
@@ -60,6 +71,21 @@ final class TransportTests: XCTestCase {
             params: ["$select": "id,posts{title}"]
         )
         XCTAssertEqual(body, Data([1, 6, 1, 5, 3, 2, 1, 2, 0]))
+    }
+
+    func testBinaryRequestRequiresSelectionForStructuredResponsesOnly() throws {
+        let structured = APISchema(id: 1, fields: ["id": .init(fieldID: 1)])
+        XCTAssertThrowsError(try LuxoBinaryProtocol.encodeRequest(schema: structured, params: [:]))
+        XCTAssertThrowsError(
+            try LuxoBinaryProtocol.encodeRequest(
+                schema: structured,
+                params: ["$select": .string("   ")]
+            )
+        )
+        XCTAssertEqual(
+            try LuxoBinaryProtocol.encodeRequest(schema: APISchema(id: 2), params: [:]),
+            Data([2, 0, 0])
+        )
     }
 
     func testBinaryRequestSupportsBytesAndJSON() throws {
@@ -312,12 +338,42 @@ final class TransportTests: XCTestCase {
             ))
     }
 
-    func testUnknownParamTypesAndNonStringDateTimeAreRejected() {
-        XCTAssertThrowsError(
+    func testStructuredParamsUseNativeLengthDelimitedMessages() throws {
+        let scalar = APISchema(
+            id: 1,
+            params: [.init(fieldID: 2, name: "input", type: "Model", typeName: "Input")]
+        )
+        XCTAssertEqual(
             try LuxoBinaryProtocol.encodeRequest(
-                schema: APISchema(id: 1, params: [.init(fieldID: 1, name: "input", type: "Model")]),
-                params: ["input": ["name": "luxo"]]
-            ))
+                schema: scalar,
+                params: ["input": .structured(TestInput(value: "x"))]
+            ),
+            Data([1, 0, 2, 5, 1, 1, 1, 120, 0, 0])
+        )
+
+        let list = APISchema(
+            id: 1,
+            params: [.init(fieldID: 2, name: "inputs", type: "Model", typeName: "Input", isList: true)]
+        )
+        XCTAssertEqual(
+            try LuxoBinaryProtocol.encodeRequest(
+                schema: list,
+                params: [
+                    "inputs": .array([
+                        .structured(TestInput(value: "x")),
+                        .structured(TestInput(value: "x")),
+                    ])
+                ]
+            ),
+            Data([1, 0, 2, 2, 5, 1, 1, 1, 120, 0, 5, 1, 1, 1, 120, 0, 0])
+        )
+
+        XCTAssertThrowsError(
+            try LuxoBinaryProtocol.encodeRequest(schema: scalar, params: ["input": ["name": "luxo"]])
+        )
+    }
+
+    func testUnknownParamTypesAndNonStringDateTimeAreRejected() {
         XCTAssertThrowsError(
             try LuxoBinaryProtocol.encodeRequest(
                 schema: APISchema(id: 1, params: [.init(fieldID: 1, name: "at", type: "DateTime")]),

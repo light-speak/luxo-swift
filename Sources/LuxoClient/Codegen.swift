@@ -260,7 +260,8 @@ public final class LuxoCodegen {
         usages: [String: TypeUsage],
         output: Bool
     ) -> String {
-        var out = "public struct \(name): Codable, Sendable {\n"
+        let binaryConformance = output ? "" : ", LuxoBinaryEncodable"
+        var out = "public struct \(name): Codable, Sendable\(binaryConformance) {\n"
         for field in fields {
             let base = resolveFieldType(field, schema: schema, usages: usages, input: !output)
             let value = field.nullable ?? false ? "\(base)?" : base
@@ -276,8 +277,91 @@ public final class LuxoCodegen {
         out += "    public init(\(parameters)) {\n"
         for field in fields { out += "        self.\(field.name) = \(field.name)\n" }
         out += "    }\n"
+        if !output {
+            out += generateInputBinaryEncoder(fields: fields, schema: schema)
+        }
         out += "}\n\n"
         return out
+    }
+
+    private func generateInputBinaryEncoder(fields: [LuxoField], schema: LuxoSchema) -> String {
+        let arenaTerms = fields.compactMap(arenaLengthExpression)
+        let arenaLength = arenaTerms.isEmpty ? "0" : arenaTerms.joined(separator: " + ")
+        var out = "\n    public func writeLuxo(to encoder: inout Encoder) throws {\n"
+        out += "        encoder.writeVarint(UInt64(\(arenaLength)))\n"
+        for field in fields {
+            out += generateInputBinaryField(field, schema: schema)
+        }
+        out += "        encoder.writeEnd()\n"
+        out += "    }\n"
+        return out
+    }
+
+    private func arenaLengthExpression(_ field: LuxoField) -> String? {
+        guard !(field.isList ?? false), field.type == "String" || field.type == "Enum" else { return nil }
+        let value = field.type == "Enum" ? "\(field.name).rawValue" : field.name
+        if field.nullable ?? false {
+            let mapped = field.type == "Enum" ? "$0.rawValue.utf8.count" : "$0.utf8.count"
+            return "(\(field.name).map { \(mapped) } ?? 0)"
+        }
+        return "\(value).utf8.count"
+    }
+
+    private func generateInputBinaryField(_ field: LuxoField, schema: LuxoSchema) -> String {
+        var out = "        encoder.writeVarint(UInt64(\(field.id)))\n"
+        guard field.nullable ?? false else {
+            return out + generateInputBinaryValue(field, value: field.name, schema: schema, indent: "        ")
+        }
+        out += "        if let value = \(field.name) {\n"
+        out += "            encoder.writeBool(true)\n"
+        out += generateInputBinaryValue(field, value: "value", schema: schema, indent: "            ")
+        out += "        } else {\n"
+        out += "            encoder.writeBool(false)\n"
+        out += "        }\n"
+        return out
+    }
+
+    private func generateInputBinaryValue(
+        _ field: LuxoField,
+        value: String,
+        schema: LuxoSchema,
+        indent: String
+    ) -> String {
+        guard field.isList ?? false else {
+            return generateInputBinaryScalar(field, value: value, schema: schema, indent: indent)
+        }
+        var out = "\(indent)encoder.writeArrayHeader(\(value).count)\n"
+        out += "\(indent)for item in \(value) {\n"
+        out += generateInputBinaryScalar(field, value: "item", schema: schema, indent: indent + "    ")
+        out += "\(indent)}\n"
+        return out
+    }
+
+    private func generateInputBinaryScalar(
+        _ field: LuxoField,
+        value: String,
+        schema: LuxoSchema,
+        indent: String
+    ) -> String {
+        if isNested(field, schema: schema) {
+            return "\(indent)try \(value).writeLuxo(to: &encoder)\n"
+        }
+        let statement: String
+        switch field.type {
+        case "Int", "Duration": statement = "encoder.writeSvarint(Int64(\(value)))"
+        case "Float": statement = "encoder.writeFixed64(\(value))"
+        case "String", "Decimal": statement = "encoder.writeString(\(value))"
+        case "Enum": statement = "encoder.writeString(\(value).rawValue)"
+        case "Boolean": statement = "encoder.writeBool(\(value))"
+        case "DateTime": statement = "try encoder.writeDateTime(\(value))"
+        case "UUID": statement = "encoder.writeUUID(\(value))"
+        case "Bytes": statement = "encoder.writeBytes(\(value))"
+        case "JSON": statement = "try encoder.writeJSON(\(value))"
+        default:
+            statement =
+                "throw LuxoError(code: 0, message: \"unsupported binary field type: \(field.type)\", name: \"ConfigError\")"
+        }
+        return "\(indent)\(statement)\n"
     }
 
     func generateClient(_ schema: LuxoSchema) -> String {
@@ -341,18 +425,22 @@ public final class LuxoCodegen {
                         paramSetup += "        switch \(p.name) {\n"
                         paramSetup += "        case .absent: break\n"
                         paramSetup += "        case .present(let value):\n"
+                        let value = transportValueExpression(p, value: "value")
                         paramSetup +=
-                            "            if let value { callParams[\"\(p.name)\"] = try LuxoValue.encode(value) } else { callParams[\"\(p.name)\"] = .null }\n"
+                            "            if let value { callParams[\"\(p.name)\"] = \(value) } else { callParams[\"\(p.name)\"] = .null }\n"
                         paramSetup += "        }\n"
                     } else if forceOptional || hasDefault {
+                        let value = transportValueExpression(p, value: p.name)
                         paramSetup +=
-                            "        if let \(p.name) { callParams[\"\(p.name)\"] = try LuxoValue.encode(\(p.name)) }\n"
+                            "        if let \(p.name) { callParams[\"\(p.name)\"] = \(value) }\n"
                     } else if nullable {
+                        let value = transportValueExpression(p, value: p.name)
                         paramSetup +=
-                            "        if let \(p.name) { callParams[\"\(p.name)\"] = try LuxoValue.encode(\(p.name)) } else { callParams[\"\(p.name)\"] = .null }\n"
+                            "        if let \(p.name) { callParams[\"\(p.name)\"] = \(value) } else { callParams[\"\(p.name)\"] = .null }\n"
                     } else {
+                        let value = transportValueExpression(p, value: p.name)
                         paramSetup +=
-                            "        callParams[\"\(p.name)\"] = try LuxoValue.encode(\(p.name))\n"
+                            "        callParams[\"\(p.name)\"] = \(value)\n"
                     }
                 }
             }
@@ -464,6 +552,14 @@ public final class LuxoCodegen {
 
         out += "}\n"
         return out
+    }
+
+    private func transportValueExpression(_ param: LuxoParam, value: String) -> String {
+        guard param.type == "Model" else { return "try LuxoValue.encode(\(value))" }
+        if param.isList ?? false {
+            return ".array(\(value).map { .structured($0) })"
+        }
+        return ".structured(\(value))"
     }
 
     // MARK: - Binary Decoders
@@ -723,7 +819,8 @@ public final class LuxoCodegen {
             let values = fields.map { field in
                 let typeName = field.typeName ?? field.type
                 let nested = isNested(field, schema: schema) ? ", typeName: \"\(typeName)\"" : ""
-                return "\"\(field.name)\": .init(fieldID: \(field.id)\(nested))"
+                return
+                    "\"\(field.name)\": .init(fieldID: \(field.id)\(nested), type: \"\(field.type)\", isList: \(field.isList ?? false), nullable: \(field.nullable ?? false))"
             }.joined(separator: ", ")
             out += "private let \(selectionFieldsName(name)): [String: APISchema.SelectionFieldSchema] = [\(values)]\n"
         }
@@ -740,8 +837,9 @@ public final class LuxoCodegen {
             if let params = api.params, !params.isEmpty {
                 let paramItems = params.map { p in
                     let isList = p.isList ?? false
+                    let typeName = p.typeName.map { ", typeName: \"\($0)\"" } ?? ""
                     return
-                        "APISchema.ParamSchema(fieldID: \(p.id), name: \"\(p.name)\", type: \"\(p.type)\", isList: \(isList), nullable: \(p.nullable ?? false))"
+                        "APISchema.ParamSchema(fieldID: \(p.id), name: \"\(p.name)\", type: \"\(p.type)\"\(typeName), isList: \(isList), nullable: \(p.nullable ?? false))"
                 }
                 paramsStr = "[\(paramItems.joined(separator: ", "))]"
             }
@@ -749,8 +847,9 @@ public final class LuxoCodegen {
             let structuredTypeName = returnType.flatMap { name in
                 schema.models[name] != nil || schema.types?[name] != nil ? name : nil
             }
+            let needsTypes = structuredTypeName != nil || (api.params ?? []).contains { $0.type == "Model" }
             let fieldsStr = structuredTypeName.map(selectionFieldsName) ?? "[:]"
-            let typesStr = structuredTypeName == nil ? "[:]" : "LUXO_SELECTION_TYPES"
+            let typesStr = needsTypes ? "LUXO_SELECTION_TYPES" : "[:]"
             out +=
                 "    \"\(api.name)\": APISchema(id: \(api.id), params: \(paramsStr), fields: \(fieldsStr), types: \(typesStr)),\n"
         }

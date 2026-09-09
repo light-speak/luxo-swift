@@ -2,6 +2,10 @@ import XCTest
 @testable import LuxoClient
 
 final class CodecTests: XCTestCase {
+    private enum TestError: Error {
+        case failed
+    }
+
     func testVarintRoundTrip() {
         var encoder = Encoder()
         encoder.writeVarint(300)
@@ -23,6 +27,31 @@ final class CodecTests: XCTestCase {
         encoder.writeString("hello 世界")
         var decoder = Decoder(encoder.data)
         XCTAssertEqual(decoder.readString(), "hello 世界")
+    }
+
+    func testLengthDelimitedWritesInPlaceAndRollsBackOnError() throws {
+        var encoder = Encoder()
+        encoder.writeDelimited { value in
+            value.writeVarint(7)
+            value.writeString("go")
+        }
+        XCTAssertEqual(encoder.data, Data([4, 7, 2, 103, 111]))
+
+        var large = Encoder()
+        large.writeDelimited { value in
+            value.writeRawBytes(Data(repeating: 9, count: 130))
+        }
+        XCTAssertEqual(large.data.prefix(2), Data([130, 1]))
+        XCTAssertEqual(large.data.dropFirst(2), Data(repeating: 9, count: 130))
+
+        let before = encoder.data
+        XCTAssertThrowsError(
+            try encoder.writeDelimited { value in
+                value.writeVarint(99)
+                throw TestError.failed
+            }
+        )
+        XCTAssertEqual(encoder.data, before)
     }
 
     func testBoolRoundTrip() {

@@ -49,8 +49,61 @@ public struct Encoder {
         writeRawBytes(value)
     }
 
+    public mutating func writeDateTime(_ value: String) throws {
+        guard let date = ISO8601DateFormatter().date(from: value) else {
+            throw LuxoError(code: 0, message: "invalid DateTime value", name: "ConfigError")
+        }
+        writeSvarint(Int64(date.timeIntervalSince1970))
+    }
+
+    public mutating func writeJSON(_ value: JSONValue) throws {
+        writeBytes(try JSONEncoder().encode(value))
+    }
+
     public mutating func writeRawBytes(_ value: Data) {
         data.append(value)
+    }
+
+    /// Writes a length-prefixed value into the current buffer without a child buffer.
+    public mutating func writeDelimited(
+        _ writeValue: (inout Encoder) throws -> Void
+    ) rethrows {
+        let prefixPosition = data.count
+        data.append(0)
+        let valuePosition = data.count
+        do {
+            try writeValue(&self)
+        } catch {
+            data.removeSubrange(prefixPosition...)
+            throw error
+        }
+        let valueLength = data.count - valuePosition
+        let shift = varintLength(UInt64(valueLength)) - 1
+        if shift > 0 {
+            data.insert(contentsOf: repeatElement(0, count: shift), at: valuePosition)
+        }
+        writeVarint(UInt64(valueLength), at: prefixPosition)
+    }
+
+    private func varintLength(_ value: UInt64) -> Int {
+        var value = value
+        var length = 1
+        while value >= 0x80 {
+            value >>= 7
+            length += 1
+        }
+        return length
+    }
+
+    private mutating func writeVarint(_ value: UInt64, at position: Int) {
+        var value = value
+        var position = position
+        while value >= 0x80 {
+            data[position] = UInt8(value & 0x7F) | 0x80
+            value >>= 7
+            position += 1
+        }
+        data[position] = UInt8(value)
     }
 
     /// Write a fixed 16-byte UUID without a length prefix.
@@ -125,10 +178,8 @@ public struct Encoder {
         case "DateTime":
             if let value = value as? Date {
                 writeSvarint(Int64(value.timeIntervalSince1970))
-            } else if let value = value as? String,
-                let date = ISO8601DateFormatter().date(from: value)
-            {
-                writeSvarint(Int64(date.timeIntervalSince1970))
+            } else if let value = value as? String {
+                try writeDateTime(value)
             } else if let value = value as? Int64 {
                 writeSvarint(value)
             } else {
@@ -139,7 +190,7 @@ public struct Encoder {
             writeBytes(value)
         case "JSON":
             if let value = value as? JSONValue {
-                writeBytes(try JSONEncoder().encode(value))
+                try writeJSON(value)
             } else {
                 guard
                     JSONSerialization.isValidJSONObject(value) || value is String || value is NSNumber

@@ -9,6 +9,17 @@ final class TypesTests: XCTestCase {
         let names: [String]
     }
 
+    private struct BinaryInput: Codable, Sendable, LuxoBinaryEncodable {
+        let name: String
+
+        func writeLuxo(to encoder: inout Encoder) throws {
+            encoder.writeVarint(UInt64(name.utf8.count))
+            encoder.writeVarint(1)
+            encoder.writeString(name)
+            encoder.writeEnd()
+        }
+    }
+
     private struct SelectedRecord: Codable {
         let name: Selected<String>
         let note: Selected<String?>
@@ -88,6 +99,17 @@ final class TypesTests: XCTestCase {
                 "names": .array([.string("a"), .string("b")]),
             ])
         )
+    }
+
+    func testStructuredLuxoValueDefersToJSONUntilJSONTransportNeedsIt() throws {
+        let value = LuxoValue.structured(BinaryInput(name: "Luxo"))
+        XCTAssertEqual(
+            try LuxoValue.decodeJSONData(value.jsonData()),
+            .object(["name": .string("Luxo")])
+        )
+        XCTAssertEqual(value, .structured(BinaryInput(name: "Luxo")))
+        XCTAssertNotEqual(value, .structured(BinaryInput(name: "Other")))
+        XCTAssertNotEqual(value, .string("Luxo"))
     }
 
     func testPageCanBeConstructedAndDecoded() throws {

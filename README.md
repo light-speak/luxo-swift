@@ -205,7 +205,7 @@ try await codegen.generate(outputDir: "Sources/YourApp/Luxo")
 ```
 
 Generates:
-- `Models.swift` — typed structs with Codable
+- `Models.swift` — typed Codable outputs and `LuxoBinaryEncodable` inputs; binary requests write native Luxo messages directly without a JSON intermediate
 - `Decoders.swift` — binary decoders per model
 - `Schema.swift` — API schema map
 - `Client.swift` — typed client with async/await methods

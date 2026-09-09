@@ -120,10 +120,22 @@ public struct APISchema: Sendable {
     public struct SelectionFieldSchema: Sendable {
         public let fieldID: Int
         public let typeName: String?
+        public let type: String?
+        public let isList: Bool
+        public let nullable: Bool
 
-        public init(fieldID: Int, typeName: String? = nil) {
+        public init(
+            fieldID: Int,
+            typeName: String? = nil,
+            type: String? = nil,
+            isList: Bool = false,
+            nullable: Bool = false
+        ) {
             self.fieldID = fieldID
             self.typeName = typeName
+            self.type = type
+            self.isList = isList
+            self.nullable = nullable
         }
     }
 
@@ -131,13 +143,22 @@ public struct APISchema: Sendable {
         public let fieldID: Int
         public let name: String
         public let type: String
+        public let typeName: String?
         public let isList: Bool
         public let nullable: Bool
 
-        public init(fieldID: Int, name: String, type: String, isList: Bool = false, nullable: Bool = false) {
+        public init(
+            fieldID: Int,
+            name: String,
+            type: String,
+            typeName: String? = nil,
+            isList: Bool = false,
+            nullable: Bool = false
+        ) {
             self.fieldID = fieldID
             self.name = name
             self.type = type
+            self.typeName = typeName
             self.isList = isList
             self.nullable = nullable
         }
@@ -385,11 +406,12 @@ enum LuxoBinaryProtocol {
         schema: APISchema,
         selection: String?
     ) throws {
-        guard let selection, !selection.trimmingCharacters(in: .whitespaces).isEmpty,
-            !schema.fields.isEmpty
-        else {
+        guard !schema.fields.isEmpty else {
             encoder.writeVarint(0)
             return
+        }
+        guard let selection, !selection.trimmingCharacters(in: .whitespaces).isEmpty else {
+            throw configError("$select is required for structured responses")
         }
         let selected = try SelectionParser(selection).parse()
         let mask = try encodeSelectionNode(selected, fields: schema.fields, types: schema.types)
@@ -557,6 +579,9 @@ enum LuxoBinaryProtocol {
             }
         case "JSON":
             encoder.writeBytes(try value.jsonData())
+        case "Model":
+            guard case .structured(let value) = value else { throw invalidValue(type) }
+            try encoder.writeDelimited { try value.writeLuxo(to: &$0) }
         default:
             throw LuxoError(code: 0, message: "unsupported binary param type: \(type)", name: "ConfigError")
         }

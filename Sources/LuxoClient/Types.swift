@@ -103,6 +103,17 @@ public enum JSONValue: Codable, Sendable, Equatable {
     }
 }
 
+/// A generated input value that can write the native Luxo message directly.
+public protocol LuxoBinaryEncodable: Encodable, Sendable {
+    func writeLuxo(to encoder: inout Encoder) throws
+}
+
+public extension LuxoBinaryEncodable {
+    func luxoJSONValue() throws -> LuxoValue {
+        try LuxoValue.encode(self)
+    }
+}
+
 /// Sendable value representation used at transport boundaries.
 ///
 /// Unlike `Any`, this preserves integer precision and makes values safe to move
@@ -116,6 +127,7 @@ public enum LuxoValue: Sendable, Equatable {
     case bytes(Data)
     case array([LuxoValue])
     case object([String: LuxoValue])
+    case structured(any LuxoBinaryEncodable)
 
     public init(_ value: Int) { self = .int(Int64(value)) }
     public init(_ value: Int64) { self = .int(value) }
@@ -148,12 +160,12 @@ public enum LuxoValue: Sendable, Equatable {
 
     func jsonData() throws -> Data {
         try JSONSerialization.data(
-            withJSONObject: foundationValue,
+            withJSONObject: foundationValue(),
             options: [.fragmentsAllowed, .sortedKeys]
         )
     }
 
-    var foundationValue: Any {
+    private func foundationValue() throws -> Any {
         switch self {
         case .null: return NSNull()
         case .bool(let value): return value
@@ -161,8 +173,26 @@ public enum LuxoValue: Sendable, Equatable {
         case .float(let value): return value
         case .string(let value): return value
         case .bytes(let value): return value.base64EncodedString()
-        case .array(let values): return values.map(\.foundationValue)
-        case .object(let values): return values.mapValues(\.foundationValue)
+        case .array(let values): return try values.map { try $0.foundationValue() }
+        case .object(let values): return try values.mapValues { try $0.foundationValue() }
+        case .structured(let value): return try value.luxoJSONValue().foundationValue()
+        }
+    }
+
+    public static func == (lhs: LuxoValue, rhs: LuxoValue) -> Bool {
+        switch (lhs, rhs) {
+        case (.null, .null): return true
+        case (.bool(let lhs), .bool(let rhs)): return lhs == rhs
+        case (.int(let lhs), .int(let rhs)): return lhs == rhs
+        case (.float(let lhs), .float(let rhs)): return lhs == rhs
+        case (.string(let lhs), .string(let rhs)): return lhs == rhs
+        case (.bytes(let lhs), .bytes(let rhs)): return lhs == rhs
+        case (.array(let lhs), .array(let rhs)): return lhs == rhs
+        case (.object(let lhs), .object(let rhs)): return lhs == rhs
+        case (.structured(let lhs), .structured(let rhs)):
+            guard let lhs = try? lhs.luxoJSONValue(), let rhs = try? rhs.luxoJSONValue() else { return false }
+            return lhs == rhs
+        default: return false
         }
     }
 

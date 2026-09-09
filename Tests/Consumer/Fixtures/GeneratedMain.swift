@@ -1,6 +1,12 @@
+import Foundation
 import LuxoClient
 
-_ = ProfileInput(name: "Luxo", bio: nil)
+let profile = ProfileInput(name: "Luxo", bio: nil)
+var profileEncoder = Encoder()
+try profile.writeLuxo(to: &profileEncoder)
+guard profileEncoder.data == Data([4, 1, 4, 76, 117, 120, 111, 2, 0, 0]) else {
+    throw LuxoError(code: 0, message: "invalid generated input wire format", name: "ConsumerError")
+}
 _ = Record()
 
 func inspectSelection(client: LuxoGeneratedClient) async throws {
