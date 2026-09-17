@@ -6,25 +6,72 @@ import Foundation
 
 // MARK: - Transport Protocol
 
+/// Raw response bytes and their encoding, independent of later transport configuration.
+public struct TransportPayload: Sendable {
+    public let data: Data
+    public let mode: TransportMode
+
+    public init(data: Data, mode: TransportMode) {
+        self.data = data
+        self.mode = mode
+    }
+}
+
+/// Optional terminal notifications; an explicit cancellation is silent.
+public final class StreamObserver: Sendable {
+    public let onComplete: (@Sendable () -> Void)?
+    public let onError: (@Sendable (LuxoError) -> Void)?
+
+    public init(
+        onComplete: (@Sendable () -> Void)? = nil,
+        onError: (@Sendable (LuxoError) -> Void)? = nil
+    ) {
+        self.onComplete = onComplete
+        self.onError = onError
+    }
+}
+
 /// Transport protocol — all transports implement this.
 public protocol Transport: Sendable {
-    func call(_ api: String, params: [String: LuxoValue]?) async throws -> Data
-    func subscribe(
+    func call(_ api: String, params: [String: LuxoValue]?) async throws -> TransportPayload
+    func subscribe<Value: Sendable>(
         _ api: String,
+        decoder: @escaping @Sendable (TransportPayload) throws -> Value,
         params: [String: LuxoValue]?,
-        handler: @escaping @Sendable (Data) -> Void
-    ) async throws -> () -> Void
+        observer: StreamObserver?,
+        handler: @escaping @Sendable (Value) -> Void
+    ) async throws -> (@Sendable () -> Void)
     func setToken(_ token: String)
     func setMode(_ mode: TransportMode)
     func setSchema(_ schema: [String: APISchema])
 }
 
 public extension Transport {
-    func subscribe(
+    func subscribe<Value: Sendable>(
         _ api: String,
+        decoder: @escaping @Sendable (TransportPayload) throws -> Value,
         params: [String: LuxoValue]? = nil,
-        handler: @escaping @Sendable (Data) -> Void
-    ) async throws -> () -> Void {
+        handler: @escaping @Sendable (Value) -> Void
+    ) async throws -> (@Sendable () -> Void) {
+        try await subscribe(api, decoder: decoder, params: params, observer: nil, handler: handler)
+    }
+
+    func subscribe<Value: Sendable>(
+        _ api: String,
+        decoder: @escaping @Sendable (TransportPayload) throws -> Value,
+        observer: StreamObserver?,
+        handler: @escaping @Sendable (Value) -> Void
+    ) async throws -> (@Sendable () -> Void) {
+        try await subscribe(api, decoder: decoder, params: nil, observer: observer, handler: handler)
+    }
+
+    func subscribe<Value: Sendable>(
+        _ api: String,
+        decoder: @escaping @Sendable (TransportPayload) throws -> Value,
+        params: [String: LuxoValue]?,
+        observer: StreamObserver?,
+        handler: @escaping @Sendable (Value) -> Void
+    ) async throws -> (@Sendable () -> Void) {
         throw LuxoError(
             code: 0,
             message: "transport does not support subscriptions",
@@ -110,12 +157,13 @@ public struct LuxoSorter: Sendable {
     }
 }
 
-/// API schema metadata for binary encoding.
+/// API schema metadata for binary encoding and exact JSON parameter validation.
 public struct APISchema: Sendable {
     public let id: Int
     public let params: [ParamSchema]?
     public let fields: [String: SelectionFieldSchema]
     public let types: [String: [String: SelectionFieldSchema]]
+    let jsonParameters: JSONParameterPlan?
 
     public struct SelectionFieldSchema: Sendable {
         public let fieldID: Int
@@ -174,6 +222,7 @@ public struct APISchema: Sendable {
         self.params = params
         self.fields = fields
         self.types = types
+        self.jsonParameters = JSONParameterPlan(params: params, types: types)
     }
 }
 
@@ -273,11 +322,13 @@ enum LuxoBinaryProtocol {
     static let callRequest: UInt64 = 0x01
     static let callSuccess: UInt64 = 0x02
     static let callError: UInt64 = 0x03
-    static let subscribe: UInt64 = 0x04
-    static let unsubscribe: UInt64 = 0x05
-    static let stream: UInt64 = 0x06
-    static let subscribeSuccess: UInt64 = 0x07
-    static let subscribeError: UInt64 = 0x08
+    static let subscribe: UInt64 = 0x10
+    static let unsubscribe: UInt64 = 0x11
+    static let stream: UInt64 = 0x12
+    static let subscribeSuccess: UInt64 = 0x13
+    static let subscribeError: UInt64 = 0x14
+    static let streamComplete: UInt64 = 0x15
+    static let streamError: UInt64 = 0x16
 
     static func encodeRequest(schema: APISchema, params: [String: LuxoValue]?) throws -> Data {
         var encoder = Encoder()
@@ -322,81 +373,18 @@ enum LuxoBinaryProtocol {
         frame(type: callRequest, id: sequence, payload: body)
     }
 
-    static func subscribeFrame(body: Data) -> Data {
-        frame(type: subscribe, id: nil, payload: body)
+    static func subscribeFrame(sequence: UInt64, body: Data) -> Data {
+        frame(type: subscribe, id: sequence, payload: body)
     }
 
-    static func unsubscribeFrame(apiID: Int) -> Data {
-        frame(type: unsubscribe, id: UInt64(apiID), payload: Data())
+    static func unsubscribeFrame(sequence: UInt64) -> Data {
+        frame(type: unsubscribe, id: sequence, payload: Data())
     }
 
-    static func decodeError(_ data: Data, statusCode: Int) -> LuxoError {
-        var decoder = Decoder(data)
-        var code = statusCode
-        var name = "Error"
-        var message = "HTTP \(statusCode)"
-        var traceId: String?
-        var errorData: Any?
-        var cause: String?
-        var seen = 0
-        var ended = false
-        while decoder.remaining > 0 {
-            let fieldID = decoder.nextField()
-            if fieldID == 0 {
-                ended = decoder.error == nil
-                break
-            }
-            switch fieldID {
-            case 1:
-                code = Int(decoder.readSvarint())
-                seen |= 1
-            case 2:
-                name = decoder.readString()
-                seen |= 2
-            case 3:
-                message = decoder.readString()
-                seen |= 4
-            case 4: traceId = decoder.readString()
-            case 5:
-                do {
-                    errorData = try JSONSerialization.jsonObject(
-                        with: decoder.readBytes(),
-                        options: [.fragmentsAllowed]
-                    )
-                } catch {
-                    return binaryParseError(statusCode, "invalid JSON data")
-                }
-            case 6: cause = decoder.readString()
-            default:
-                return binaryParseError(statusCode, "unknown binary error field \(fieldID)")
-            }
-        }
-        if let error = decoder.error { return binaryParseError(statusCode, error) }
-        if !ended { return binaryParseError(statusCode, "missing end marker") }
-        if decoder.remaining != 0 { return binaryParseError(statusCode, "trailing bytes") }
-        if seen != 7 { return binaryParseError(statusCode, "missing required fields") }
-        return LuxoError(
-            code: code,
-            message: message,
-            name: name,
-            traceId: traceId,
-            data: errorData,
-            cause: cause
-        )
-    }
-
-    private static func binaryParseError(_ statusCode: Int, _ message: String) -> LuxoError {
-        LuxoError(
-            code: statusCode,
-            message: "invalid binary error response: \(message)",
-            name: "ParseError"
-        )
-    }
-
-    private static func frame(type: UInt64, id: UInt64?, payload: Data) -> Data {
+    private static func frame(type: UInt64, id: UInt64, payload: Data) -> Data {
         var encoder = Encoder()
         encoder.writeVarint(type)
-        if let id { encoder.writeVarint(id) }
+        encoder.writeVarint(id)
         encoder.writeRawBytes(payload)
         return encoder.data
     }
@@ -551,8 +539,8 @@ enum LuxoBinaryProtocol {
             encoder.writeSvarint(number)
         case "Float":
             switch value {
-            case .float(let number): encoder.writeFixed64(number)
-            case .int(let number): encoder.writeFixed64(Double(number))
+            case .float(let number): try encoder.writeFixed64(number)
+            case .int(let number): try encoder.writeFixed64(Double(number))
             default: throw invalidValue(type)
             }
         case "String", "Enum", "Decimal":
@@ -562,7 +550,8 @@ enum LuxoBinaryProtocol {
             guard case .bool(let boolean) = value else { throw invalidValue(type) }
             encoder.writeBool(boolean)
         case "DateTime":
-            encoder.writeSvarint(try unixSeconds(value))
+            guard case .string(let text) = value else { throw invalidValue(type) }
+            try encoder.writeDateTime(text)
         case "UUID":
             if case .string(let string) = value, let uuid = UUID(uuidString: string) {
                 encoder.writeUUID(uuid)
@@ -587,52 +576,8 @@ enum LuxoBinaryProtocol {
         }
     }
 
-    private static func unixSeconds(_ value: LuxoValue) throws -> Int64 {
-        if case .string(let text) = value,
-            let date = ISO8601DateFormatter().date(from: text)
-        {
-            return Int64(date.timeIntervalSince1970)
-        }
-        throw invalidValue("DateTime")
-    }
-
     private static func invalidValue(_ type: String) -> LuxoError {
         LuxoError(code: 0, message: "invalid \(type) parameter", name: "ConfigError")
-    }
-}
-
-enum LuxoWebSocketProtocol {
-    struct SubscriptionAcknowledgement {
-        let api: String?
-        let apiID: UInt64?
-        let error: LuxoError?
-    }
-
-    static func decodeJSONSubscriptionAcknowledgement(
-        _ json: [String: Any]
-    ) -> SubscriptionAcknowledgement? {
-        guard let api = json["$sub"] as? String else { return nil }
-        if json["ok"] as? Bool == true {
-            return SubscriptionAcknowledgement(api: api, apiID: nil, error: nil)
-        }
-        guard json["error"] != nil else { return nil }
-        return SubscriptionAcknowledgement(api: api, apiID: nil, error: LuxoError.from(json: json))
-    }
-
-    static func decodeBinarySubscriptionAcknowledgement(
-        _ data: Data
-    ) -> SubscriptionAcknowledgement? {
-        var decoder = Decoder(data)
-        let frameType = decoder.readVarint()
-        guard frameType == LuxoBinaryProtocol.subscribeSuccess || frameType == LuxoBinaryProtocol.subscribeError else {
-            return nil
-        }
-        let apiID = decoder.readVarint()
-        let error =
-            frameType == LuxoBinaryProtocol.subscribeError
-            ? LuxoBinaryProtocol.decodeError(decoder.readRemainingData(), statusCode: 0)
-            : nil
-        return SubscriptionAcknowledgement(api: nil, apiID: apiID, error: error)
     }
 }
 
@@ -708,10 +653,10 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
         lock.withLock { self.schema = schema }
     }
 
-    public func call(_ api: String, params: [String: LuxoValue]? = nil) async throws -> Data {
+    public func call(_ api: String, params: [String: LuxoValue]? = nil) async throws -> TransportPayload {
         do {
             return try await doCall(api, params: params)
-        } catch let error as LuxoError where error.code == 401 {
+        } catch let error as LuxoError where error.code == 401 && error.name != "ParseError" {
             // Attempt token refresh on 401
             let refresh = lock.withLock { tokenExpiredHandler }
             if let refresh, let newToken = await refresh() {
@@ -722,39 +667,38 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
         }
     }
 
-    private func doCall(_ api: String, params: [String: LuxoValue]?) async throws -> Data {
+    private func doCall(_ api: String, params: [String: LuxoValue]?) async throws -> TransportPayload {
         let state = lock.withLock {
             State(headers: headers, mode: mode, schema: schema)
         }
+        let data: Data
         switch state.mode {
         case .json:
-            return try await jsonCall(api, params: params, headers: state.headers)
+            data = try await jsonCall(
+                api, params: params, headers: state.headers, plan: state.schema[api]?.jsonParameters)
         case .binary:
-            return try await binaryCall(
+            data = try await binaryCall(
                 api,
                 params: params,
                 headers: state.headers,
                 schema: state.schema
             )
         }
+        return TransportPayload(data: data, mode: state.mode)
     }
 
     private func jsonCall(
         _ api: String,
         params: [String: LuxoValue]?,
-        headers: [String: String]
+        headers: [String: String],
+        plan: JSONParameterPlan?
     ) async throws -> Data {
-        var body: [String: LuxoValue] = ["$api": .string(api)]
-        if let params = params {
-            for (k, v) in params { body[k] = v }
-        }
-
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
-        request.httpBody = try LuxoValue.object(body).jsonData()
+        request.httpBody = try LuxoJSONRequest.encode(api: api, params: params, plan: plan)
 
         let (data, response) = try await session.data(for: request)
 
@@ -762,33 +706,16 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
             throw LuxoError(code: 0, message: "Invalid response")
         }
 
-        let json = try decodeJSONEnvelope(data, statusCode: httpResponse.statusCode)
-        if httpResponse.statusCode != 200 || json["error"] != nil {
-            var error = LuxoError.from(json: json)
-            if error.code == 0 {
-                error = LuxoError(
-                    code: httpResponse.statusCode,
-                    message: error.message,
-                    name: error.name,
-                    traceId: error.traceId,
-                    data: error.data,
-                    cause: error.cause
-                )
-            }
-            throw error
+        let envelope = try decodeJSONEnvelope(data, statusCode: httpResponse.statusCode)
+        if httpResponse.statusCode != 200 || envelope.fields["error"] != nil {
+            throw JSONEnvelope.decodeError(envelope, statusCode: httpResponse.statusCode)
         }
-        return try JSONSerialization.data(
-            withJSONObject: json["data"] ?? NSNull(),
-            options: [.fragmentsAllowed, .sortedKeys]
-        )
+        return envelope.responseData
     }
 
-    private func decodeJSONEnvelope(_ data: Data, statusCode: Int) throws -> [String: Any] {
+    private func decodeJSONEnvelope(_ data: Data, statusCode: Int) throws -> JSONEnvelope {
         do {
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw LuxoError(code: statusCode, message: "invalid JSON response", name: "ParseError")
-            }
-            return json
+            return try JSONEnvelope.decode(data, errorResponse: statusCode != 200)
         } catch {
             throw LuxoError(code: statusCode, message: "invalid JSON response", name: "ParseError")
         }
@@ -830,509 +757,7 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
     }
 }
 
-// MARK: - WebSocket Transport
-
-protocol LuxoWebSocketTask: AnyObject, Sendable {
-    func resume()
-    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
-    func send(
-        _ message: URLSessionWebSocketTask.Message,
-        completionHandler: @escaping @Sendable (Error?) -> Void
-    )
-    func receive(
-        completionHandler: @escaping @Sendable (Result<URLSessionWebSocketTask.Message, Error>) -> Void
-    )
-}
-
-extension URLSessionWebSocketTask: LuxoWebSocketTask {}
-
-protocol LuxoWebSocketSession: AnyObject {
-    func makeWebSocketTask(with request: URLRequest) -> LuxoWebSocketTask
-}
-
-extension URLSession: LuxoWebSocketSession {
-    func makeWebSocketTask(with request: URLRequest) -> LuxoWebSocketTask {
-        webSocketTask(with: request)
-    }
-}
-
-/// WebSocket transport for streaming (subscriptions) and bidirectional communication.
-/// Supports exponential backoff auto-reconnect on disconnect.
-public final class WebSocketTransport: Transport, @unchecked Sendable {
-    private struct Subscription {
-        let params: [String: LuxoValue]
-        let handler: @Sendable (Data) -> Void
-    }
-
-    private struct PendingCall {
-        let continuation: CheckedContinuation<Data, Error>
-        let timeoutTask: DispatchWorkItem
-    }
-
-    private struct PendingSubscription {
-        let continuation: CheckedContinuation<Void, Error>
-        let timeoutTask: DispatchWorkItem
-    }
-
-    private let url: URL
-    private let session: LuxoWebSocketSession
-    private let lock = NSLock()
-    private let timeout: TimeInterval
-    private var task: LuxoWebSocketTask?
-    private var subscriptions: [String: Subscription] = [:]
-    private var pending: [UInt64: PendingCall] = [:]
-    private var pendingSubscriptions: [String: PendingSubscription] = [:]
-    private var schema: [String: APISchema] = [:]
-    private var apiByID: [UInt64: String] = [:]
-    private var mode: TransportMode = .json
-    private var token: String?
-    private var sequence: UInt64 = 0
-
-    private var shouldReconnect = true
-    private var reconnectAttempt = 0
-    private let maxBackoff: TimeInterval
-    private let baseBackoff: TimeInterval
-
-    public convenience init(
-        url: String,
-        token: String? = nil,
-        timeout: TimeInterval = 30
-    ) throws {
-        try self.init(
-            url: url,
-            token: token,
-            timeout: timeout,
-            session: URLSession(configuration: .default),
-            baseBackoff: 1,
-            maxBackoff: 30
-        )
-    }
-
-    init(
-        url: String,
-        token: String? = nil,
-        timeout: TimeInterval = 30,
-        session: LuxoWebSocketSession,
-        baseBackoff: TimeInterval = 1,
-        maxBackoff: TimeInterval = 30
-    ) throws {
-        self.url = try validatedURL(url, schemes: ["ws", "wss"])
-        guard timeout > 0 else {
-            throw LuxoError(code: 0, message: "timeout must be greater than zero", name: "ConfigError")
-        }
-        guard baseBackoff > 0, maxBackoff >= baseBackoff else {
-            throw LuxoError(code: 0, message: "invalid reconnect backoff", name: "ConfigError")
-        }
-        self.token = token
-        self.timeout = timeout
-        self.session = session
-        self.baseBackoff = baseBackoff
-        self.maxBackoff = maxBackoff
-    }
-
-    public func setToken(_ token: String) {
-        lock.withLock { self.token = token }
-    }
-
-    public func setMode(_ mode: TransportMode) {
-        lock.withLock { self.mode = mode }
-    }
-
-    public func setSchema(_ schema: [String: APISchema]) {
-        lock.withLock {
-            self.schema = schema
-            self.apiByID = Dictionary(uniqueKeysWithValues: schema.map { (UInt64($0.value.id), $0.key) })
-        }
-    }
-
-    public func connect() {
-        let previous = lock.withLock { () -> LuxoWebSocketTask? in
-            shouldReconnect = true
-            reconnectAttempt = 0
-            let current = task
-            task = nil
-            return current
-        }
-        previous?.cancel(with: .goingAway, reason: nil)
-        openConnection()
-    }
-
-    public func call(_ api: String, params: [String: LuxoValue]? = nil) async throws -> Data {
-        let request = try lock.withLock { () throws -> (UInt64, LuxoWebSocketTask, URLSessionWebSocketTask.Message) in
-            guard let socket = task else {
-                throw LuxoError(code: 0, message: "WebSocket not connected", name: "ConnectionError")
-            }
-            sequence &+= 1
-            let requestID = sequence
-            if mode == .binary {
-                guard let apiSchema = schema[api] else {
-                    throw LuxoError(
-                        code: 0,
-                        message: "no schema for API \"\(api)\" — binary mode requires schema",
-                        name: "ConfigError"
-                    )
-                }
-                let body = try LuxoBinaryProtocol.encodeRequest(schema: apiSchema, params: params)
-                return (requestID, socket, .data(LuxoBinaryProtocol.callFrame(sequence: requestID, body: body)))
-            }
-            var body = params ?? [:]
-            body["$id"] = .int(Int64(requestID))
-            body["$api"] = .string(api)
-            let data = try LuxoValue.object(body).jsonData()
-            return (requestID, socket, .string(String(decoding: data, as: UTF8.self)))
-        }
-
-        return try await withCheckedThrowingContinuation { continuation in
-            let timeoutTask = DispatchWorkItem { [weak self] in
-                self?.failPending(
-                    request.0,
-                    error: LuxoError(
-                        code: 0,
-                        message: "WebSocket call \"\(api)\" timed out",
-                        name: "TimeoutError"
-                    ))
-            }
-            lock.withLock {
-                pending[request.0] = PendingCall(
-                    continuation: continuation,
-                    timeoutTask: timeoutTask
-                )
-            }
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutTask)
-            let requestID = request.0
-            request.1.send(request.2) { [weak self] error in
-                guard let error else { return }
-                self?.failPending(
-                    requestID,
-                    error: LuxoError(
-                        code: 0,
-                        message: error.localizedDescription,
-                        name: "NetworkError"
-                    ))
-            }
-        }
-    }
-
-    public func subscribe(
-        _ api: String,
-        params: [String: LuxoValue]? = nil,
-        handler: @escaping @Sendable (Data) -> Void
-    ) async throws -> () -> Void {
-        let values = params ?? [:]
-        let request = try subscriptionMessage(api, params: values)
-        try await withCheckedThrowingContinuation { continuation in
-            let timeoutTask = DispatchWorkItem { [weak self] in
-                self?.failSubscription(
-                    api,
-                    error: LuxoError(
-                        code: 0,
-                        message: "WebSocket subscription \"\(api)\" timed out",
-                        name: "TimeoutError"
-                    ))
-            }
-            let duplicate = lock.withLock { () -> Bool in
-                guard subscriptions[api] == nil else { return true }
-                subscriptions[api] = Subscription(params: values, handler: handler)
-                pendingSubscriptions[api] = PendingSubscription(
-                    continuation: continuation,
-                    timeoutTask: timeoutTask
-                )
-                return false
-            }
-            if duplicate {
-                continuation.resume(
-                    throwing: LuxoError(
-                        code: 0,
-                        message: "already subscribed to \"\(api)\"",
-                        name: "ConfigError"
-                    ))
-                return
-            }
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutTask)
-            request.0.send(request.1) { [weak self] error in
-                guard let error else { return }
-                self?.failSubscription(
-                    api,
-                    error: LuxoError(
-                        code: 0,
-                        message: error.localizedDescription,
-                        name: "NetworkError"
-                    ))
-            }
-        }
-        return { [weak self] in self?.unsubscribe(api) }
-    }
-
-    public func unsubscribe(_ api: String) {
-        let result: (LuxoWebSocketTask?, URLSessionWebSocketTask.Message?) = lock.withLock {
-            guard subscriptions.removeValue(forKey: api) != nil else { return (nil, nil) }
-            pendingSubscriptions.removeValue(forKey: api)?.timeoutTask.cancel()
-            if mode == .binary, let apiSchema = schema[api] {
-                return (task, .data(LuxoBinaryProtocol.unsubscribeFrame(apiID: apiSchema.id)))
-            }
-            let data = try? JSONSerialization.data(withJSONObject: ["$unsub": api])
-            return (task, data.map { .string(String(decoding: $0, as: UTF8.self)) })
-        }
-        if let socket = result.0, let message = result.1 { socket.send(message) { _ in } }
-    }
-
-    public func close() {
-        let state = lock.withLock {
-            () -> (
-                LuxoWebSocketTask?,
-                [PendingCall],
-                [PendingSubscription]
-            ) in
-            shouldReconnect = false
-            let socket = task
-            task = nil
-            subscriptions.removeAll()
-            let calls = Array(pending.values)
-            let acknowledgements = Array(pendingSubscriptions.values)
-            pending.removeAll()
-            pendingSubscriptions.removeAll()
-            return (socket, calls, acknowledgements)
-        }
-        state.0?.cancel(with: .normalClosure, reason: nil)
-        let error = LuxoError(code: 0, message: "WebSocket closed by client", name: "ConnectionError")
-        state.1.forEach {
-            $0.timeoutTask.cancel()
-            $0.continuation.resume(throwing: error)
-        }
-        state.2.forEach {
-            $0.timeoutTask.cancel()
-            $0.continuation.resume(throwing: error)
-        }
-    }
-
-    private func openConnection() {
-        let request: URLRequest = lock.withLock {
-            var request = URLRequest(url: url)
-            if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-            return request
-        }
-        let socket = session.makeWebSocketTask(with: request)
-        lock.withLock { task = socket }
-        socket.resume()
-        let currentSubscriptions = lock.withLock { subscriptions }
-        for (api, subscription) in currentSubscriptions {
-            sendConfirmedSubscription(api, params: subscription.params, socket: socket)
-        }
-        receiveLoop(socket)
-    }
-
-    private func receiveLoop(_ socket: LuxoWebSocketTask) {
-        socket.receive { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .success(let message):
-                self.lock.withLock { self.reconnectAttempt = 0 }
-                self.handleMessage(message)
-                self.receiveLoop(socket)
-            case .failure(let error):
-                let current = self.lock.withLock { () -> Bool in
-                    guard self.task === socket else { return false }
-                    self.task = nil
-                    return true
-                }
-                guard current else { return }
-                self.failAllPending(error)
-                self.scheduleReconnect()
-            }
-        }
-    }
-
-    private func handleMessage(_ message: URLSessionWebSocketTask.Message) {
-        switch message {
-        case .data(let data):
-            if lock.withLock({ mode }) == .binary {
-                handleBinaryMessage(data)
-            } else {
-                handleJSONData(data)
-            }
-        case .string(let text):
-            handleJSONData(Data(text.utf8))
-        @unknown default:
-            break
-        }
-    }
-
-    private func handleJSONData(_ data: Data) {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-        if let acknowledgement = LuxoWebSocketProtocol.decodeJSONSubscriptionAcknowledgement(json),
-            let api = acknowledgement.api
-        {
-            acknowledgeSubscription(api, error: acknowledgement.error)
-            return
-        }
-        if let api = json["$stream"] as? String {
-            let handler = lock.withLock { subscriptions[api]?.handler }
-            if let data = try? JSONSerialization.data(
-                withJSONObject: json["data"] ?? NSNull(),
-                options: [.fragmentsAllowed, .sortedKeys]
-            ) {
-                handler?(data)
-            }
-            return
-        }
-        guard let number = json["$id"] as? NSNumber else { return }
-        let requestID = number.uint64Value
-        guard let state = lock.withLock({ pending.removeValue(forKey: requestID) }) else { return }
-        state.timeoutTask.cancel()
-        if json["error"] != nil {
-            state.continuation.resume(throwing: LuxoError.from(json: json))
-        } else {
-            do {
-                let data = try JSONSerialization.data(
-                    withJSONObject: json["data"] ?? NSNull(),
-                    options: [.fragmentsAllowed, .sortedKeys]
-                )
-                state.continuation.resume(returning: data)
-            } catch {
-                state.continuation.resume(
-                    throwing: LuxoError(code: 0, message: "invalid JSON response", name: "ParseError")
-                )
-            }
-        }
-    }
-
-    private func handleBinaryMessage(_ data: Data) {
-        if let acknowledgement = LuxoWebSocketProtocol.decodeBinarySubscriptionAcknowledgement(data),
-            let apiID = acknowledgement.apiID,
-            let api = lock.withLock({ apiByID[apiID] })
-        {
-            acknowledgeSubscription(api, error: acknowledgement.error)
-            return
-        }
-        var decoder = Decoder(data)
-        let frameType = decoder.readVarint()
-        let id = decoder.readVarint()
-        let payload = decoder.readRemainingData()
-        switch frameType {
-        case LuxoBinaryProtocol.callSuccess:
-            if let state = lock.withLock({ pending.removeValue(forKey: id) }) {
-                state.timeoutTask.cancel()
-                state.continuation.resume(returning: payload)
-            }
-        case LuxoBinaryProtocol.callError:
-            if let state = lock.withLock({ pending.removeValue(forKey: id) }) {
-                state.timeoutTask.cancel()
-                state.continuation.resume(
-                    throwing: LuxoBinaryProtocol.decodeError(payload, statusCode: 0)
-                )
-            }
-        case LuxoBinaryProtocol.stream:
-            let handler = lock.withLock { () -> (@Sendable (Data) -> Void)? in
-                guard let api = apiByID[id] else { return nil }
-                return subscriptions[api]?.handler
-            }
-            handler?(payload)
-        default:
-            break
-        }
-    }
-
-    private func subscriptionMessage(
-        _ api: String,
-        params: [String: LuxoValue]
-    ) throws -> (LuxoWebSocketTask, URLSessionWebSocketTask.Message) {
-        try lock.withLock {
-            guard let socket = task else {
-                throw LuxoError(code: 0, message: "WebSocket not connected", name: "ConnectionError")
-            }
-            if mode == .binary {
-                guard let apiSchema = schema[api] else {
-                    throw LuxoError(code: 0, message: "no schema for API \"\(api)\"", name: "ConfigError")
-                }
-                let body = try LuxoBinaryProtocol.encodeRequest(schema: apiSchema, params: params)
-                return (socket, .data(LuxoBinaryProtocol.subscribeFrame(body: body)))
-            }
-            var body = params
-            body["$sub"] = .string(api)
-            let data = try LuxoValue.object(body).jsonData()
-            return (socket, .string(String(decoding: data, as: UTF8.self)))
-        }
-    }
-
-    private func sendConfirmedSubscription(
-        _ api: String,
-        params: [String: LuxoValue],
-        socket: LuxoWebSocketTask
-    ) {
-        guard let request = try? subscriptionMessage(api, params: params), request.0 === socket else { return }
-        socket.send(request.1) { _ in }
-    }
-
-    private func failPending(_ id: UInt64, error: Error) {
-        guard let state = lock.withLock({ pending.removeValue(forKey: id) }) else { return }
-        state.timeoutTask.cancel()
-        state.continuation.resume(throwing: error)
-    }
-
-    private func failSubscription(_ api: String, error: Error) {
-        let state = lock.withLock { () -> PendingSubscription? in
-            subscriptions.removeValue(forKey: api)
-            return pendingSubscriptions.removeValue(forKey: api)
-        }
-        guard let state else { return }
-        state.timeoutTask.cancel()
-        state.continuation.resume(throwing: error)
-    }
-
-    private func acknowledgeSubscription(_ api: String, error: LuxoError?) {
-        let state = lock.withLock { () -> PendingSubscription? in
-            if error != nil { subscriptions.removeValue(forKey: api) }
-            return pendingSubscriptions.removeValue(forKey: api)
-        }
-        state?.timeoutTask.cancel()
-        guard let state else { return }
-        if let error {
-            state.continuation.resume(throwing: error)
-        } else {
-            state.continuation.resume()
-        }
-    }
-
-    private func failAllPending(_ underlyingError: Error) {
-        let state = lock.withLock { () -> ([PendingCall], [PendingSubscription]) in
-            let calls = Array(pending.values)
-            let acknowledgements = Array(pendingSubscriptions.values)
-            for api in pendingSubscriptions.keys { subscriptions.removeValue(forKey: api) }
-            pending.removeAll()
-            pendingSubscriptions.removeAll()
-            return (calls, acknowledgements)
-        }
-        let error = LuxoError(
-            code: 0,
-            message: "WebSocket connection lost: \(underlyingError.localizedDescription)",
-            name: "ConnectionError"
-        )
-        state.0.forEach {
-            $0.timeoutTask.cancel()
-            $0.continuation.resume(throwing: error)
-        }
-        state.1.forEach {
-            $0.timeoutTask.cancel()
-            $0.continuation.resume(throwing: error)
-        }
-    }
-
-    private func scheduleReconnect() {
-        let delay: TimeInterval? = lock.withLock {
-            guard shouldReconnect else { return nil }
-            let value = min(baseBackoff * pow(2, Double(reconnectAttempt)), maxBackoff)
-            reconnectAttempt += 1
-            return value
-        }
-        guard let delay else { return }
-        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self, self.lock.withLock({ self.shouldReconnect }) else { return }
-            self.openConnection()
-        }
-    }
-}
-
-private func validatedURL(_ value: String, schemes: Set<String>) throws -> URL {
+func validatedURL(_ value: String, schemes: Set<String>) throws -> URL {
     guard let url = URL(string: value),
         let scheme = url.scheme?.lowercased(),
         schemes.contains(scheme),

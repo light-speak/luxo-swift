@@ -29,7 +29,10 @@ public struct Encoder {
         writeVarint(encoded)
     }
 
-    public mutating func writeFixed64(_ value: Double) {
+    public mutating func writeFixed64(_ value: Double) throws {
+        guard value.isFinite else {
+            throw LuxoError(code: 0, message: "Float must be finite", name: "ConfigError")
+        }
         var v = value.bitPattern
         data.append(contentsOf: withUnsafeBytes(of: &v) { Array($0) })
     }
@@ -50,14 +53,16 @@ public struct Encoder {
     }
 
     public mutating func writeDateTime(_ value: String) throws {
-        guard let date = ISO8601DateFormatter().date(from: value) else {
-            throw LuxoError(code: 0, message: "invalid DateTime value", name: "ConfigError")
-        }
-        writeSvarint(Int64(date.timeIntervalSince1970))
+        writeDateTime(try dateTimeParts(value))
+    }
+
+    private mutating func writeDateTime(_ value: DateTimeParts) {
+        writeSvarint(value.seconds)
+        writeVarint(value.nanoseconds)
     }
 
     public mutating func writeJSON(_ value: JSONValue) throws {
-        writeBytes(try JSONEncoder().encode(value))
+        writeBytes(try value.jsonData())
     }
 
     public mutating func writeRawBytes(_ value: Data) {
@@ -155,9 +160,9 @@ public struct Encoder {
             }
         case "Float":
             if let value = value as? Double {
-                writeFixed64(value)
+                try writeFixed64(value)
             } else if let value = value as? Float {
-                writeFixed64(Double(value))
+                try writeFixed64(Double(value))
             } else {
                 throw invalidValue(type)
             }
@@ -177,11 +182,12 @@ public struct Encoder {
             writeString(value)
         case "DateTime":
             if let value = value as? Date {
-                writeSvarint(Int64(value.timeIntervalSince1970))
+                writeDateTime(try dateTimeParts(value))
             } else if let value = value as? String {
                 try writeDateTime(value)
             } else if let value = value as? Int64 {
-                writeSvarint(value)
+                guard validDateTimeSeconds(value) else { throw invalidValue(type) }
+                writeDateTime(DateTimeParts(seconds: value, nanoseconds: 0))
             } else {
                 throw invalidValue(type)
             }
@@ -263,11 +269,16 @@ public struct Decoder {
     }
 
     public mutating func readFixed64() -> Double {
+        guard error == nil else { return 0 }
         guard offset + 8 <= data.count else {
             if error == nil { error = "truncated fixed64 at offset \(offset)" }
             return 0
         }
         let bits = data[offset..<offset + 8].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+        guard bits & 0x7ff0000000000000 != 0x7ff0000000000000 else {
+            error = "non-finite Float at offset \(offset)"
+            return 0
+        }
         offset += 8
         return Double(bitPattern: bits)
     }
@@ -329,38 +340,68 @@ public struct Decoder {
 
     // MARK: - DateTime
 
-    /// Read a DateTime field: svarint(unix seconds) → RFC3339/ISO-8601 UTC `String`.
+    /// Read a DateTime seconds/nanoseconds pair as an RFC3339 UTC string.
     ///
-    /// Go's wire format (`FieldDateTime`) is an int64 unix timestamp; in JSON mode Go
+    /// Go's wire format (`FieldDateTime`) preserves the fractional second; in JSON mode Go
     /// emits the same instant as an RFC3339 string. Converting here keeps the DateTime
     /// field type identical (`String`) across JSON and binary modes, matching the
     /// TS/Dart/Kotlin SDKs.
     public mutating func readDateTime() -> String {
-        return Decoder.dateTimeString(fromUnixSeconds: readSvarint())
+        guard error == nil else { return "" }
+        let seconds = readSvarint()
+        let nanos = readVarint()
+        guard error == nil else { return "" }
+        guard nanos < 1_000_000_000, validDateTimeSeconds(seconds) else {
+            error = "invalid DateTime range or nanoseconds"
+            return ""
+        }
+        return LuxoClient.dateTimeString(DateTimeParts(seconds: seconds, nanoseconds: nanos))
     }
 
-    /// Read a nullable DateTime field (null flag + svarint(unix seconds)) → `String?`.
+    /// Read a nullable DateTime pair.
     public mutating func readDateTimePtr() -> String? {
         if !readNullFlag() { return nil }
-        return Decoder.dateTimeString(fromUnixSeconds: readSvarint())
+        let value = readDateTime()
+        return error == nil ? value : nil
+    }
+
+    /// A timestamp occupies at least two bytes; check before allocating the list.
+    public mutating func readDateTimeArray() -> [String] {
+        let rawCount = readVarint()
+        guard error == nil else { return [] }
+        guard rawCount <= CodecLimits.maxArrayElements, rawCount <= UInt64(remaining / 2) else {
+            error = "invalid DateTime array count or insufficient pair payload"
+            return []
+        }
+        var values: [String] = []
+        values.reserveCapacity(Int(rawCount))
+        for _ in 0..<rawCount {
+            let value = readDateTime()
+            guard error == nil else { return [] }
+            values.append(value)
+        }
+        return values
     }
 
     /// Format unix seconds as an RFC3339/ISO-8601 UTC string (e.g. `2021-07-14T02:40:00Z`).
     static func dateTimeString(fromUnixSeconds seconds: Int64) -> String {
-        let date = Date(timeIntervalSince1970: TimeInterval(seconds))
-        return date.formatted(Decoder.iso8601Format)
+        dateTimeStringFromUnixSeconds(seconds)
     }
-
-    private static let iso8601Format = Date.ISO8601FormatStyle(timeZone: .gmt)
 
     /// Skip the arena header (totalStringLen varint) that prefixes each model's binary data.
     public mutating func skipArenaHeader() {
-        _ = readVarint()
+        let size = readVarint()
+        if error == nil, size > CodecLimits.maxArenaSize {
+            error = "arena size \(size) exceeds limit \(CodecLimits.maxArenaSize)"
+        }
     }
 
     /// Read next field ID. Returns 0 for end marker.
     public mutating func nextField() -> Int {
-        guard !isAtEnd else { return 0 }
+        guard !isAtEnd else {
+            if error == nil { error = "missing row end marker at offset \(offset)" }
+            return 0
+        }
         let rawID = readVarint()
         guard error == nil, rawID <= UInt64(Int.max) else {
             if error == nil { error = "field ID exceeds platform integer range" }
@@ -435,6 +476,11 @@ public struct Decoder {
             return []
         }
         let count = Int(rawCount)
+        // Every wire element occupies at least one byte, including an empty model.
+        guard count <= remaining else {
+            error = "array count \(count) exceeds remaining payload \(remaining)"
+            return []
+        }
         var items: [T] = []
         items.reserveCapacity(count)
         for _ in 0..<count {
@@ -489,6 +535,27 @@ public struct ColumnarDecoder {
             return
         }
         arenaSize = Int(rawArenaSize)
+        if count > 0 {
+            guard count <= data.count - off - 2 else {
+                fail("insufficient columnar element bytes")
+                return
+            }
+            let start = off
+            let first = data[data.startIndex + start]
+            var id: UInt64? = UInt64(first)
+            if first >= 0x80 {
+                id = readVarintValue("column field ID")
+                let end = off
+                off = start
+                guard count <= data.count - end - 1 else {
+                    fail("insufficient columnar element bytes")
+                    return
+                }
+            }
+            if id == 0 {
+                fail("nonempty list requires at least one column")
+            }
+        }
     }
 
     /// Advance to next column. Returns false at end marker (0x00) or EOF.
@@ -520,7 +587,7 @@ public struct ColumnarDecoder {
 
     /// Read `count` fixed64 (8-byte LE) float values.
     public mutating func readColumnFloat() -> [Double] {
-        readColumn("float") { decoder, index in
+        readColumn("float", minimumSize: 8) { decoder, index in
             decoder.readFixed64Value("float column at record \(index)")
         }
     }
@@ -569,7 +636,7 @@ public struct ColumnarDecoder {
 
     /// Read `count` fixed 16-byte UUID values.
     public mutating func readColumnUUID() -> [UUID] {
-        readColumn("UUID") { decoder, index in
+        readColumn("UUID", minimumSize: 16) { decoder, index in
             decoder.readUUIDValue("UUID column at record \(index)")
         }
     }
@@ -597,17 +664,25 @@ public struct ColumnarDecoder {
         }
     }
 
-    /// Read `count` DateTime values (svarint unix seconds) as RFC3339/ISO-8601 strings.
-    /// DateTime columns are Int columns on the wire; convert to match JSON mode.
+    /// Read `count` exact DateTime pairs without an intermediate Int column.
     public mutating func readColumnDateTime() -> [String] {
-        let seconds = readColumnInt()
-        return seconds.map { Decoder.dateTimeString(fromUnixSeconds: $0) }
+        readColumn("DateTime", minimumSize: 2) { decoder, _ in decoder.readDateTimeValue() }
     }
 
-    /// Read `count` nullable DateTime values (0x00=null, 0x01+svarint seconds) as `String?`.
+    /// Read `count` nullable DateTime pairs.
     public mutating func readColumnDateTimePtr() -> [String?] {
-        let seconds = readColumnIntPtr()
-        return seconds.map { $0.map { Decoder.dateTimeString(fromUnixSeconds: $0) } }
+        readNullableColumn("DateTime") { decoder, _ in decoder.readDateTimeValue() }
+    }
+
+    private mutating func readDateTimeValue() -> String? {
+        guard let seconds = readSvarintValue("DateTime seconds"),
+            let nanos = readVarintValue("DateTime nanoseconds")
+        else { return nil }
+        guard nanos < 1_000_000_000, validDateTimeSeconds(seconds) else {
+            fail("invalid DateTime range or nanoseconds")
+            return nil
+        }
+        return dateTimeString(DateTimeParts(seconds: seconds, nanoseconds: nanos))
     }
 
     /// Current read position (for reading pagination metadata after 0x00).
@@ -622,9 +697,10 @@ public struct ColumnarDecoder {
 
     private mutating func readColumn<T>(
         _ name: String,
+        minimumSize: Int = 1,
         read: (inout ColumnarDecoder, Int) -> T?
     ) -> [T] {
-        guard error == nil else { return [] }
+        guard preflightColumn(name, minimumSize: minimumSize) else { return [] }
         var result: [T] = []
         result.reserveCapacity(count)
         for index in 0..<count {
@@ -641,7 +717,8 @@ public struct ColumnarDecoder {
         _ name: String,
         read: (inout ColumnarDecoder, Int) -> T?
     ) -> [T?] {
-        guard error == nil else { return [] }
+        // Null cells need only their marker, irrespective of the non-null value width.
+        guard preflightColumn(name, minimumSize: 1) else { return [] }
         var result: [T?] = []
         result.reserveCapacity(count)
         for index in 0..<count {
@@ -654,6 +731,15 @@ public struct ColumnarDecoder {
             result.append(value)
         }
         return result
+    }
+
+    private mutating func preflightColumn(_ name: String, minimumSize: Int) -> Bool {
+        guard error == nil else { return false }
+        guard count <= (data.count - off) / minimumSize else {
+            fail("insufficient \(name) column payload for \(count) records at offset \(off)")
+            return false
+        }
+        return true
     }
 
     private mutating func readVarintValue(_ context: String) -> UInt64? {
@@ -681,11 +767,16 @@ public struct ColumnarDecoder {
     }
 
     private mutating func readFixed64Value(_ context: String) -> Double? {
+        guard error == nil else { return nil }
         guard off <= data.count, data.count - off >= 8 else {
             fail("truncated \(context) at offset \(off)")
             return nil
         }
         let bits = data[off..<off + 8].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+        guard bits & 0x7ff0000000000000 != 0x7ff0000000000000 else {
+            fail("non-finite Float at offset \(off)")
+            return nil
+        }
         off += 8
         return Double(bitPattern: bits)
     }

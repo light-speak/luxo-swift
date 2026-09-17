@@ -212,6 +212,10 @@ public final class SelectAnalyzer: SyntaxVisitor {
             } else if let subscript_ = current.as(SubscriptCallExprSyntax.self) {
                 // arr[0] → skip index, continue with arr
                 current = subscript_.calledExpression
+            } else if let optional = current.as(OptionalChainingExprSyntax.self) {
+                current = optional.expression
+            } else if let unwrapped = current.as(ForceUnwrapExprSyntax.self) {
+                current = unwrapped.expression
             } else if let call = current.as(FunctionCallExprSyntax.self),
                 call.arguments.isEmpty,
                 let member = call.calledExpression.as(MemberAccessExprSyntax.self),

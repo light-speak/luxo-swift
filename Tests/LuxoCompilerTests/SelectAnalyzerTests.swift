@@ -56,6 +56,35 @@ final class SelectAnalyzerTests: XCTestCase {
         XCTAssertEqual(analyzer.buildHints(), ["getUser": "name,posts{title}"])
     }
 
+    func testAnalyzerTracksSwiftSixConcurrencyDeclarations() {
+        for modifier in ["@concurrent", "nonisolated(nonsending)"] {
+            let analyzer = SelectAnalyzer()
+            analyzer.analyzeSource(
+                """
+                \(modifier)
+                func load(client: Client) async throws {
+                    let record = try await client.getRecord()
+                    print(try record.profile.requireValue()?.name.requireValue())
+                }
+                """
+            )
+            XCTAssertEqual(analyzer.buildHints(), ["getRecord": "profile{name}"], modifier)
+        }
+    }
+
+    func testAnalyzerTracksNullableSelectedRelationships() {
+        for access in ["?", "!"] {
+            let analyzer = SelectAnalyzer()
+            analyzer.analyzeSource(
+                """
+                let record = try await client.getRecord()
+                print(try record.profile.requireValue()\(access).name.requireValue())
+                """
+            )
+            XCTAssertEqual(analyzer.buildHints(), ["getRecord": "profile{name}"], access)
+        }
+    }
+
     func testAnalyzerMergesAccessesAcrossSources() {
         let analyzer = SelectAnalyzer()
         analyzer.analyzeSource(

@@ -1,4 +1,4 @@
-// swift-tools-version:5.9
+// swift-tools-version:6.3
 import PackageDescription
 
 let package = Package(
@@ -10,7 +10,7 @@ let package = Package(
         .executable(name: "LuxoAnalyze", targets: ["LuxoAnalyze"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-syntax.git", from: "510.0.0")
+        .package(url: "https://github.com/apple/swift-syntax.git", from: "603.0.2")
     ],
     targets: [
         .target(name: "LuxoClient"),

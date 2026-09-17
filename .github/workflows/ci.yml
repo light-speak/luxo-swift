@@ -9,13 +9,16 @@ on:
 permissions:
   contents: read
 
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   quality:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -33,10 +36,19 @@ jobs:
         run: swift package resolve
 
       - name: Check formatting
-        run: swift format lint --recursive --strict Sources Tests Package.swift
+        run: swift format lint --recursive --strict Sources Tests Benchmarks Package.swift
 
       - name: Build release with strict concurrency
         run: swift build -c release -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete
+
+      - name: Check minimum deployment targets
+        run: |
+          ios_sdk_path="$(xcrun --sdk iphoneos --show-sdk-path)"
+          macos_sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
+          swiftc -typecheck -swift-version 6 -warnings-as-errors -strict-concurrency=complete \
+            -target arm64-apple-ios15.0 -sdk "$ios_sdk_path" Sources/LuxoClient/*.swift
+          swiftc -typecheck -swift-version 6 -warnings-as-errors -strict-concurrency=complete \
+            -target x86_64-apple-macos13.0 -sdk "$macos_sdk_path" Sources/LuxoClient/*.swift
 
       - name: Test with coverage
         run: swift test --parallel --enable-code-coverage -Xswiftc -warnings-as-errors
@@ -52,16 +64,16 @@ jobs:
           fail_ci_if_error: false
 
   thread-sanitizer:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
       - name: Test transport concurrency
-        run: swift test --sanitize=thread --filter TransportTests
+        run: swift test --sanitize=thread --filter 'TransportTests|WebSocketSubscriptionTests|WebSocketTerminalTests'
 
   external-consumer:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -70,6 +82,10 @@ jobs:
         run: |
           mkdir -p Tests/Consumer/.tmp/generated-consumer
           cp Tests/Consumer/Fixtures/GeneratedMain.swift Tests/Consumer/.tmp/generated-consumer/main.swift
+          cp Tests/Consumer/Fixtures/ScalarResponses.swift Tests/Consumer/.tmp/generated-consumer/ScalarResponses.swift
+          cp Tests/Consumer/Fixtures/ScalarResponseBenchmark.swift Tests/Consumer/.tmp/generated-consumer/ScalarResponseBenchmark.swift
+          cp Tests/Consumer/Fixtures/StructuredResponses.swift Tests/Consumer/.tmp/generated-consumer/StructuredResponses.swift
+          cp Tests/Consumer/Fixtures/JSONProjection.swift Tests/Consumer/.tmp/generated-consumer/JSONProjection.swift
           swift build \
             --package-path Tests/Consumer \
             --product LuxoConsumer \
@@ -85,13 +101,28 @@ jobs:
           curl --retry 20 --retry-connrefused --retry-delay 1 -fsS -o /dev/null http://127.0.0.1:18080/luxo.schema.json
           .tmp/consumer-build/debug/LuxoConsumer --generate http://127.0.0.1:18080/luxo.schema.json Tests/Consumer/.tmp/generated-consumer
           cp Tests/Consumer/Fixtures/GeneratedMain.swift Tests/Consumer/.tmp/generated-consumer/main.swift
+          cp Tests/Consumer/Fixtures/ScalarResponses.swift Tests/Consumer/.tmp/generated-consumer/ScalarResponses.swift
+          cp Tests/Consumer/Fixtures/ScalarResponseBenchmark.swift Tests/Consumer/.tmp/generated-consumer/ScalarResponseBenchmark.swift
+          cp Tests/Consumer/Fixtures/StructuredResponses.swift Tests/Consumer/.tmp/generated-consumer/StructuredResponses.swift
+          cp Tests/Consumer/Fixtures/JSONProjection.swift Tests/Consumer/.tmp/generated-consumer/JSONProjection.swift
           swift build \
             --package-path Tests/Consumer \
             --product LuxoGeneratedConsumer \
             --scratch-path .tmp/generated-consumer-build \
             -Xswiftc -warnings-as-errors \
             -Xswiftc -strict-concurrency=complete
+          .tmp/generated-consumer-build/debug/LuxoGeneratedConsumer
           swift run LuxoAnalyze \
             --source-dir Tests/Consumer/.tmp/generated-consumer \
             --output Tests/Consumer/.tmp/SelectHints.swift
           grep -F '"getRecord": "profile{name}"' Tests/Consumer/.tmp/SelectHints.swift
+
+      - name: Run optimized generated consumer
+        run: |
+          swift run \
+            --package-path Tests/Consumer \
+            --scratch-path .tmp/generated-consumer-build \
+            -c release \
+            -Xswiftc -warnings-as-errors \
+            -Xswiftc -strict-concurrency=complete \
+            LuxoGeneratedConsumer

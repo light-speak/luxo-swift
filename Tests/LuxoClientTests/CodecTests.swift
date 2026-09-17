@@ -6,6 +6,39 @@ final class CodecTests: XCTestCase {
         case failed
     }
 
+    func testNativeDateFloorsBeforeEpoch() throws {
+        var encoder = Encoder()
+        try encoder.writeField(1, value: Date(timeIntervalSince1970: -0.001), type: "DateTime")
+        var decoder = Decoder(encoder.data)
+        XCTAssertEqual(decoder.readVarint(), 1)
+        XCTAssertEqual(decoder.readSvarint(), -1)
+    }
+
+    func testNativeDateRejectsUnrepresentableSeconds() {
+        for interval in [Double.nan, .infinity, -.infinity, Double(Int64.max), -Double.greatestFiniteMagnitude] {
+            var encoder = Encoder()
+            encoder.writeBool(true)
+            XCTAssertThrowsError(
+                try encoder.writeField(1, value: Date(timeIntervalSince1970: interval), type: "DateTime"))
+            XCTAssertEqual(encoder.data, Data([1]))
+        }
+    }
+
+    func testDateTimeRejectsMalformedFractionsWithoutPartialWrites() {
+        for value in [
+            "", "invalid", "2026.09-15T00:00:00Z", "2026-09-15T00:00:00.Z",
+            "2026-09-15T00:00:00.1", "2026-09-15T00:00:00.1xZ",
+            "2026-09-15T00:00:00.1+99:99", "2026-09-15T00:00:00.1Ztrailing",
+            "2026-09-15T00:00:00Ztrailing", "0001-01-01T00:00:00.1Ztrailing",
+            "2026-09-15T00:00:00.1+09:00trailing", "2026-09-15T00:00:00extraZ",
+        ] {
+            var encoder = Encoder()
+            encoder.writeBool(true)
+            XCTAssertThrowsError(try encoder.writeDateTime(value), value)
+            XCTAssertEqual(encoder.data, Data([1]), value)
+        }
+    }
+
     func testVarintRoundTrip() {
         var encoder = Encoder()
         encoder.writeVarint(300)
@@ -63,9 +96,9 @@ final class CodecTests: XCTestCase {
         XCTAssertFalse(decoder.readBool())
     }
 
-    func testFixed64RoundTrip() {
+    func testFixed64RoundTrip() throws {
         var encoder = Encoder()
-        encoder.writeFixed64(3.14)
+        try encoder.writeFixed64(3.14)
         var decoder = Decoder(encoder.data)
         XCTAssertEqual(decoder.readFixed64(), 3.14, accuracy: 0.001)
     }
@@ -115,17 +148,18 @@ final class CodecTests: XCTestCase {
         XCTAssertEqual(decoder.readVarint(), UInt64.max / 2)
     }
 
-    func testFixed64SpecialValues() {
+    func testFixed64SpecialValues() throws {
         var encoder = Encoder()
-        encoder.writeFixed64(0.0)
-        encoder.writeFixed64(-0.0)
-        encoder.writeFixed64(Double.infinity)
-        encoder.writeFixed64(-Double.infinity)
+        try encoder.writeFixed64(0.0)
+        try encoder.writeFixed64(-0.0)
+        let before = encoder.data
+        XCTAssertThrowsError(try encoder.writeFixed64(Double.infinity))
+        XCTAssertThrowsError(try encoder.writeFixed64(-Double.infinity))
+        XCTAssertThrowsError(try encoder.writeFixed64(Double.nan))
+        XCTAssertEqual(encoder.data, before)
         var decoder = Decoder(encoder.data)
-        XCTAssertEqual(decoder.readFixed64(), 0.0)
-        XCTAssertEqual(decoder.readFixed64(), -0.0)
-        XCTAssertEqual(decoder.readFixed64(), Double.infinity)
-        XCTAssertEqual(decoder.readFixed64(), -Double.infinity)
+        XCTAssertEqual(decoder.readFixed64().bitPattern, 0.0.bitPattern)
+        XCTAssertEqual(decoder.readFixed64().bitPattern, (-0.0).bitPattern)
     }
 
     func testBytesRoundTrip() {
@@ -226,7 +260,7 @@ final class CodecTests: XCTestCase {
 
     // MARK: - ColumnarDecoder Tests
 
-    func testColumnarDecode2Records() {
+    func testColumnarDecode2Records() throws {
         var enc = Encoder()
         // count = 2
         enc.writeVarint(2)
@@ -241,8 +275,8 @@ final class CodecTests: XCTestCase {
         enc.writeString("world")
         // Column 3: fieldID=3, float values [3.14, 2.718]
         enc.writeVarint(3)
-        enc.writeFixed64(3.14)
-        enc.writeFixed64(2.718)
+        try enc.writeFixed64(3.14)
+        try enc.writeFixed64(2.718)
         // End marker
         enc.writeEnd()
 
@@ -530,7 +564,7 @@ final class CodecTests: XCTestCase {
         XCTAssertEqual(decoder.nextField(), 4)
         XCTAssertEqual(decoder.readString(), "12.50")
         XCTAssertEqual(decoder.nextField(), 5)
-        XCTAssertEqual(decoder.readSvarint(), 60)
+        XCTAssertEqual(decoder.readDateTime(), "1970-01-01T00:01:00Z")
         XCTAssertEqual(decoder.nextField(), 6)
         XCTAssertEqual(decoder.readBytes(), Data([1, 2]))
         XCTAssertEqual(decoder.nextField(), 7)
@@ -551,7 +585,7 @@ final class CodecTests: XCTestCase {
         )
         var dateDecoder = Decoder(dates.data)
         XCTAssertEqual(dateDecoder.nextField(), 1)
-        XCTAssertEqual(dateDecoder.readArray { $0.readSvarint() }, [60, 120])
+        XCTAssertEqual(dateDecoder.readDateTimeArray(), ["1970-01-01T00:01:00Z", "1970-01-01T00:02:00Z"])
 
         var values = Encoder()
         try values.writeFieldList(2, values: [true, false], type: "Boolean")
@@ -668,6 +702,7 @@ final class CodecTests: XCTestCase {
         // unix 0 = 1970-01-01T00:00:00Z
         var encoder = Encoder()
         encoder.writeSvarint(0)
+        encoder.writeVarint(0)
         var decoder = Decoder(encoder.data)
         XCTAssertEqual(decoder.readDateTime(), "1970-01-01T00:00:00Z")
     }
@@ -676,6 +711,7 @@ final class CodecTests: XCTestCase {
         // unix 1626230400 = 2021-07-14T02:40:00Z
         var encoder = Encoder()
         encoder.writeSvarint(1_626_230_400)
+        encoder.writeVarint(0)
         var decoder = Decoder(encoder.data)
         XCTAssertEqual(decoder.readDateTime(), "2021-07-14T02:40:00Z")
     }
@@ -684,6 +720,7 @@ final class CodecTests: XCTestCase {
         var encoder = Encoder()
         encoder.writeBool(true)  // null flag = present
         encoder.writeSvarint(1_626_230_400)
+        encoder.writeVarint(0)
         var decoder = Decoder(encoder.data)
         XCTAssertEqual(decoder.readDateTimePtr(), "2021-07-14T02:40:00Z")
     }
@@ -726,7 +763,9 @@ final class CodecTests: XCTestCase {
         enc.writeVarint(0)  // arena size
         enc.writeVarint(7)  // field ID
         enc.writeSvarint(0)
+        enc.writeVarint(0)
         enc.writeSvarint(1_626_230_400)
+        enc.writeVarint(0)
         enc.writeEnd()
 
         var dec = ColumnarDecoder(data: enc.data)
@@ -744,6 +783,7 @@ final class CodecTests: XCTestCase {
         enc.writeBool(false)  // null
         enc.writeBool(true)  // present
         enc.writeSvarint(1_626_230_400)
+        enc.writeVarint(0)
         enc.writeEnd()
 
         var dec = ColumnarDecoder(data: enc.data)
@@ -849,7 +889,7 @@ final class CodecTests: XCTestCase {
         encoder.writeVarint(1)
         encoder.writeRawBytes(payload)
         var decoder = ColumnarDecoder(data: encoder.data)
-        XCTAssertTrue(decoder.nextColumn())
+        XCTAssertEqual(decoder.nextColumn(), payload.count >= 2)
         _ = read(&decoder)
         XCTAssertNotNil(decoder.error)
     }
