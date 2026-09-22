@@ -103,18 +103,38 @@ final class CodecTests: XCTestCase {
         XCTAssertEqual(decoder.readFixed64(), 3.14, accuracy: 0.001)
     }
 
-    func testFieldMask() {
-        var mask: [UInt8] = []
-        fieldMaskSet(&mask, fieldID: 1)
-        fieldMaskSet(&mask, fieldID: 5)
-        fieldMaskSet(&mask, fieldID: 16)
+    func testFieldMaskRejectsInvalidIDsBeforeMutation() throws {
+        for id in [0, -1, 65536, Int.max, Int.min] {
+            XCTAssertThrowsError(try fieldMaskHas([1], fieldID: id))
+        }
+        for id in [0, -1, 65536, Int.max, Int.min] {
+            var mask: [UInt8] = [1]
+            XCTAssertThrowsError(try fieldMaskSet(&mask, fieldID: id))
+            XCTAssertEqual(mask, [1])
+        }
+    }
 
-        XCTAssertTrue(fieldMaskHas(mask, fieldID: 1))
-        XCTAssertTrue(fieldMaskHas(mask, fieldID: 5))
-        XCTAssertTrue(fieldMaskHas(mask, fieldID: 16))
-        XCTAssertFalse(fieldMaskHas(mask, fieldID: 0))
-        XCTAssertFalse(fieldMaskHas(mask, fieldID: 2))
-        XCTAssertFalse(fieldMaskHas(mask, fieldID: 17))
+    func testMaximumSelectionField() throws {
+        var mask: [UInt8] = []
+        try fieldMaskSet(&mask, fieldID: 65535)
+        XCTAssertEqual(mask.count, 8192)
+        XCTAssertEqual(mask.last, 0x40)
+        XCTAssertTrue(try fieldMaskHas(mask, fieldID: 65535))
+        XCTAssertFalse(try fieldMaskHas(mask, fieldID: 1))
+    }
+
+    func testFieldMask() throws {
+        var mask: [UInt8] = []
+        try fieldMaskSet(&mask, fieldID: 1)
+        try fieldMaskSet(&mask, fieldID: 5)
+        try fieldMaskSet(&mask, fieldID: 16)
+
+        XCTAssertTrue(try fieldMaskHas(mask, fieldID: 1))
+        XCTAssertTrue(try fieldMaskHas(mask, fieldID: 5))
+        XCTAssertTrue(try fieldMaskHas(mask, fieldID: 16))
+        XCTAssertThrowsError(try fieldMaskHas(mask, fieldID: 0))
+        XCTAssertFalse(try fieldMaskHas(mask, fieldID: 2))
+        XCTAssertFalse(try fieldMaskHas(mask, fieldID: 17))
     }
 
     // MARK: - Edge Cases
@@ -244,17 +264,17 @@ final class CodecTests: XCTestCase {
         XCTAssertEqual(decoder.readFixed64(), 2.718, accuracy: 0.0001)
     }
 
-    func testFieldMaskOutOfRange() {
+    func testFieldMaskOutOfRange() throws {
         let mask: [UInt8] = [0xFF]  // only byte 0 set
-        XCTAssertFalse(fieldMaskHas(mask, fieldID: 9))
-        XCTAssertFalse(fieldMaskHas(mask, fieldID: 100))
+        XCTAssertFalse(try fieldMaskHas(mask, fieldID: 9))
+        XCTAssertFalse(try fieldMaskHas(mask, fieldID: 100))
     }
 
-    func testFieldMaskLargeFieldID() {
+    func testFieldMaskLargeFieldID() throws {
         var mask: [UInt8] = []
-        fieldMaskSet(&mask, fieldID: 64)
-        XCTAssertTrue(fieldMaskHas(mask, fieldID: 64))
-        XCTAssertFalse(fieldMaskHas(mask, fieldID: 63))
+        try fieldMaskSet(&mask, fieldID: 64)
+        XCTAssertTrue(try fieldMaskHas(mask, fieldID: 64))
+        XCTAssertFalse(try fieldMaskHas(mask, fieldID: 63))
         XCTAssertEqual(mask.count, 8)
     }
 

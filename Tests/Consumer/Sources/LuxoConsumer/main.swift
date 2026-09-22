@@ -16,7 +16,7 @@ struct LuxoConsumer {
 
         let transport = try URLSessionTransport(endpoint: "https://example.com/luvia")
         transport.setMode(.binary)
-        transport.setSchema(["getUser": APISchema(id: 1)])
+        try transport.setSchema(["getUser": APISchema(id: 1)])
 
         var encoder = Encoder()
         try encoder.writeField(1, value: 7, type: "Int")

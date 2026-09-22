@@ -5,7 +5,7 @@ set -euo pipefail
 minimum="${1:-90.0}"
 output="${2:-coverage.lcov}"
 profile="$(find .build -path '*/debug/codecov/default.profdata' -print -quit)"
-binary="$(find .build -type f -path '*.xctest/Contents/MacOS/*PackageTests' -perm -111 -print -quit)"
+binary="$(find .build -type f -path '*/debug/*.xctest/Contents/MacOS/*PackageTests' -perm -111 -print -quit)"
 
 if [[ -z "${profile}" || -z "${binary}" ]]; then
   echo "::error::Swift coverage profile or test binary was not found"

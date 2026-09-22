@@ -21,7 +21,7 @@ import Foundation
                     url: "ws://localhost/test", session: BenchmarkSession(oldSocket))
                 after = try WebSocketTransport(url: "ws://localhost/test", session: BenchmarkSession(newSocket))
                 before.setMode(mode); after.setMode(mode)
-                before.setSchema(["watch": APISchema(id: 7)]); after.setSchema(["watch": APISchema(id: 7)])
+                before.setSchema(["watch": APISchema(id: 7)]); try after.setSchema(["watch": APISchema(id: 7)])
                 before.connect(); after.connect()
             }
 

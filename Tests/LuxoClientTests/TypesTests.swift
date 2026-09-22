@@ -2,6 +2,22 @@ import XCTest
 @testable import LuxoClient
 
 final class TypesTests: XCTestCase {
+    func testComputedSourceMetadataRoundTrips() throws {
+        let input = #"""
+            {"name":"User","fields":[{"id":1,"name":"postCount","type":"Int"}],
+            "computedSources":{"postCount":{"model":"Post","module":"blog"},"localCount":{"model":"Local"}}}
+            """#
+        let model = try JSONDecoder().decode(LuxoModel.self, from: Data(input.utf8))
+        XCTAssertEqual(model.computedSources?["postCount"]?.model, "Post")
+        XCTAssertEqual(model.computedSources?["postCount"]?.module, "blog")
+        XCTAssertNil(model.computedSources?["localCount"]?.module)
+        XCTAssertEqual(model.fields.first?.type, "Int")
+        let roundTrip = try JSONDecoder().decode(LuxoModel.self, from: JSONEncoder().encode(model))
+        XCTAssertEqual(roundTrip.computedSources?["postCount"]?.model, "Post")
+        let plain = try JSONDecoder().decode(LuxoModel.self, from: Data(#"{"name":"Plain","fields":[]}"#.utf8))
+        XCTAssertNil(plain.computedSources)
+    }
+
     func testJSONValueKeepsIntegersOnTheExactIntegerPath() throws {
         for source in ["0", "1", "42", "9007199254740991"] {
             let value = try JSONValue.parse(Data(source.utf8))

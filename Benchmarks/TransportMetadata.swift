@@ -4,6 +4,14 @@ import Foundation
 @main
 enum TransportMetadataBenchmark {
     static func main() async throws {
+        if CommandLine.arguments.contains("--schema-registration") {
+            try SchemaRegistrationBenchmark.run()
+            return
+        }
+        if CommandLine.arguments.contains("--field-masks") {
+            try FieldMaskBenchmark.run()
+            return
+        }
         #if LUXO_PROJECTION_BENCHMARK
             if CommandLine.arguments.contains("--projection") {
                 try JSONProjectionBenchmark.run()

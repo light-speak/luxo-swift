@@ -13,6 +13,12 @@
     }
   },
   "types": {
+    "EnumRecord": {"name":"EnumRecord","usage":"inputOutput","fields":[
+      {"id":1,"name":"state","type":"Enum","typeName":"Status"},
+      {"id":2,"name":"optional","type":"Enum","typeName":"Status","nullable":true},
+      {"id":3,"name":"states","type":"Enum","typeName":"Status","isList":true},
+      {"id":4,"name":"optionalStates","type":"Enum","typeName":"Status","isList":true,"nullable":true}
+    ]},
     "ProjectionEmpty": {"name":"ProjectionEmpty","usage":"output","fields":[]},
     "ProjectionNames": {"name":"ProjectionNames","usage":"output","fields":[
       {"id":1,"name":"decoder","type":"Int"},
@@ -49,9 +55,15 @@
     }
   },
   "enums": {
-    "Status": {"name": "Status", "values": ["OPEN", "CLOSED"]}
+    "Status": {"name": "Status", "values": ["OPEN", "CLOSED", "K"]},
+    "EscapedStatus": {"name":"EscapedStatus","values":["OPEN","open","UNKNOWN","unknown","case","init","self","quote\"","slash\\","line\n","é","é"]}
   },
   "apis": {
+    "enumOptions": {"id":144,"name":"enumOptions","module":"enum","returnType":"Boolean","params":[
+      {"id":1,"name":"state","type":"Enum","typeName":"Status"},
+      {"id":2,"name":"optional","type":"Enum","typeName":"Status","nullable":true,"hasDefault":true},
+      {"id":3,"name":"states","type":"Enum","typeName":"Status","isList":true,"hasDefault":true}
+    ]},
     "readInt": {"id": 100, "name": "readInt", "module": "scalars", "returnType": "Int", "returnList": false, "stream": false, "params": []},
     "watchInt": {"id": 101, "name": "watchInt", "module": "scalars", "returnType": "Int", "returnList": false, "stream": true},
     "readIntList": {"id": 102, "name": "readIntList", "module": "scalars", "returnType": "Int", "returnList": true, "stream": false},

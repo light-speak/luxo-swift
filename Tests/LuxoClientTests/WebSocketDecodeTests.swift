@@ -3,6 +3,22 @@ import XCTest
 @testable import LuxoClient
 
 final class WebSocketDecodeTests: XCTestCase {
+    func testRejectedSchemaPreservesLiveConnection() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let (transport, socket) = try fixture(mode)
+            defer { transport.close() }
+            XCTAssertThrowsError(try transport.setSchema(["watch": APISchema(id: 0)]))
+            let result = try await transport.call("watch")
+            XCTAssertEqual(try Self.integer(result), 7)
+            let values = DecodeValues()
+            let cancel = try await transport.subscribe("watch", decoder: Self.integer) { values.append($0) }
+            socket.deliver(.success(data(mode, 2)))
+            XCTAssertEqual(values.rows, [7])
+            XCTAssertNil(socket.cancelCode)
+            cancel()
+        }
+    }
+
     func testBadPayloadRetiresOnlyItsSubscription() async throws {
         for mode in [TransportMode.json, .binary] {
             let (transport, socket) = try fixture(mode)
@@ -166,7 +182,7 @@ final class WebSocketDecodeTests: XCTestCase {
             url: "ws://localhost/test", timeout: 1,
             session: MockWebSocketSession(socket: socket), initialSequence: start)
         transport.setMode(mode)
-        transport.setSchema(["watch": APISchema(id: 77)])
+        try transport.setSchema(["watch": APISchema(id: 77)])
         transport.connect()
         socket.onSend = { [weak socket] message in
             switch message {

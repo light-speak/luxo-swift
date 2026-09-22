@@ -367,11 +367,25 @@ public struct LuxoModel: Codable, Sendable {
     public let name: String
     public let usage: TypeUsage?
     public let fields: [LuxoField]
+    public let computedSources: [String: LuxoComputedSource]?
 
-    public init(name: String, usage: TypeUsage? = nil, fields: [LuxoField]) {
+    public init(
+        name: String, usage: TypeUsage? = nil, fields: [LuxoField], computedSources: [String: LuxoComputedSource]? = nil
+    ) {
         self.name = name
         self.usage = usage
         self.fields = fields
+        self.computedSources = computedSources
+    }
+}
+
+public struct LuxoComputedSource: Codable, Sendable {
+    public let model: String
+    public let module: String?
+
+    public init(model: String, module: String? = nil) {
+        self.model = model
+        self.module = module
     }
 }
 
@@ -394,6 +408,28 @@ public struct LuxoAPI: Codable, Sendable {
     public let paginated: Bool?
     public let stream: Bool?
     public let params: [LuxoParam]?
+    public let isInternal: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, module, returnType, returnList, paginated, stream, params
+        case isInternal = "internal"
+    }
+
+    public init(
+        id: Int, name: String, module: String, returnType: String? = nil,
+        returnList: Bool? = nil, paginated: Bool? = nil, stream: Bool? = nil,
+        params: [LuxoParam]? = nil, isInternal: Bool? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.module = module
+        self.returnType = returnType
+        self.returnList = returnList
+        self.paginated = paginated
+        self.stream = stream
+        self.params = params
+        self.isInternal = isInternal
+    }
 }
 
 public struct LuxoParam: Codable, Sendable {

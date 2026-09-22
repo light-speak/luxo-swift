@@ -48,7 +48,7 @@ import Foundation
                     ? try PreDisconnectWebSocketTransport(url: "ws://localhost/bench", session: session)
                     : PayloadBenchmarkTransport(
                         base: try WebSocketTransport(url: "ws://localhost/bench", session: session))
-                transport.setSchema(["watch": APISchema(id: 7)])
+                try transport.setSchema(["watch": APISchema(id: 7)])
                 transport.setMode(mode)
                 transport.connect()
             }

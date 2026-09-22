@@ -112,7 +112,10 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
 
     public func setToken(_ token: String) { lock.withLock { self.token = token } }
     public func setMode(_ mode: TransportMode) { lock.withLock { self.mode = mode } }
-    public func setSchema(_ schema: [String: APISchema]) { lock.withLock { self.schema = schema } }
+    public func setSchema(_ schema: [String: APISchema]) throws {
+        try validateRuntimeSchemaIDs(schema)
+        lock.withLock { self.schema = schema }
+    }
 
     public func connect() {
         sendOrder.withLock {

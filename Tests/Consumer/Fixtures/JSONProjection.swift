@@ -65,7 +65,7 @@ private func rejectJSONProjection<Value>(
 ) async throws {
     do {
         _ = try await read(projectionClient(json))
-    } catch is DecodingError {
+    } catch let error as LuxoError where error.name == "DecodeError" {
         return
     }
     throw projectionFailure("empty/unknown-only model list accepted: \(json)")
@@ -82,8 +82,8 @@ private func rejectProjectionStream(_ json: String) async throws {
     }
 }
 
-private func projectionClient(_ json: String) -> LuxoGeneratedClient {
-    LuxoGeneratedClient(transport: ProjectionTransport(data: Data(json.utf8)))
+private func projectionClient(_ json: String) throws -> LuxoGeneratedClient {
+    try LuxoGeneratedClient(transport: ProjectionTransport(data: Data(json.utf8)))
 }
 
 private func projectionFailure(_ message: String) -> LuxoError {

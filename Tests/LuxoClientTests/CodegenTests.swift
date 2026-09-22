@@ -6,6 +6,36 @@ import XCTest
 #endif
 
 final class CodegenTests: XCTestCase {
+    func testInternalScopeDoesNotDependOnAPIPrefix() throws {
+        let payload = Data(
+            #"{"models":{},"apis":{"ping":{"id":1,"name":"ping","module":"test","returnType":"Int","internal":false},"privateOperation":{"id":2,"name":"privateOperation","module":"test","returnType":"Int","internal":true}}}"#
+                .utf8)
+        let schema = try JSONDecoder().decode(LuxoSchema.self, from: payload)
+        let generator = try makeCodegen()
+        for source in [generator.generateClient(schema), generator.generateSchema(schema)] {
+            XCTAssertTrue(source.contains("ping"))
+            XCTAssertFalse(source.contains("privateOperation"))
+        }
+    }
+    func testInternalRPCsAreExcludedFromClientAndTransportSchema() throws {
+        let publicAPI = LuxoAPI(
+            id: 1, name: "listItems", module: "test", returnType: "Int", returnList: true,
+            paginated: false, stream: false, params: [])
+        let internalAPI = LuxoAPI(
+            id: 2, name: "svc:batchLoad:Item", module: "test", returnType: "Int", returnList: true,
+            paginated: false, stream: false, params: [], isInternal: true)
+        let schema = LuxoSchema(
+            models: [:], apis: [publicAPI.name: publicAPI, internalAPI.name: internalAPI],
+            enums: nil, types: nil)
+        let generator = try makeCodegen()
+        let client = generator.generateClient(schema)
+        let transport = generator.generateSchema(schema)
+        XCTAssertTrue(client.contains("func listItems("))
+        XCTAssertTrue(transport.contains("listItems"))
+        XCTAssertFalse(client.contains(internalAPI.name))
+        XCTAssertFalse(transport.contains(internalAPI.name))
+    }
+
     func testOutputModelsValidateSelectedStateWithoutRescanningJSONKeys() throws {
         let schema = LuxoSchema(
             models: [
@@ -68,9 +98,9 @@ final class CodegenTests: XCTestCase {
     func testClientRegistersSchemaAtInitializationForBothModes() throws {
         let schema = LuxoSchema(models: [:], apis: [:], enums: nil, types: nil)
         let source = try makeCodegen().generateClient(schema)
-        let start = try XCTUnwrap(source.range(of: "public init(transport: Transport) {"))
+        let start = try XCTUnwrap(source.range(of: "public init(transport: Transport) throws {"))
         let end = try XCTUnwrap(source.range(of: "    }", range: start.upperBound..<source.endIndex))
-        XCTAssertTrue(source[start.upperBound..<end.lowerBound].contains("transport.setSchema(LUXO_SCHEMA)"))
+        XCTAssertTrue(source[start.upperBound..<end.lowerBound].contains("try transport.setSchema(LUXO_SCHEMA)"))
         XCTAssertEqual(source.components(separatedBy: "transport.setSchema(LUXO_SCHEMA)").count - 1, 1)
     }
 
@@ -107,7 +137,7 @@ final class CodegenTests: XCTestCase {
                     XCTAssertFalse(source.contains("try? decodeLuxoResponse"))
                     if type == "Status" {
                         XCTAssertTrue(
-                            source.contains("try decodeEnum(Status.self, raw: decoder.readString(), field: \"Status\")")
+                            source.contains("Status(rawValue: decoder.readString())")
                         )
                     }
                     if stream {

@@ -42,7 +42,7 @@ import Foundation
                     url: "ws://localhost/bench", session: BenchmarkSession(oldSocket))
                 after = try WebSocketTransport(url: "ws://localhost/bench", session: BenchmarkSession(newSocket))
                 let schema = ["watch": APISchema(id: 7)]
-                before.setSchema(schema); after.setSchema(schema)
+                before.setSchema(schema); try after.setSchema(schema)
                 before.setMode(mode); after.setMode(mode)
                 before.connect(); after.connect()
             }

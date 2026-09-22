@@ -846,9 +846,9 @@ public struct ColumnarDecoder {
 
 // MARK: - FieldMask
 
-/// Set a field as selected in a bitmask.
-public func fieldMaskSet(_ mask: inout [UInt8], fieldID: Int) {
-    guard fieldID > 0 else { return }
+/// Set a field as selected, rejecting invalid IDs before mutation or allocation.
+public func fieldMaskSet(_ mask: inout [UInt8], fieldID: Int) throws {
+    try checkSelectionFieldID(fieldID)
     let bit = fieldID - 1
     let byteIndex = bit / 8
     let bitIndex = bit % 8
@@ -858,12 +858,19 @@ public func fieldMaskSet(_ mask: inout [UInt8], fieldID: Int) {
     mask[byteIndex] |= (1 << bitIndex)
 }
 
-/// Check if a field is selected in a bitmask.
-public func fieldMaskHas(_ mask: [UInt8], fieldID: Int) -> Bool {
-    guard fieldID > 0 else { return false }
+/// Check a selected bit. Invalid IDs throw instead of being silently ignored.
+public func fieldMaskHas(_ mask: [UInt8], fieldID: Int) throws -> Bool {
+    try checkSelectionFieldID(fieldID)
     let bit = fieldID - 1
     let byteIndex = bit / 8
     let bitIndex = bit % 8
     guard byteIndex < mask.count else { return false }
     return mask[byteIndex] & (1 << bitIndex) != 0
+}
+
+@inline(__always)
+private func checkSelectionFieldID(_ fieldID: Int) throws {
+    guard fieldID > 0 && fieldID <= WireIDLimits.selectionField else {
+        throw LuxoError(code: 0, message: "selection field ID must be from 1 to 65535", name: "ConfigError")
+    }
 }

@@ -64,9 +64,23 @@ func verifyScalarResponses() async throws {
     try await verifyRejectedResponse(
         Data([2]), read: { try await $0.readBoolean() },
         watch: { try await $0.subscribeWatchBoolean(handler: $1) })
-    try await verifyRejectedResponse(
-        scalarText("INVALID"), read: { try await $0.readStatus() },
-        watch: { try await $0.subscribeWatchStatus(handler: $1) })
+    for raw in ["FUTURE", "", "open", "K", "é", "e\u{301}"] {
+        try await verifyScalar(
+            Status.unknown(raw), wire: scalarText(raw),
+            read: { try await $0.readStatus() }, readList: { try await $0.readStatusList() },
+            watch: { try await $0.subscribeWatchStatus(handler: $1) },
+            watchList: { try await $0.subscribeWatchStatusList(handler: $1) })
+    }
+    for binary in [false, true] {
+        try await verifyRejectedResponse(
+            binary ? Data([1, 0xff]) : Data("42".utf8), binary: binary,
+            read: { try await $0.readStatus() }, watch: { try await $0.subscribeWatchStatus(handler: $1) })
+    }
+    for json in ["null", "true", "{}", "[42]", "[null]"] {
+        try await verifyRejectedResponse(
+            Data(json.utf8), binary: false, read: { try await $0.readStatusList() },
+            watch: { try await $0.subscribeWatchStatusList(handler: $1) })
+    }
     try await verifyRejectedResponse(
         Data([1, 0xff]), read: { try await $0.readString() },
         watch: { try await $0.subscribeWatchString(handler: $1) })
@@ -125,11 +139,11 @@ private func verifyDateTimeBoundaries() async throws {
 }
 
 func verifyResponseModeOwnership() async throws {
-    let configured = LuxoGeneratedClient(transport: ScalarTransport(payload: Data([4]), mode: .binary))
+    let configured = try LuxoGeneratedClient(transport: ScalarTransport(payload: Data([4]), mode: .binary))
     guard try await configured.readInt() == 2 else { throw scalarFailure("preconfigured response mode was ignored") }
     for binary in [false, true] {
         let transport = ModeSwitchTransport()
-        let client = LuxoGeneratedClient(transport: transport)
+        let client = try LuxoGeneratedClient(transport: transport)
         if binary { client.enableBinary() }
         let result = Task { try await client.readInt() }
         var starts = transport.starts.makeAsyncIterator()
@@ -225,7 +239,7 @@ private func verifyReply<Value: Codable & Equatable & Sendable>(
 ) async throws {
     for binary in [false, true] {
         let payload = binary ? wire : try JSONEncoder().encode(expected)
-        let client = scalarClient(payload, binary: binary)
+        let client = try scalarClient(payload, binary: binary)
         guard try await read(client) == expected else { throw scalarFailure("valid reply changed value") }
         let received = ScalarReceiver<Value>()
         let cancel = try await watch(client) { received.append($0) }
@@ -241,7 +255,7 @@ private func verifyReply<Value: Codable & Equatable & Sendable>(
 func verifyRejectedResponse<Value: Sendable>(
     _ payload: Data, binary: Bool = true, read: ScalarCall<Value>, watch: ScalarWatch<Value>
 ) async throws {
-    let client = scalarClient(payload, binary: binary)
+    let client = try scalarClient(payload, binary: binary)
     do {
         _ = try await read(client)
         throw scalarFailure("malformed reply became a successful value")
@@ -252,8 +266,8 @@ func verifyRejectedResponse<Value: Sendable>(
     guard received.values.isEmpty else { throw scalarFailure("malformed stream invoked success handler") }
 }
 
-private func scalarClient(_ payload: Data, binary: Bool) -> LuxoGeneratedClient {
-    let client = LuxoGeneratedClient(transport: ScalarTransport(payload: payload, mode: binary ? .binary : .json))
+private func scalarClient(_ payload: Data, binary: Bool) throws -> LuxoGeneratedClient {
+    let client = try LuxoGeneratedClient(transport: ScalarTransport(payload: payload, mode: binary ? .binary : .json))
     if binary { client.enableBinary() }
     return client
 }

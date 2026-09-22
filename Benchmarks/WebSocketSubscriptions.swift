@@ -71,7 +71,7 @@ enum WebSocketSubscriptionBenchmark {
                 let transport = try WebSocketTransport(
                     url: "ws://localhost/bench", session: session, initialSequence: id - 1)
                 transport.setMode(mode)
-                transport.setSchema(schema)
+                try transport.setSchema(schema)
                 transport.connect()
                 self.transport = PayloadBenchmarkTransport(base: transport)
             }
@@ -102,7 +102,7 @@ protocol BenchmarkTransport: Sendable {
     func connect()
     func close()
     func setMode(_ mode: TransportMode)
-    func setSchema(_ schema: [String: APISchema])
+    func setSchema(_ schema: [String: APISchema]) throws
     func call(_ api: String, params: [String: LuxoValue]?) async throws -> Data
     func subscribe(
         _ api: String, params: [String: LuxoValue]?, observer: StreamObserver?,
@@ -125,7 +125,7 @@ struct PayloadBenchmarkTransport: BenchmarkTransport {
     func connect() { base.connect() }
     func close() { base.close() }
     func setMode(_ mode: TransportMode) { base.setMode(mode) }
-    func setSchema(_ schema: [String: APISchema]) { base.setSchema(schema) }
+    func setSchema(_ schema: [String: APISchema]) throws { try base.setSchema(schema) }
     func call(_ api: String, params: [String: LuxoValue]?) async throws -> Data {
         try await base.call(api, params: params).data
     }

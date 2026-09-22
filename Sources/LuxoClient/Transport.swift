@@ -43,7 +43,7 @@ public protocol Transport: Sendable {
     ) async throws -> (@Sendable () -> Void)
     func setToken(_ token: String)
     func setMode(_ mode: TransportMode)
-    func setSchema(_ schema: [String: APISchema])
+    func setSchema(_ schema: [String: APISchema]) throws
 }
 
 public extension Transport {
@@ -418,7 +418,7 @@ enum LuxoBinaryProtocol {
             guard let metadata = fields[field.name] else {
                 throw configError("unknown selected field: \(field.name)")
             }
-            fieldMaskSet(&fieldMask, fieldID: metadata.fieldID)
+            try fieldMaskSet(&fieldMask, fieldID: metadata.fieldID)
             guard let childSelection = field.children else { continue }
             guard let typeName = metadata.typeName, let nestedFields = types[typeName] else {
                 throw configError("field \(field.name) does not support nested selection")
@@ -587,6 +587,11 @@ enum LuxoBinaryProtocol {
 /// Supports both JSON and binary (Luxo codec) modes.
 /// Supports timeout configuration and 401 auto-refresh.
 public final class URLSessionTransport: Transport, @unchecked Sendable {
+    private struct HTTPFailure: Error {
+        let statusCode: Int
+        let error: LuxoError
+    }
+
     private struct State {
         let headers: [String: String]
         let mode: TransportMode
@@ -602,7 +607,8 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
     private let timeout: TimeInterval
     private var tokenExpiredHandler: (() async -> String?)?
 
-    /// Callback invoked on 401 response. Return a new token to retry, or nil to propagate error.
+    /// Called only when HTTP status and the validated error code are both 401.
+    /// Return a new token to retry once, or nil to propagate the original error.
     public var onTokenExpired: (() async -> String?)? {
         get { lock.withLock { tokenExpiredHandler } }
         set { lock.withLock { tokenExpiredHandler = newValue } }
@@ -649,19 +655,27 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
         lock.withLock { self.mode = mode }
     }
 
-    public func setSchema(_ schema: [String: APISchema]) {
+    public func setSchema(_ schema: [String: APISchema]) throws {
+        try validateRuntimeSchemaIDs(schema)
         lock.withLock { self.schema = schema }
     }
 
     public func call(_ api: String, params: [String: LuxoValue]? = nil) async throws -> TransportPayload {
         do {
             return try await doCall(api, params: params)
-        } catch let error as LuxoError where error.code == 401 && error.name != "ParseError" {
-            // Attempt token refresh on 401
+        } catch let failure as HTTPFailure {
+            let error = failure.error
+            guard failure.statusCode == 401, error.code == 401, error.name != "ParseError" else {
+                throw error
+            }
             let refresh = lock.withLock { tokenExpiredHandler }
             if let refresh, let newToken = await refresh() {
                 setToken(newToken)
-                return try await doCall(api, params: params)
+                do {
+                    return try await doCall(api, params: params)
+                } catch let retryFailure as HTTPFailure {
+                    throw retryFailure.error
+                }
             }
             throw error
         }
@@ -708,7 +722,9 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
 
         let envelope = try decodeJSONEnvelope(data, statusCode: httpResponse.statusCode)
         if httpResponse.statusCode != 200 || envelope.fields["error"] != nil {
-            throw JSONEnvelope.decodeError(envelope, statusCode: httpResponse.statusCode)
+            throw HTTPFailure(
+                statusCode: httpResponse.statusCode,
+                error: JSONEnvelope.decodeError(envelope, statusCode: httpResponse.statusCode))
         }
         return envelope.responseData
     }
@@ -750,7 +766,9 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
             throw LuxoError(code: 0, message: "Invalid response", name: "NetworkError")
         }
         guard httpResponse.statusCode == 200 else {
-            throw LuxoBinaryProtocol.decodeError(data, statusCode: httpResponse.statusCode)
+            throw HTTPFailure(
+                statusCode: httpResponse.statusCode,
+                error: LuxoBinaryProtocol.decodeError(data, statusCode: httpResponse.statusCode))
         }
 
         return data  // Return raw bytes for binary decoding

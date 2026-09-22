@@ -254,7 +254,7 @@ final class WebSocketSubscriptionTests: XCTestCase {
                 initialSequence: UInt64(Int64.max) - 1)
             defer { transport.close() }
             transport.setMode(mode)
-            transport.setSchema(["watch": APISchema(id: 77)])
+            try transport.setSchema(["watch": APISchema(id: 77)])
             transport.connect()
             acknowledgeSentSubscriptions(first, mode: mode)
             let values = SubscriptionValues()
@@ -276,7 +276,7 @@ final class WebSocketSubscriptionTests: XCTestCase {
                     })
             }
             transport.setMode(mode == .json ? .binary : .json)
-            transport.setSchema([:])
+            try transport.setSchema([:])
             transport.connect()
             await fulfillment(of: [ended], timeout: 1)
             XCTAssertTrue(second.sentMessages.isEmpty)
@@ -300,7 +300,7 @@ final class WebSocketSubscriptionTests: XCTestCase {
                 url: "wss://example.com/socket", session: MockWebSocketSession(sockets: [first, second]))
             defer { transport.close() }
             transport.setMode(mode)
-            transport.setSchema(["watch": APISchema(id: 77)])
+            try transport.setSchema(["watch": APISchema(id: 77)])
             transport.connect()
             acknowledgeSentSubscriptions(first, mode: mode)
             acknowledgeSentSubscriptions(second, mode: mode)
@@ -382,7 +382,7 @@ final class WebSocketSubscriptionTests: XCTestCase {
         let transport = try WebSocketTransport(
             url: "wss://example.com/socket", timeout: 0.5,
             session: MockWebSocketSession(socket: socket), initialSequence: start)
-        transport.setSchema(["watch": APISchema(id: 77)])
+        try transport.setSchema(["watch": APISchema(id: 77)])
         transport.setMode(mode)
         transport.connect()
         return transport

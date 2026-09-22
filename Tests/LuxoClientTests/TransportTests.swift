@@ -6,6 +6,87 @@ import XCTest
 #endif
 
 final class TransportTests: XCTestCase {
+    func testHTTPCacheOverloadPreservesIdentityWithoutRetryOrRefresh() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let lock = NSLock()
+            var calls = 0
+            let transport = try makeURLSessionTransport { request in
+                let attempt = lock.withLock {
+                    calls += 1; return calls
+                }
+                if attempt == 1 {
+                    return try self.mockResponse(request, status: 503, data: self.cacheOriginError(mode))
+                }
+                return try self.mockResponse(
+                    request, status: 200, data: mode == .json ? Data(#"{"data":42}"#.utf8) : Data([84]))
+            }
+            transport.setMode(mode)
+            try transport.setSchema(["echo": APISchema(id: 1)])
+            transport.onTokenExpired = {
+                XCTFail("cache overload must not refresh authentication")
+                return "must-not-refresh"
+            }
+            do {
+                _ = try await transport.call("echo")
+                XCTFail("expected cache overload")
+            } catch let error as LuxoError {
+                XCTAssertEqual(error.name, "CacheOriginBusy")
+                XCTAssertEqual(error.code, 503)
+                XCTAssertEqual(error.message, "Cache origin capacity exhausted")
+            }
+            XCTAssertEqual(lock.withLock { calls }, 1)
+            let next = try await transport.call("echo")
+            XCTAssertEqual(next.mode, mode)
+            XCTAssertEqual(next.data, mode == .json ? Data("42".utf8) : Data([84]))
+            XCTAssertEqual(lock.withLock { calls }, 2)
+        }
+    }
+
+    private func cacheOriginError(_ mode: TransportMode) -> Data {
+        if mode == .json {
+            return Data(#"{"error":"CacheOriginBusy","code":503,"message":"Cache origin capacity exhausted"}"#.utf8)
+        }
+        var encoder = Encoder()
+        encoder.writeVarint(1)
+        encoder.writeSvarint(503)
+        encoder.writeVarint(2)
+        encoder.writeString("CacheOriginBusy")
+        encoder.writeVarint(3)
+        encoder.writeString("Cache origin capacity exhausted")
+        encoder.writeEnd()
+        return encoder.data
+    }
+
+    func testRejectedHTTPSchemaPreservesEncodingAndValidation() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let original = APISchema(id: 7, params: [.init(fieldID: 1, name: "value", type: "Int")])
+            let transport = try makeURLSessionTransport { request in
+                let body = try self.requestBody(request)
+                if mode == .binary {
+                    XCTAssertEqual(
+                        body, try LuxoBinaryProtocol.encodeRequest(schema: original, params: ["value": .int(7)]))
+                } else {
+                    XCTAssertTrue(String(decoding: body, as: UTF8.self).contains("\"value\":7"))
+                }
+                return try self.mockResponse(
+                    request, status: 200, data: mode == .binary ? Data([14]) : Data("{\"data\":7}".utf8))
+            }
+            try transport.setSchema(["echo": original])
+            transport.setMode(mode)
+            XCTAssertThrowsError(
+                try transport.setSchema([
+                    "echo": APISchema(
+                        id: 9, params: [.init(fieldID: 0, name: "value", type: "String")])
+                ]))
+            let result = try await transport.call("echo", params: ["value": .int(7)])
+            XCTAssertEqual(result.mode, mode)
+            do {
+                _ = try await transport.call("echo", params: ["value": .string("invalid")])
+                XCTFail("old Int validation was replaced")
+            } catch is LuxoError {}
+        }
+    }
+
     func testPayloadRetainsOriginalByteStorage() {
         let bytes = Data(repeating: 0x61, count: 4096)
         let payload = TransportPayload(data: bytes, mode: .json)
@@ -30,7 +111,7 @@ final class TransportTests: XCTestCase {
                 let data = original == .json ? Data(#"{"data":2}"#.utf8) : Data([4])
                 return try self.mockResponse(request, status: 200, data: data)
             }
-            transport.setSchema(["echo": APISchema(id: 1)])
+            try transport.setSchema(["echo": APISchema(id: 1)])
             transport.setMode(original)
             let pending = Task { try await transport.call("echo") }
             await fulfillment(of: [sent], timeout: 1)
@@ -50,7 +131,7 @@ final class TransportTests: XCTestCase {
             }
             return try self.mockResponse(request, status: 200, data: Data([4]))
         }
-        transport.setSchema(["echo": APISchema(id: 1)])
+        try transport.setSchema(["echo": APISchema(id: 1)])
         transport.onTokenExpired = { [weak transport] in
             transport?.setMode(.binary)
             return "fresh"
@@ -64,7 +145,7 @@ final class TransportTests: XCTestCase {
         let socket = MockWebSocketTask()
         let transport = try WebSocketTransport(
             url: "wss://example.com/socket", session: MockWebSocketSession(socket: socket))
-        transport.setSchema(["echo": APISchema(id: 7)])
+        try transport.setSchema(["echo": APISchema(id: 7)])
         transport.connect()
         defer { transport.close() }
         let jsonSent = expectation(description: "JSON sent")
@@ -480,6 +561,15 @@ final class TransportTests: XCTestCase {
         XCTAssertNil(decoder.error)
     }
 
+    func testBinaryRequestRejectsOutOfRangeSelectionMetadata() {
+        for id in [0, -1, 65536, Int.max] {
+            let schema = APISchema(id: 1, fields: ["value": .init(fieldID: id)])
+            XCTAssertThrowsError(try LuxoBinaryProtocol.encodeRequest(schema: schema, params: ["$select": "value"])) {
+                XCTAssertEqual(($0 as? LuxoError)?.name, "ConfigError")
+            }
+        }
+    }
+
     func testBinaryRequestRejectsInvalidParamsAndSelections() {
         let invalidParams: [(APISchema.ParamSchema, LuxoValue)] = [
             (.init(fieldID: 1, name: "value", type: "Int"), "bad"),
@@ -752,7 +842,7 @@ final class TransportTests: XCTestCase {
                     APISchema.ParamSchema(fieldID: 1, name: "id", type: "Int")
                 ])
         ]
-        transport.setSchema(schema)
+        try transport.setSchema(schema)
         // No crash, schema set correctly
     }
 
@@ -807,7 +897,7 @@ final class TransportTests: XCTestCase {
                 XCTFail("invalid integers must not be sent")
                 return try self.mockResponse(request, status: 200, body: ["data": 0])
             }
-            transport.setSchema(["echo": schema])
+            try transport.setSchema(["echo": schema])
             XCTAssertThrowsError(try LuxoBinaryProtocol.encodeRequest(schema: schema, params: params))
             do {
                 _ = try await transport.call("echo", params: params)
@@ -834,7 +924,7 @@ final class TransportTests: XCTestCase {
             XCTFail("invalid nested integers must not be sent")
             return try self.mockResponse(request, status: 200, body: ["data": 0])
         }
-        transport.setSchema(["echo": schema])
+        try transport.setSchema(["echo": schema])
         do {
             _ = try await transport.call(
                 "echo",
@@ -854,15 +944,15 @@ final class TransportTests: XCTestCase {
             XCTAssertEqual(json["$api"] as? String, "echo")
             return try self.mockResponse(request, status: 200, body: ["data": try XCTUnwrap(json["value"])])
         }
-        transport.setSchema(["echo": APISchema(id: 1, params: [.init(fieldID: 1, name: "value", type: "Int")])])
+        try transport.setSchema(["echo": APISchema(id: 1, params: [.init(fieldID: 1, name: "value", type: "Int")])])
         for value in [Int64.min, Int64.max] {
             let response = try await transport.call("echo", params: ["value": .int(value), "$api": .float(.nan)])
             XCTAssertEqual(try JSONDecoder().decode(Int64.self, from: response.data), value)
         }
-        transport.setSchema(["echo": APISchema(id: 1, params: [.init(fieldID: 1, name: "value", type: "Float")])])
+        try transport.setSchema(["echo": APISchema(id: 1, params: [.init(fieldID: 1, name: "value", type: "Float")])])
         let floating = try await transport.call("echo", params: ["value": .float(1.5)])
         XCTAssertEqual(try JSONDecoder().decode(Double.self, from: floating.data), 1.5)
-        transport.setSchema([:])
+        try transport.setSchema([:])
         let untyped = try await transport.call("echo", params: ["value": true])
         XCTAssertTrue(try JSONDecoder().decode(Bool.self, from: untyped.data))
     }
@@ -871,7 +961,7 @@ final class TransportTests: XCTestCase {
         let socket = MockWebSocketTask()
         let transport = try WebSocketTransport(
             url: "wss://example.com/socket", timeout: 0.01, session: MockWebSocketSession(socket: socket))
-        transport.setSchema(["echo": APISchema(id: 1, params: [.init(fieldID: 1, name: "id", type: "Int")])])
+        try transport.setSchema(["echo": APISchema(id: 1, params: [.init(fieldID: 1, name: "id", type: "Int")])])
         transport.connect()
         defer { transport.close() }
         for subscription in [false, true] {
@@ -991,6 +1081,52 @@ final class TransportTests: XCTestCase {
         )
     }
 
+    func testHTTPRefreshRequiresMatchingStatusAndErrorCode() async throws {
+        for mode in [TransportMode.json, .binary] {
+            for (status, code) in [(200, 401), (403, 401), (500, 401), (401, 403), (401, 0), (401, 401)] {
+                if mode == .binary, status == 200 { continue }
+                let lock = NSLock()
+                var calls = 0
+                var refreshes = 0
+                let transport = try makeURLSessionTransport { request in
+                    lock.withLock { calls += 1 }
+                    return try self.mockResponse(request, status: status, data: self.unauthorizedBody(mode, code: code))
+                }
+                transport.setMode(mode)
+                try transport.setSchema(["viewer": APISchema(id: 1)])
+                transport.onTokenExpired = {
+                    lock.withLock { refreshes += 1 }
+                    return "renewed"
+                }
+                do {
+                    _ = try await transport.call("viewer")
+                    XCTFail("expected the original error")
+                } catch let error as LuxoError {
+                    XCTAssertEqual(error.code, code)
+                    XCTAssertEqual(error.name, "Unauthorized")
+                }
+                let eligible = status == 401 && code == 401
+                XCTAssertEqual(lock.withLock { refreshes }, eligible ? 1 : 0, "\(mode)/\(status)/\(code)")
+                XCTAssertEqual(lock.withLock { calls }, eligible ? 2 : 1, "\(mode)/\(status)/\(code)")
+            }
+        }
+    }
+
+    private func unauthorizedBody(_ mode: TransportMode, code: Int) -> Data {
+        if mode == .json {
+            return Data("{\"error\":\"Unauthorized\",\"code\":\(code),\"message\":\"expired\"}".utf8)
+        }
+        var encoder = Encoder()
+        encoder.writeVarint(1)
+        encoder.writeSvarint(Int64(code))
+        encoder.writeVarint(2)
+        encoder.writeString("Unauthorized")
+        encoder.writeVarint(3)
+        encoder.writeString("expired")
+        encoder.writeEnd()
+        return encoder.data
+    }
+
     func testURLSessionTransportPropagates401WithoutRefreshToken() async throws {
         let transport = try makeURLSessionTransport { request in
             try self.mockResponse(
@@ -1020,7 +1156,7 @@ final class TransportTests: XCTestCase {
             return try self.mockResponse(request, status: 200, data: Data([1, 2, 3]))
         }
         transport.setMode(.binary)
-        transport.setSchema([
+        try transport.setSchema([
             "getUser": APISchema(
                 id: 9,
                 params: [.init(fieldID: 1, name: "id", type: "Int")]
@@ -1058,7 +1194,7 @@ final class TransportTests: XCTestCase {
             return try self.mockResponse(request, status: 400, data: body)
         }
         transport.setMode(.binary)
-        transport.setSchema(["fail": APISchema(id: 1)])
+        try transport.setSchema(["fail": APISchema(id: 1)])
 
         do {
             _ = try await transport.call("fail")
@@ -1098,7 +1234,7 @@ final class TransportTests: XCTestCase {
         }
 
         nonHTTP.setMode(.binary)
-        nonHTTP.setSchema(["invalid": APISchema(id: 1)])
+        try nonHTTP.setSchema(["invalid": APISchema(id: 1)])
         do {
             _ = try await nonHTTP.call("invalid")
             XCTFail("expected network error")
@@ -1237,7 +1373,7 @@ final class TransportTests: XCTestCase {
             )
             defer { transport.close() }
             transport.setMode(mode)
-            transport.setSchema(["getUser": APISchema(id: 7)])
+            try transport.setSchema(["getUser": APISchema(id: 7)])
             let sent = expectation(description: "last available ID sent")
             socket.onSend = { _ in sent.fulfill() }
             transport.connect()
@@ -1297,7 +1433,7 @@ final class TransportTests: XCTestCase {
         )
         defer { transport.close() }
         transport.setMode(.binary)
-        transport.setSchema(["getUser": APISchema(id: 7)])
+        try transport.setSchema(["getUser": APISchema(id: 7)])
         socket.onSend = { [weak socket] _ in
             socket?.deliver(.success(.data(Data([0x82, 0, 1, 0]))))
             socket?.deliver(.success(.data(Data([2, 1, 42]))))
@@ -1324,7 +1460,7 @@ final class TransportTests: XCTestCase {
             session: MockWebSocketSession(socket: socket)
         )
         transport.setMode(.binary)
-        transport.setSchema(["getUser": APISchema(id: 7)])
+        try transport.setSchema(["getUser": APISchema(id: 7)])
         transport.connect()
 
         socket.onSend = { [weak socket] _ in
@@ -1528,7 +1664,7 @@ final class TransportTests: XCTestCase {
             session: MockWebSocketSession(socket: socket)
         )
         transport.setMode(.binary)
-        transport.setSchema(["watchOrders": APISchema(id: 7)])
+        try transport.setSchema(["watchOrders": APISchema(id: 7)])
         transport.connect()
         let streamed = expectation(description: "binary stream received")
         socket.onSend = { [weak socket] _ in

@@ -80,10 +80,13 @@ analyzer uses SwiftSyntax 603; deployment minimums remain iOS 15 and macOS 13.
 
 ### Swift Package Manager
 
+The following exact version is prepared for the unreleased `1.0.0-beta.1`
+candidate. It becomes installable once the matching release tag is published.
+
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/light-speak/luxo-swift.git", from: "0.1.0")
+    .package(url: "https://github.com/light-speak/luxo-swift.git", exact: "1.0.0-beta.1")
 ]
 
 // Target
@@ -210,8 +213,20 @@ JSON in dev for easy debugging. Switch to binary in prod — same API, zero code
 
 ```swift
 transport.setMode(.binary)
-transport.setSchema(LUXO_SCHEMA) // from codegen
+try transport.setSchema(LUXO_SCHEMA) // from codegen; validates IDs before replacing the schema
 ```
+
+Generated clients register their schema during throwing initialization:
+
+```swift
+let client = try LuxoGeneratedClient(transport: transport)
+```
+
+HTTP and WebSocket transports reject out-of-range or duplicate IDs before replacing
+their current schema. A failed update preserves the previous registration. Validation
+runs during registration, not on every call or stream message. Forwarding transports
+must propagate `try base.setSchema(schema)`; regenerate clients for this pre-release
+interface change. The wire format is unchanged.
 
 ### 401 Auto-Refresh
 
@@ -503,6 +518,21 @@ multi-service routing or network performance, and do not waive performance gates
 
 ### Generated scalar responses / 生成的标量响应
 
+Generated enums preserve known cases such as `.open` and expose new server values as
+`.unknown(String)`. Use `Status(rawValue: text)` to classify a value, `rawValue` to
+retrieve its exact wire text, and `knownCases` to enumerate only declared members.
+`CaseIterable`/`allCases` is intentionally unavailable because unknown values are unbounded.
+Known matching and unknown equality use exact UTF-8, not Swift's Unicode-equivalent
+string comparison. Conflicting or unsupported case identifiers are escaped without
+changing their wire values. Unknown parameters are sent unchanged; the server still
+rejects values absent from its own Schema. This does not waive performance gates.
+
+生成枚举保留 `.open` 等已知分支，新服务端成员表示为 `.unknown(String)`。
+用 `Status(rawValue: text)` 分类，`rawValue` 读取协议原文，`knownCases` 仅枚举声明成员；
+未知值无穷，故不再提供 `CaseIterable`/`allCases`。成员匹配与未知值相等性按精确 UTF-8，
+不采用 Swift 的 Unicode 等价比较。冲突标识符转义不改变 wire；SDK 发送未知参数时保留
+原文，服务端仍按自身 Schema 拒绝未声明值。新增性能成本仍待独立验收。
+
 The external consumer compiles and executes 44 methods covering eleven return kinds,
 scalar/list shapes and calls/streams in both JSON and Binary. Enum replies use the
 declared enum type, and throwing JSON-list decoding stays inside the stream's guarded
@@ -511,9 +541,11 @@ decode path. No-argument calls explicitly pass `params: nil`.
 A shared generated boundary rejects decoder errors and trailing bytes after a complete
 Binary scalar/list reply; it is not applied to inline row fields. Calls throw
 `DecodeError` instead of returning a decoder's zero/empty placeholder. The current
-data callback remains success-only: invalid payloads do not invoke it. These decoding
-failures do not yet notify `StreamObserver`; server-sent terminal errors do. This
-does not certify complete stream-error observability.
+data callback remains success-only: invalid payloads do not invoke it. Generated JSON
+response boundaries also normalize decode failures to `DecodeError`; the standalone
+`LuxoJSONDecoder` retains Codable's errors. Subscription decoding failures notify
+`StreamObserver.onError` and terminate only the affected subscription, not other streams.
+This does not certify all device or network failure scenarios.
 
 The Binary response boundary also normalizes embedded JSON parser failures to
 `DecodeError`, retaining the underlying diagnostic. `--decoder-errors-bench` on

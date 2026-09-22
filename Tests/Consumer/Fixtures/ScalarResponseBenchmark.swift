@@ -85,8 +85,9 @@ func benchmarkScalarResponses() throws {
     }
 }
 
-private func compareScalarBoundary(
+func compareScalarBoundary(
     _ label: String, fixtures: [Data], labels: (String, String) = ("unchecked", "checked"),
+    iterations: Int = 50_000,
     operation: (Data, Bool) throws -> UInt64
 ) rethrows {
     var checksum: UInt64 = 0
@@ -98,7 +99,8 @@ private func compareScalarBoundary(
     var after: [Double] = []
     for index in 0..<16 {
         for checked in index.isMultiple(of: 2) ? [false, true] : [true, false] {
-            let sample = try measureScalarBoundary(fixtures, checked: checked, iterations: 50_000, operation: operation)
+            let sample = try measureScalarBoundary(
+                fixtures, checked: checked, iterations: iterations, operation: operation)
             checksum &+= sample.sum
             if checked { after.append(sample.ns) } else { before.append(sample.ns) }
         }

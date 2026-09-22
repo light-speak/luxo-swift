@@ -9,12 +9,17 @@ guard profileEncoder.data == Data([4, 1, 4, 76, 117, 120, 111, 2, 0, 0]) else {
 }
 _ = Record()
 do {
-    if CommandLine.arguments.contains("--decoder-errors-bench") {
+    if CommandLine.arguments.contains("--enum-bench") {
+        try await verifyEnums()
+        try benchmarkEnums()
+    } else if CommandLine.arguments.contains("--decoder-errors-bench") {
         try benchmarkDecoderErrorBoundary()
     } else if CommandLine.arguments.contains("--scalar-bench") {
         try benchmarkScalarResponses()
     } else {
+        try verifyRegistrationFailure()
         try await verifyPrecisionInputs()
+        try await verifyEnums()
         try await verifyScalarResponses()
         try await verifyStructuredResponses()
         try await verifyJSONProjection()
@@ -22,6 +27,26 @@ do {
 } catch {
     FileHandle.standardError.write(Data("Consumer failed: \(error)\n".utf8))
     exit(1)
+}
+
+func verifyRegistrationFailure() throws {
+    do {
+        _ = try LuxoGeneratedClient(transport: RejectedSchemaTransport())
+    } catch let error as LuxoError where error.name == "ConfigError" && error.message == "registration rejected" {
+        return
+    }
+    throw LuxoError(code: 0, message: "client swallowed schema registration failure", name: "ConsumerError")
+}
+
+private struct RejectedSchemaTransport: Transport {
+    func setSchema(_ schema: [String: APISchema]) throws {
+        throw LuxoError(code: 0, message: "registration rejected", name: "ConfigError")
+    }
+    func setToken(_ token: String) {}
+    func setMode(_ mode: TransportMode) {}
+    func call(_ api: String, params: [String: LuxoValue]?) async throws -> TransportPayload {
+        throw LuxoError(code: 0, message: "uninitialized client called", name: "ConsumerError")
+    }
 }
 
 func precisionInput(note: String? = nil) -> PrecisionInput {
@@ -56,12 +81,12 @@ func verifyPrecisionInputs() async throws {
             (.absent, nil), (.present(nil), .null), (.present("patch"), .string("patch")),
         ]
         for (patch, expected) in patches {
-            let client = LuxoGeneratedClient(transport: PrecisionTransport(input: input, expectedNote: expected))
+            let client = try LuxoGeneratedClient(transport: PrecisionTransport(input: input, expectedNote: expected))
             guard try await callPrecision(client, input: input, note: patch) else {
                 throw LuxoError(code: 0, message: "generated request failed", name: "ConsumerError")
             }
         }
-        let client = LuxoGeneratedClient(transport: PrecisionTransport(input: input, expectedNote: nil))
+        let client = try LuxoGeneratedClient(transport: PrecisionTransport(input: input, expectedNote: nil))
         for ratio in [Double.nan, .infinity, -.infinity] {
             do {
                 _ = try await callPrecision(client, input: input, ratios: [ratio])

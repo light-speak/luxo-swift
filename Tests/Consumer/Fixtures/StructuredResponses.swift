@@ -50,9 +50,9 @@ private func verifyStructured(
     let row = Data([0, field]) + marker + rowValue + Data([0])
     let columns = Data([1, 0, field]) + marker + columnValue + Data([0])
     for binary in [false, true] {
-        let rowClient = structuredClient(binary ? row : Data(json.utf8), binary: binary)
+        let rowClient = try structuredClient(binary ? row : Data(json.utf8), binary: binary)
         try check(try await rowClient.getRecord(select: "numbers, profile { name, bio }, profiles { name, bio }"))
-        let columnClient = structuredClient(binary ? columns : Data("[\(json)]".utf8), binary: binary)
+        let columnClient = try structuredClient(binary ? columns : Data("[\(json)]".utf8), binary: binary)
         let records = try await columnClient.listRecords(
             select: "numbers, profile { name, bio }, profiles { name, bio }")
         guard records.count == 1 else { throw structuredFailure() }
@@ -153,8 +153,8 @@ private func structuredFailure() -> LuxoError {
         name: "ConsumerError")
 }
 
-private func structuredClient(_ data: Data, binary: Bool) -> LuxoGeneratedClient {
-    let client = LuxoGeneratedClient(transport: StructuredTransport(data: data, mode: binary ? .binary : .json))
+private func structuredClient(_ data: Data, binary: Bool) throws -> LuxoGeneratedClient {
+    let client = try LuxoGeneratedClient(transport: StructuredTransport(data: data, mode: binary ? .binary : .json))
     if binary { client.enableBinary() }
     return client
 }

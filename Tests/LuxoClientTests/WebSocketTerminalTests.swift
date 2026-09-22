@@ -146,7 +146,7 @@ final class WebSocketTerminalTests: XCTestCase {
                 url: "ws://localhost/test", timeout: 1,
                 session: MockWebSocketSession(sockets: [first, second]))
             defer { transport.close() }
-            transport.setSchema(["watch": APISchema(id: 77)])
+            try transport.setSchema(["watch": APISchema(id: 77)])
             transport.setMode(mode)
             transport.connect()
             let acknowledgement: URLSessionWebSocketTask.Message =
@@ -411,7 +411,7 @@ final class WebSocketTerminalTests: XCTestCase {
         let transport = try WebSocketTransport(
             url: "ws://localhost/test", timeout: 1,
             session: MockWebSocketSession(socket: socket), initialSequence: start)
-        transport.setSchema(["watch": APISchema(id: 77)])
+        try transport.setSchema(["watch": APISchema(id: 77)])
         transport.setMode(mode)
         transport.connect()
         socket.onSend = { [weak socket] message in
