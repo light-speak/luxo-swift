@@ -726,7 +726,10 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
                 statusCode: httpResponse.statusCode,
                 error: JSONEnvelope.decodeError(envelope, statusCode: httpResponse.statusCode))
         }
-        return envelope.responseData
+        guard let data = envelope.responseData else {
+            throw LuxoError(code: httpResponse.statusCode, message: "missing JSON response data", name: "ParseError")
+        }
+        return data
     }
 
     private func decodeJSONEnvelope(_ data: Data, statusCode: Int) throws -> JSONEnvelope {

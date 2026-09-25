@@ -428,7 +428,8 @@ public final class LuxoCodegen {
             let returnType = api.returnType ?? "Void"
             let baseReturn = mapType(returnType, nullable: false, list: api.returnList ?? false)
             let swiftReturn =
-                api.paginated ?? false ? "Page<\(mapType(returnType, nullable: false, list: false))>" : baseReturn
+                (api.paginated ?? false ? "Page<\(mapType(returnType, nullable: false, list: false))>" : baseReturn)
+                + (api.returnNullable == true ? "?" : "")
             let hasStructuredReturn = schema.models[returnType] != nil || schema.types?[returnType] != nil
 
             // Build params — page/pageSize always optional for list APIs
@@ -549,17 +550,21 @@ public final class LuxoCodegen {
         var out = "    private static func decode_\(api.name)(_ result: TransportPayload) throws -> \(swiftReturn) {\n"
         if returnType == "Void" { return out + "        return ()\n    }\n\n" }
         out += "        if result.mode == .binary {\n"
+        let nullable = api.returnNullable == true
+        if nullable { out += "            if try isNullRoot(result.data) { return nil }\n" }
+        let scalarData = nullable ? "try Decoder(result.data, offset: 1)" : "result.data"
+        let columnData = nullable ? "try ColumnarDecoder(data: result.data, offset: 1)" : "result.data"
         if structured {
             if api.paginated ?? false {
-                out += "            return try decodePaginated\(returnType)(result.data)\n"
+                out += "            return try decodePaginated\(returnType)(\(columnData))\n"
             } else if api.returnList ?? false {
-                out += "            return try decodeColumnar\(returnType)(result.data)\n"
+                out += "            return try decodeColumnar\(returnType)(\(columnData))\n"
             } else {
-                out += "            return \(modelPayloadRead(returnType, data: "result.data"))\n"
+                out += "            return \(modelPayloadRead(returnType, data: scalarData))\n"
             }
         } else {
             let read = scalarDecodeExpression(returnType, list: api.returnList ?? false, schema: schema)
-            out += "            return try decodeLuxoResponse(result.data) { decoder in \(read) }\n"
+            out += "            return try decodeLuxoResponse(\(scalarData)) { decoder in \(read) }\n"
         }
         out += "        }\n"
         if returnType == "DateTime" {
@@ -640,7 +645,12 @@ public final class LuxoCodegen {
         // Only complete response payloads use this boundary, never inline row fields.
         @inline(__always)
         func decodeLuxoResponse<Value>(_ data: Data, read: (inout Decoder) throws -> Value) throws -> Value {
-            var decoder = Decoder(data)
+            try decodeLuxoResponse(Decoder(data), read: read)
+        }
+
+        @inline(__always)
+        func decodeLuxoResponse<Value>(_ initial: Decoder, read: (inout Decoder) throws -> Value) throws -> Value {
+            var decoder = initial
             let value: Value
             do {
                 value = try read(&decoder)
@@ -788,7 +798,9 @@ public final class LuxoCodegen {
         let function = paginated ? "decodePaginated\(name)" : "decodeColumnar\(name)"
         let result = paginated ? "Page<\(name)>" : "[\(name)]"
         var out = "public func \(function)(_ data: Data) throws -> \(result) {\n"
-        out += "    var decoder = ColumnarDecoder(data: data)\n"
+        out += "    try \(function)(ColumnarDecoder(data: data))\n}\n\n"
+        out += "public func \(function)(_ initial: ColumnarDecoder) throws -> \(result) {\n"
+        out += "    var decoder = initial\n"
         for field in fields {
             out += "    var _\(field.name): \(columnType(field, schema: schema, usages: usages))?\n"
         }
@@ -834,7 +846,7 @@ public final class LuxoCodegen {
             out +=
                 "    if let error = decoder.error { throw LuxoError(code: 0, message: error, name: \"DecodeError\") }\n"
         }
-        out += "    guard decoder.offset == data.count else {\n"
+        out += "    guard decoder.isAtEnd else {\n"
         out +=
             "        throw LuxoError(code: 0, message: \"trailing columnar response bytes\", name: \"DecodeError\")\n"
         out += "    }\n"

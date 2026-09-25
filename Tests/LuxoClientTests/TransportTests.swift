@@ -6,6 +6,31 @@ import XCTest
 #endif
 
 final class TransportTests: XCTestCase {
+    func testHTTPSuccessRequiresDataButAllowsExplicitNull() async throws {
+        for body in ["{}", #"{"ok":true}"#, #"{"value":42}"#] {
+            let transport = try makeURLSessionTransport { request in
+                try self.mockResponse(request, status: 200, data: Data(body.utf8))
+            }
+            transport.onTokenExpired = {
+                XCTFail("missing data triggered refresh"); return nil
+            }
+            do {
+                _ = try await transport.call("echo")
+                XCTFail("missing data was accepted")
+            } catch let error as LuxoError {
+                XCTAssertEqual(error.name, "ParseError")
+                XCTAssertEqual(error.code, 200)
+            }
+        }
+        for value in ["null", "false", "0", "\"\"", "[]", "{}"] {
+            let transport = try makeURLSessionTransport { request in
+                try self.mockResponse(request, status: 200, data: Data("{\"data\":\(value)}".utf8))
+            }
+            let payload = try await transport.call("echo")
+            XCTAssertEqual(payload.data, Data(value.utf8))
+        }
+    }
+
     func testHTTPCacheOverloadPreservesIdentityWithoutRetryOrRefresh() async throws {
         for mode in [TransportMode.json, .binary] {
             let lock = NSLock()

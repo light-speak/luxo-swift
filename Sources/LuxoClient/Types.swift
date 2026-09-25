@@ -405,26 +405,28 @@ public struct LuxoAPI: Codable, Sendable {
     public let module: String
     public let returnType: String?
     public let returnList: Bool?
+    public let returnNullable: Bool?
     public let paginated: Bool?
     public let stream: Bool?
     public let params: [LuxoParam]?
     public let isInternal: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, module, returnType, returnList, paginated, stream, params
+        case id, name, module, returnType, returnList, returnNullable, paginated, stream, params
         case isInternal = "internal"
     }
 
     public init(
         id: Int, name: String, module: String, returnType: String? = nil,
         returnList: Bool? = nil, paginated: Bool? = nil, stream: Bool? = nil,
-        params: [LuxoParam]? = nil, isInternal: Bool? = nil
+        params: [LuxoParam]? = nil, isInternal: Bool? = nil, returnNullable: Bool? = nil
     ) {
         self.id = id
         self.name = name
         self.module = module
         self.returnType = returnType
         self.returnList = returnList
+        self.returnNullable = returnNullable
         self.paginated = paginated
         self.stream = stream
         self.params = params

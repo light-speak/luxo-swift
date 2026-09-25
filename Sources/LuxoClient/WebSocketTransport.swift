@@ -237,6 +237,10 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
     private func failDecoding(_ id: UInt64, cause: Error) {
         let message = (cause as? LuxoError)?.message ?? "invalid subscription payload"
         let error = LuxoError(code: 0, message: message, name: "DecodeError")
+        failSubscriptionPayload(id, error: error)
+    }
+
+    private func failSubscriptionPayload(_ id: UInt64, error: LuxoError) {
         guard let observer = failSubscription(id, error: error, cancelRemote: true),
             let notify = observer.onError
         else { return }
@@ -393,7 +397,12 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
             guard let id = LuxoWebSocketProtocol.jsonRequestID(value: json["$stream"]),
                 let handler = streamHandler(id, mode: .json, socket: socket)
             else { return }
-            handler(TransportPayload(data: envelope.responseData, mode: .json))
+            guard let data = envelope.responseData else {
+                failSubscriptionPayload(
+                    id, error: LuxoError(code: 0, message: "missing JSON response data", name: "ParseError"))
+                return
+            }
+            handler(TransportPayload(data: data, mode: .json))
         } else {
             handleJSONCall(envelope, socket: socket)
         }
@@ -407,8 +416,11 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
         state.timeoutTask.cancel()
         if json["error"] != nil {
             state.continuation.resume(throwing: JSONEnvelope.decodeError(envelope, statusCode: 0))
+        } else if let data = envelope.responseData {
+            state.continuation.resume(returning: TransportPayload(data: data, mode: .json))
         } else {
-            state.continuation.resume(returning: TransportPayload(data: envelope.responseData, mode: .json))
+            state.continuation.resume(
+                throwing: LuxoError(code: 0, message: "missing JSON response data", name: "ParseError"))
         }
     }
 

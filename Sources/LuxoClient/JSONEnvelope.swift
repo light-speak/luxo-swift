@@ -10,8 +10,8 @@ struct JSONEnvelope {
 
     var hasData: Bool { payload != nil }
 
-    var responseData: Data {
-        guard let payload else { return Data("null".utf8) }
+    var responseData: Data? {
+        guard let payload else { return nil }
         // Data slices can have a nonzero startIndex; reader offsets are always relative.
         return source[(source.startIndex + payload.lowerBound)..<(source.startIndex + payload.upperBound)]
     }
@@ -29,7 +29,7 @@ struct JSONEnvelope {
 
     func materializedFields() throws -> [String: LuxoValue] {
         var values = fields
-        if payload != nil, values["data"] == nil { values["data"] = try JSONReader.decode(responseData) }
+        if let data = responseData, values["data"] == nil { values["data"] = try JSONReader.decode(data) }
         return values
     }
 

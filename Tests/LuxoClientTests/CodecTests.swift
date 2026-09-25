@@ -2,6 +2,112 @@ import XCTest
 @testable import LuxoClient
 
 final class CodecTests: XCTestCase {
+    func testOffsetDecoderUsesSliceIndicesWithoutRebasingData() throws {
+        let data = Data([99, 1, 84]).dropFirst()
+        XCTAssertEqual(data.startIndex, 1)
+        var decoder = try Decoder(data, offset: 1)
+        XCTAssertEqual(decoder.readSvarint(), 42)
+        XCTAssertTrue(decoder.isAtEnd)
+    }
+
+    func testSliceDecoderReadersPreserveBoundsAndCursor() throws {
+        let cases: [([UInt8], (inout Decoder) -> String, String)] = [
+            ([2, 65, 66], { $0.readString() }, "AB"),
+            ([2, 65, 66], { String(decoding: $0.readBytes(), as: UTF8.self) }, "AB"),
+            ([1], { String($0.readBool()) }, "true"),
+            (Array(repeating: 0, count: 8), { String($0.readFixed64()) }, "0.0"),
+            (Array(repeating: 0, count: 16), { $0.readUUID().uuidString }, "00000000-0000-0000-0000-000000000000"),
+            ([1, 84], { String(describing: $0.readArray { $0.readSvarint() }) }, "[42]"),
+            ([1, 84], { String($0.readIntPtr() ?? -1) }, "42"),
+            ([0, 0], { $0.readDateTime() }, "1970-01-01T00:00:00Z"),
+            ([65, 66], { String(decoding: $0.readRemainingData(), as: UTF8.self) }, "AB"),
+        ]
+        for (bytes, read, expected) in cases {
+            for prefix in [false, true] {
+                let data = Data([99] + (prefix ? [1] : []) + bytes).dropFirst()
+                var decoder = prefix ? try Decoder(data, offset: 1) : Decoder(data)
+                XCTAssertEqual(decoder.remaining, bytes.count)
+                XCTAssertEqual(read(&decoder), expected)
+                XCTAssertNil(decoder.error)
+                XCTAssertTrue(decoder.isAtEnd)
+                XCTAssertEqual(decoder.remaining, 0)
+            }
+        }
+    }
+
+    func testColumnarOffsetDecoderUsesSliceIndices() throws {
+        for prefix in [false, true] {
+            let data = Data([99] + (prefix ? [1] : []) + [1, 0, 1, 84, 0]).dropFirst()
+            var decoder = prefix ? try ColumnarDecoder(data: data, offset: 1) : ColumnarDecoder(data: data)
+            XCTAssertEqual(decoder.count, 1)
+            XCTAssertTrue(decoder.nextColumn())
+            if decoder.error != nil { XCTFail(decoder.error!); continue }
+            XCTAssertEqual(decoder.fieldID, 1)
+            XCTAssertEqual(decoder.readColumnInt(), [42])
+            XCTAssertFalse(decoder.nextColumn())
+            XCTAssertNil(decoder.error)
+            XCTAssertTrue(decoder.isAtEnd)
+            XCTAssertEqual(decoder.offset, data.count)
+        }
+    }
+
+    func testColumnarSliceReadersPreserveBounds() throws {
+        let zeroUUID = "00000000-0000-0000-0000-000000000000"
+        let cases: [([UInt8], (inout ColumnarDecoder) -> String, String)] = [
+            ([2, 65, 66], { $0.readColumnString().joined() }, "AB"),
+            ([2, 65, 66], { String(decoding: $0.readColumnBytes().first ?? Data(), as: UTF8.self) }, "AB"),
+            ([1], { String(describing: $0.readColumnBool()) }, "[true]"),
+            (Array(repeating: 0, count: 8), { String(describing: $0.readColumnFloat()) }, "[0.0]"),
+            (Array(repeating: 0, count: 16), { $0.readColumnUUID().first?.uuidString ?? "" }, zeroUUID),
+            ([1, 84], { String($0.readColumnIntPtr().first.flatMap { $0 } ?? -1) }, "42"),
+            ([0, 0], { $0.readColumnDateTime().joined() }, "1970-01-01T00:00:00Z"),
+        ]
+        for (bytes, read, expected) in cases {
+            let data = Data([99, 1, 1, 0, 1] + bytes + [0]).dropFirst()
+            var decoder = try ColumnarDecoder(data: data, offset: 1)
+            XCTAssertTrue(decoder.nextColumn())
+            XCTAssertEqual(read(&decoder), expected)
+            XCTAssertFalse(decoder.nextColumn())
+            XCTAssertNil(decoder.error)
+            XCTAssertTrue(decoder.isAtEnd)
+            XCTAssertEqual(decoder.offset, data.count)
+        }
+    }
+
+    func testNullableRootEnvelopeRejectsNoncanonicalPayloads() throws {
+        XCTAssertTrue(try isNullRoot(Data([0])))
+        XCTAssertFalse(try isNullRoot(Data([1, 0])))
+        XCTAssertFalse(try isNullRoot(Data([1, 84])))
+        for bytes: [UInt8] in [[], [1], [2], [255], [0, 0], [0, 84]] {
+            XCTAssertThrowsError(try isNullRoot(Data(bytes))) { error in
+                XCTAssertEqual((error as? LuxoError)?.name, "DecodeError")
+            }
+        }
+    }
+
+    func testOffsetDecodersCheckBoundariesAndCompleteOriginalPayload() throws {
+        var scalar = try Decoder(Data([1, 84]), offset: 1)
+        XCTAssertEqual(scalar.readSvarint(), 42)
+        XCTAssertTrue(scalar.isAtEnd)
+        var columns = try ColumnarDecoder(data: Data([1, 1, 0, 1, 84, 0]), offset: 1)
+        XCTAssertEqual(columns.count, 1)
+        XCTAssertTrue(columns.nextColumn())
+        XCTAssertEqual(columns.fieldID, 1)
+        XCTAssertEqual(columns.readColumnInt(), [42])
+        XCTAssertFalse(columns.nextColumn())
+        XCTAssertNil(columns.error)
+        XCTAssertTrue(columns.isAtEnd)
+        for offset in [-1, 2, Int.min, Int.max] {
+            XCTAssertThrowsError(try Decoder(Data([0]), offset: offset))
+            XCTAssertThrowsError(try ColumnarDecoder(data: Data([0]), offset: offset))
+        }
+        XCTAssertTrue(try Decoder(Data([0]), offset: 1).isAtEnd)
+        XCTAssertNotNil(try ColumnarDecoder(data: Data([0]), offset: 1).error)
+        var trailing = try ColumnarDecoder(data: Data([1, 0, 0, 0, 99]), offset: 1)
+        XCTAssertFalse(trailing.nextColumn())
+        XCTAssertFalse(trailing.isAtEnd)
+    }
+
     private enum TestError: Error {
         case failed
     }

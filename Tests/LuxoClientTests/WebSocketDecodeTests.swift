@@ -3,6 +3,49 @@ import XCTest
 @testable import LuxoClient
 
 final class WebSocketDecodeTests: XCTestCase {
+    func testMissingJSONDataRetiresOnlyItsOperation() async throws {
+        let (transport, socket) = try fixture(.json)
+        defer { transport.close() }
+        let values = DecodeValues(), peer = DecodeValues()
+        let failed = expectation(description: "one missing data failure")
+        let decoder: @Sendable (TransportPayload) throws -> Int? = { payload in
+            if payload.data == Data("null".utf8) { return nil }
+            return try Self.integer(payload)
+        }
+        let stop = try await transport.subscribe(
+            "watch", decoder: decoder,
+            observer: StreamObserver(
+                onComplete: { XCTFail("missing data is not completion") },
+                onError: {
+                    values.fail($0); failed.fulfill()
+                })
+        ) { values.append($0 ?? -1) }
+        let stopPeer = try await transport.subscribe("watch", decoder: decoder) { peer.append($0 ?? -1) }
+        socket.deliver(.success(.string(#"{"$stream":1,"data":null}"#)))
+        for _ in 0..<2 { socket.deliver(.success(.string(#"{"$stream":1}"#))) }
+        socket.deliver(.success(completion(.json, 1)))
+        socket.deliver(.success(.string(#"{"$stream":2,"data":null}"#)))
+        await fulfillment(of: [failed], timeout: 1)
+        XCTAssertEqual(values.rows, [-1])
+        XCTAssertEqual(values.errors.map(\.name), ["ParseError"])
+        XCTAssertEqual(peer.rows, [-1])
+        let normal = socket.onSend
+        socket.onSend = { [weak socket] message in
+            guard case .string(let text) = message,
+                case .object(let fields) = try? LuxoValue.decodeJSONData(Data(text.utf8)),
+                let id = LuxoWebSocketProtocol.jsonRequestID(value: fields["$id"])
+            else { return }
+            socket?.deliver(.success(.string("{\"$id\":\(id)}")))
+        }
+        do { _ = try await transport.call("watch"); XCTFail("missing call data accepted") } catch let error as LuxoError
+        { XCTAssertEqual(error.name, "ParseError") }
+        socket.onSend = normal
+        let result = try await transport.call("watch")
+        XCTAssertEqual(try Self.integer(result), 7)
+        XCTAssertNil(socket.cancelCode)
+        stop(); stopPeer()
+    }
+
     func testRejectedSchemaPreservesLiveConnection() async throws {
         for mode in [TransportMode.json, .binary] {
             let (transport, socket) = try fixture(mode)

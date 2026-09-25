@@ -43,7 +43,7 @@ final class JSONEnvelopeTests: XCTestCase {
                 let value = Data("\"\(prefix)\(suffix)\"".utf8)
                 let envelope = try JSONEnvelope.decode(Data(#"{"data":"#.utf8) + value + Data("}".utf8))
                 XCTAssertEqual(envelope.responseData, value)
-                XCTAssertEqual(try JSONReader.decode(envelope.responseData), try JSONReader.decode(value))
+                XCTAssertEqual(try JSONReader.decode(XCTUnwrap(envelope.responseData)), try JSONReader.decode(value))
             }
             for bad: [UInt8] in [[0], [31], [0xff], [0xc2], [0xed, 0xa0, 0x80], Array(#"\ud800"#.utf8)] {
                 let value = Data("\"\(prefix)".utf8) + Data(bad) + Data("\"".utf8)
@@ -93,7 +93,8 @@ final class JSONEnvelopeTests: XCTestCase {
         XCTAssertNil(envelope.fields["data"])
         XCTAssertNil(envelope.fields["extra"])
         XCTAssertEqual(LuxoWebSocketProtocol.jsonRequestID(value: envelope.fields["$id"]), .max)
-        XCTAssertEqual(try JSONReader.decode(envelope.responseData), try JSONReader.decode(Data(payload.utf8)))
+        XCTAssertEqual(
+            try JSONReader.decode(XCTUnwrap(envelope.responseData)), try JSONReader.decode(Data(payload.utf8)))
     }
 
     func testKnownErrorsMaterializePayloadOnceRegardlessOfFieldOrder() throws {
@@ -118,7 +119,8 @@ final class JSONEnvelopeTests: XCTestCase {
             let prefixed = Data([0, 1, 2]) + document
             XCTAssertEqual(try JSONEnvelope.decode(prefixed.dropFirst(3)).responseData, Data(payload.utf8))
         }
-        XCTAssertEqual(try JSONEnvelope.decode(Data("{}".utf8)).responseData, Data("null".utf8))
+        XCTAssertNil(try JSONEnvelope.decode(Data("{}".utf8)).responseData)
+        XCTAssertEqual(try JSONEnvelope.decode(Data(#"{"data":null}"#.utf8)).responseData, Data("null".utf8))
         let duplicate = try JSONEnvelope.decode(Data(#"{"data":[1],"data": 1E+003,"$id":1,"$id":2}"#.utf8))
         XCTAssertEqual(duplicate.responseData, Data("1E+003".utf8))
         XCTAssertEqual(duplicate.fields["$id"], .int(2))
@@ -190,7 +192,11 @@ final class JSONEnvelopeTests: XCTestCase {
                 let result = try? JSONEnvelope.decode(mutated)
                 XCTAssertEqual(result != nil, expected != nil, "index=\(index), byte=\(byte)")
                 if let result, case .object(let values) = expected {
-                    XCTAssertEqual(try JSONReader.decode(result.responseData), values["data"] ?? .null)
+                    if let data = result.responseData {
+                        XCTAssertEqual(try JSONReader.decode(data), values["data"])
+                    } else {
+                        XCTAssertNil(values["data"])
+                    }
                 }
             }
         }

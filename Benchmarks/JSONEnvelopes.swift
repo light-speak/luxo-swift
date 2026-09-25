@@ -19,7 +19,7 @@ enum JSONEnvelopeBenchmark {
             try TransportMetadataBenchmark.compare(
                 "JSON success \(name)", iterations: iterations, warmup: max(100, iterations / 5),
                 before: { _ in UInt64(try previousResponse(envelope).count) },
-                after: { _ in UInt64(try JSONEnvelope.decode(envelope).responseData.count) })
+                after: { _ in UInt64(try JSONEnvelope.decode(envelope).responseData?.count ?? 0) })
             try TransportMetadataBenchmark.compare(
                 "HTTP JSON error \(name)", iterations: iterations, warmup: max(100, iterations / 5),
                 before: { _ in UInt64(try previousError(failure).code) },

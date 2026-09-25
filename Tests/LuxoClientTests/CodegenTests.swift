@@ -6,6 +6,33 @@ import XCTest
 #endif
 
 final class CodegenTests: XCTestCase {
+    func testNullableRootResponsesPreserveSchemaAndGeneratedTypes() throws {
+        let generator = try makeCodegen()
+        for (name, type) in [("Int", "Int"), ("DateTime", "String"), ("Snapshot", "Snapshot")] {
+            for list in [false, true] {
+                for stream in [false, true] {
+                    let payload = Data(
+                        """
+                        {"models":{},"types":{"Snapshot":{"name":"Snapshot","usage":"output","fields":[
+                        {"id":1,"name":"value","type":"Int"}]}},"apis":{"read":{"id":1,"name":"read",
+                        "module":"test","returnType":"\(name)","returnNullable":true,
+                        "returnList":\(list),"stream":\(stream)}}}
+                        """.utf8)
+                    let schema = try JSONDecoder().decode(LuxoSchema.self, from: payload)
+                    let encoded = String(decoding: try JSONEncoder().encode(schema), as: UTF8.self)
+                    XCTAssertTrue(encoded.contains("\"returnNullable\":true"))
+                    let source = generator.generateClient(schema)
+                    let result = (list ? "[\(type)]" : type) + "?"
+                    XCTAssertTrue(source.contains("throws -> \(result) {"), source)
+                    XCTAssertTrue(source.contains("if try isNullRoot(result.data) { return nil }"))
+                    XCTAssertTrue(source.contains("offset: 1"))
+                    XCTAssertFalse(source.contains("dropFirst"))
+                    if stream { XCTAssertTrue(source.contains("@Sendable (\(result)) -> Void")) }
+                }
+            }
+        }
+    }
+
     func testInternalScopeDoesNotDependOnAPIPrefix() throws {
         let payload = Data(
             #"{"models":{},"apis":{"ping":{"id":1,"name":"ping","module":"test","returnType":"Int","internal":false},"privateOperation":{"id":2,"name":"privateOperation","module":"test","returnType":"Int","internal":true}}}"#
@@ -175,7 +202,7 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(source.contains("decodeColumnarChild(decoder.readBytes())"))
         XCTAssertTrue(source.contains("decodeLuxoResponse(d.readBytes())"))
         XCTAssertTrue(source.contains("decodeLuxoResponse(data[i])"))
-        XCTAssertTrue(source.contains("guard decoder.offset == data.count else"))
+        XCTAssertTrue(source.contains("guard decoder.isAtEnd else"))
         XCTAssertFalse(source.contains("var d = Decoder(data[i]); return .value"))
     }
 

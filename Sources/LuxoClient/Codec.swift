@@ -222,24 +222,46 @@ public struct Encoder {
 
 // MARK: - Decoder
 
+/// Validates only the nullable root envelope; callers must decode the complete present value.
+public func isNullRoot(_ data: Data) throws -> Bool {
+    guard let marker = data.first, marker <= 1,
+        marker == 0 ? data.count == 1 : data.count > 1
+    else { throw LuxoError(code: 0, message: "invalid nullable root envelope", name: "DecodeError") }
+    return marker == 0
+}
+
+private func checkedDecoderOffset(_ data: Data, _ offset: Int) throws -> Int {
+    guard offset >= 0, offset <= data.count else {
+        throw LuxoError(code: 0, message: "invalid decoder offset", name: "DecodeError")
+    }
+    return offset
+}
+
 /// Binary decoder for Luxo protocol.
 public struct Decoder {
     private let data: Data
-    private var offset: Int = 0
+    private var offset: Int
 
     /// The first wire-format error encountered while decoding.
     public private(set) var error: String?
 
     public init(_ data: Data) {
         self.data = data
+        self.offset = data.startIndex
     }
 
-    public var isAtEnd: Bool { offset >= data.count }
-    public var remaining: Int { data.count - offset }
+    /// Shares the original payload while skipping an already validated prefix.
+    public init(_ data: Data, offset: Int) throws {
+        self.data = data
+        self.offset = data.startIndex + (try checkedDecoderOffset(data, offset))
+    }
+
+    public var isAtEnd: Bool { offset >= data.endIndex }
+    public var remaining: Int { data.endIndex - offset }
 
     public mutating func readRemainingData() -> Data {
         let remaining = Data(data[offset...])
-        offset = data.count
+        offset = data.endIndex
         return remaining
     }
 
@@ -247,7 +269,7 @@ public struct Decoder {
         let start = offset
         var result: UInt64 = 0
         var shift: UInt64 = 0
-        while offset < data.count {
+        while offset < data.endIndex {
             let byte = data[offset]
             offset += 1
             if shift >= 64 || (shift == 63 && byte & 0x7E != 0) {
@@ -270,7 +292,7 @@ public struct Decoder {
 
     public mutating func readFixed64() -> Double {
         guard error == nil else { return 0 }
-        guard offset + 8 <= data.count else {
+        guard remaining >= 8 else {
             if error == nil { error = "truncated fixed64 at offset \(offset)" }
             return 0
         }
@@ -291,7 +313,7 @@ public struct Decoder {
         let rawLength = readVarint()
         guard error == nil, rawLength <= UInt64(Int.max) else { return "" }
         let len = Int(rawLength)
-        guard len <= data.count - offset else {
+        guard len <= remaining else {
             if error == nil { error = "truncated string at offset \(offset)" }
             return ""
         }
@@ -307,7 +329,7 @@ public struct Decoder {
         let rawLength = readVarint()
         guard error == nil, rawLength <= UInt64(Int.max) else { return Data() }
         let len = Int(rawLength)
-        guard len <= data.count - offset else {
+        guard len <= remaining else {
             if error == nil { error = "truncated bytes at offset \(offset)" }
             return Data()
         }
@@ -318,7 +340,7 @@ public struct Decoder {
 
     /// Read a fixed 16-byte UUID (no length prefix). Returns a zero UUID on truncation.
     public mutating func readUUID() -> UUID {
-        guard offset + 16 <= data.count else {
+        guard remaining >= 16 else {
             if error == nil { error = "truncated uuid at offset \(offset)" }
             return UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
         }
@@ -418,7 +440,7 @@ public struct Decoder {
     }
 
     private mutating func readCanonicalMarker(_ kind: String) -> Bool {
-        guard offset < data.count else {
+        guard !isAtEnd else {
             if error == nil { error = "truncated \(kind) marker at offset \(offset)" }
             return false
         }
@@ -505,7 +527,7 @@ public struct Decoder {
 /// ```
 public struct ColumnarDecoder {
     private let data: Data
-    private var off: Int = 0
+    private var off: Int
 
     /// Number of rows in this columnar batch.
     public private(set) var count: Int = 0
@@ -522,6 +544,18 @@ public struct ColumnarDecoder {
     /// Creates a columnar decoder from raw bytes. Reads the row count varint.
     public init(data: Data) {
         self.data = data
+        self.off = data.startIndex
+        readHeader()
+    }
+
+    /// Shares the original payload while skipping an already validated prefix.
+    public init(data: Data, offset: Int) throws {
+        self.data = data
+        self.off = data.startIndex + (try checkedDecoderOffset(data, offset))
+        readHeader()
+    }
+
+    private mutating func readHeader() {
         guard let rawCount = readVarintValue("columnar record count") else { return }
         guard rawCount <= CodecLimits.maxColumnarRecords else {
             fail("columnar count \(rawCount) exceeds limit \(CodecLimits.maxColumnarRecords)")
@@ -536,18 +570,18 @@ public struct ColumnarDecoder {
         }
         arenaSize = Int(rawArenaSize)
         if count > 0 {
-            guard count <= data.count - off - 2 else {
+            guard count <= data.endIndex - off - 2 else {
                 fail("insufficient columnar element bytes")
                 return
             }
             let start = off
-            let first = data[data.startIndex + start]
+            let first = data[start]
             var id: UInt64? = UInt64(first)
             if first >= 0x80 {
                 id = readVarintValue("column field ID")
                 let end = off
                 off = start
-                guard count <= data.count - end - 1 else {
+                guard count <= data.endIndex - end - 1 else {
                     fail("insufficient columnar element bytes")
                     return
                 }
@@ -561,7 +595,7 @@ public struct ColumnarDecoder {
     /// Advance to next column. Returns false at end marker (0x00) or EOF.
     public mutating func nextColumn() -> Bool {
         if error != nil { return false }
-        guard off < data.count else {
+        guard off < data.endIndex else {
             fail("missing columnar end marker at offset \(off)")
             return false
         }
@@ -686,7 +720,8 @@ public struct ColumnarDecoder {
     }
 
     /// Current read position (for reading pagination metadata after 0x00).
-    public var offset: Int { off }
+    public var offset: Int { off - data.startIndex }
+    public var isAtEnd: Bool { off == data.endIndex }
 
     /// Read one signed zigzag-encoded varint at current position.
     public mutating func readSvarint() -> Int64 {
@@ -735,7 +770,7 @@ public struct ColumnarDecoder {
 
     private mutating func preflightColumn(_ name: String, minimumSize: Int) -> Bool {
         guard error == nil else { return false }
-        guard count <= (data.count - off) / minimumSize else {
+        guard count <= (data.endIndex - off) / minimumSize else {
             fail("insufficient \(name) column payload for \(count) records at offset \(off)")
             return false
         }
@@ -746,7 +781,7 @@ public struct ColumnarDecoder {
         let start = off
         var result: UInt64 = 0
         var shift: UInt64 = 0
-        while off < data.count {
+        while off < data.endIndex {
             let byte = data[off]
             off += 1
             if shift >= 64 || (shift == 63 && byte & 0x7E != 0) {
@@ -768,7 +803,7 @@ public struct ColumnarDecoder {
 
     private mutating func readFixed64Value(_ context: String) -> Double? {
         guard error == nil else { return nil }
-        guard off <= data.count, data.count - off >= 8 else {
+        guard off <= data.endIndex, data.endIndex - off >= 8 else {
             fail("truncated \(context) at offset \(off)")
             return nil
         }
@@ -787,7 +822,7 @@ public struct ColumnarDecoder {
             return nil
         }
         let length = Int(rawLength)
-        guard off <= data.count, length <= data.count - off else {
+        guard off <= data.endIndex, length <= data.endIndex - off else {
             fail("truncated \(context) at offset \(off)")
             return nil
         }
@@ -807,7 +842,7 @@ public struct ColumnarDecoder {
     }
 
     private mutating func readMarker(_ context: String) -> Bool? {
-        guard off < data.count else {
+        guard off < data.endIndex else {
             fail("truncated \(context) at offset \(off)")
             return nil
         }
@@ -826,7 +861,7 @@ public struct ColumnarDecoder {
     }
 
     private mutating func readUUIDValue(_ context: String) -> UUID? {
-        guard off <= data.count, data.count - off >= 16 else {
+        guard off <= data.endIndex, data.endIndex - off >= 16 else {
             fail("truncated \(context) at offset \(off)")
             return nil
         }
