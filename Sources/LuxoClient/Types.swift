@@ -6,6 +6,8 @@ public enum LuxoOptional<Value> {
     case present(Value?)
 }
 
+extension LuxoOptional: Sendable where Value: Sendable {}
+
 /// A field-selected output value.
 ///
 /// `unselected` means the server did not return the field. For nullable
@@ -410,16 +412,19 @@ public struct LuxoAPI: Codable, Sendable {
     public let stream: Bool?
     public let params: [LuxoParam]?
     public let isInternal: Bool?
+    public let query: LuxoQueryCapabilities?
 
     enum CodingKeys: String, CodingKey {
         case id, name, module, returnType, returnList, returnNullable, paginated, stream, params
         case isInternal = "internal"
+        case query
     }
 
     public init(
         id: Int, name: String, module: String, returnType: String? = nil,
         returnList: Bool? = nil, paginated: Bool? = nil, stream: Bool? = nil,
-        params: [LuxoParam]? = nil, isInternal: Bool? = nil, returnNullable: Bool? = nil
+        params: [LuxoParam]? = nil, isInternal: Bool? = nil, returnNullable: Bool? = nil,
+        query: LuxoQueryCapabilities? = nil
     ) {
         self.id = id
         self.name = name
@@ -431,6 +436,27 @@ public struct LuxoAPI: Codable, Sendable {
         self.stream = stream
         self.params = params
         self.isInternal = isInternal
+        self.query = query
+    }
+}
+
+public struct LuxoQueryCapabilities: Codable, Sendable {
+    public let filters: [LuxoQueryFilter]?
+    public let sorters: [String]?
+    public init(filters: [LuxoQueryFilter]? = nil, sorters: [String]? = nil) {
+        self.filters = filters
+        self.sorters = sorters
+    }
+}
+
+public struct LuxoQueryFilter: Codable, Sendable {
+    public let field: String
+    public let type: String
+    public let operators: [String]
+    public init(field: String, type: String, operators: [String]) {
+        self.field = field
+        self.type = type
+        self.operators = operators
     }
 }
 

@@ -70,6 +70,17 @@ One file. Zero boilerplate. This generates everything — including the Swift cl
                      Binary (prod, 3x smaller)
 ```
 
+## Typed query controls
+
+For an API `listUsers` advertising an Int `count` filter and sorter, generated `Queries.swift` provides:
+
+```swift
+let filters = [LuxoQuery_listUsers.count_eq(9007199254740993)]
+let sorters = [LuxoQuery_listUsers.count_desc()]
+```
+
+Pass these to the generated API's `filters` / `sorters` arguments. Int filters use `Int64` without conversion through platform `Int`. Helpers cover only advertised fields and operators and perform no runtime Schema lookup. Dynamic controls remain available; server validation remains mandatory.
+
 ## Install
 
 Requires Swift 6.3 or later and compiles in Swift 6 language mode. The field
@@ -264,15 +275,115 @@ let maybeStr: String? = decoder.readStringPtr()
 let items = decoder.readArray { d in d.readString() }
 ```
 
-### Field Tracking — SwiftSyntax
+### Call-site field selection
 
-Compile-time field tracking via SwiftSyntax AST analysis:
+Use the `luxo-build` SwiftPM command plugin to build with automatic selection:
+
+```sh
+swift package --allow-writing-to-package-directory luxo-build \
+  --manifest Sources/YourApp/Luxo/LuxoSelection.json \
+  --product YourApp --output .build/luxo-publish/beta1
+```
+
+The output must be a new directory. Only the final executable, resource bundles,
+and shared libraries are exported; source snapshots are removed afterwards.
+Ordinary `swift build` does not run selection inference: use the plugin or provide
+explicit selections yourself.
 
 ```swift
-// LuxoAnalyze scans your source code
-// Detects: user.name, user.email → generates $select hint
-// Nested: user.posts.map { $0.title } → "name, email, posts { title }"
+let first = try await client.getUser()
+print(try first.id.requireValue())       // This call selects "id".
+let second = try await client.getUser()
+print(try second.name.requireValue())    // This call selects "name", not "id,name".
 ```
+
+The generator emits `LuxoSelection.json`. Its module name must match the Swift
+module containing the generated client (not necessarily the package/product name).
+The build tool resolves its entries against the compiler's symbol graph, analyzes
+the type-checked AST, and supplies rewritten snapshots through a native VFS overlay.
+It preserves original files, explicit selections and source paths. It never merges
+hints by API name and adds no runtime inference or reflection.
+
+Immutable local aliases, nested `Selected.requireValue()` access, array indexing,
+`map`/`forEach`, `for-in`, and inline subscription handlers are supported. Passing
+an entire model to an opaque function, mutable model bindings, function references,
+or unsupported data-flow constructs require explicit selection; there is no
+implicit select-all fallback. The compiler AST is pinned to the tested Apple Swift
+6.3.3 toolchain and mismatched versions fail explicitly.
+
+The standalone `LuxoAnalyze package` command accepts the same options plus
+`--workspace`; `LuxoAnalyze build --manifest <file> -- <swiftc arguments>` supports
+direct compiler workflows. Executable-product integration is verified on macOS in
+debug and release configurations, including changed field access and exported resources.
+Pass `--configuration release` for an optimized product build. This does not claim
+Xcode app integration, device, or release-performance validation. LLDB symbol
+lookup is tested against the original source file and line after the temporary
+overlay has been removed. Live breakpoint execution is a separate opt-in check:
+`LUXO_LLDB_RUNTIME=1 swift test --filter SelectionBuildTests.testBuildInfersDistinctCallsAndLeavesOriginalUntouched`.
+It requires host debugserver permission; symbol lookup alone does not certify
+interactive debugging. The local live check passed after enabling that permission:
+the rewritten executable stopped on the original source line. This does not cover Xcode UI integration.
+
+External build systems can use `LuxoAnalyze prepare-build --manifest <file> --scratch .tmp/<unique-build-directory> -- <swiftc arguments>`
+to prepare an overlay without compiling the final product. The command prints its
+path. Pass it with `-vfsoverlay` to the downstream compiler, using the same sources,
+module, target, SDK and conditional compilation settings. The scratch directory must
+be new; existing directories are rejected, and failed preparation removes only its
+own output. Keep successful output until every compiler job finishes, then remove
+that exact directory. Regenerate it when sources or build settings change.
+
+`LUXO_XCODE_BUILD=1 swift test --filter SelectionBuildTests.testPreparedOverlaySurvivesUntilExternalCompilerFinishes`
+builds and executes an isolated macOS application target through `xcodebuild`, with
+distinct inferred selections. It reuses the project and DerivedData to check a changed
+field access, a no-change rebuild and a conditional-compilation switch. Preparation
+does not modify the original source. The same fixture also builds unsigned arm64
+iOS device and simulator applications with a minimum deployment target of iOS 15.
+The macOS fixture additionally verifies automatic extraction from a real Xcode
+driver command, including source response files and conditional compilation.
+Signing, generated-client iOS application integration and device/simulator execution
+remain unverified.
+
+To prepare an overlay from a current, unmodified Xcode build log:
+
+```sh
+LuxoAnalyze prepare-xcode --workspace /path/to/project \
+  --manifest LuxoSelection.json --log .tmp/xcode.log \
+  --module MyApp --target arm64-apple-macos13.0 \
+  --scratch .tmp/unique-xcode-overlay
+```
+
+The selected module/target must have exactly one `builtin-SwiftDriver` command.
+The source `.SwiftFileList` must still exist inside the workspace. Missing or
+ambiguous commands, previous VFS overlays and unsupported flags fail explicitly;
+the tool does not execute shell expressions from the log. It preserves SDK, target,
+imports, conditions and supported language feature flags instead of reconstructing
+them from separate build settings. Use the pinned Swift toolchain and a fresh log
+for the same source/configuration; an old log is not an incremental-build cache.
+This is an explicit preparation entry, not yet an automatically installed Xcode
+build phase. The initial build obtains compiler metadata; do not run or distribute
+that untransformed product. Apply the returned overlay and rebuild before execution.
+
+For an application build with both stages managed automatically:
+
+```sh
+LuxoAnalyze xcode-build --workspace /path/to/project \
+  --manifest LuxoSelection.json --project MyApp.xcodeproj \
+  --scheme MyApp --module MyApp --target arm64-apple-macos13.0 \
+  --destination 'platform=macOS,arch=arm64' --output .tmp/export/MyApp.app
+```
+
+Use `--configuration Release` or `--swift-flags '-D FEATURE'` when needed. The
+command uses an isolated DerivedData directory, extracts the actual compiler
+arguments, prepares the overlay, rebuilds, and exports the complete app only after
+success. Existing output is never overwritten. Output must be under the project's
+`.tmp`; temporary build products are removed on success or failure. The source,
+manifest and project file are checked for changes before export.
+
+This entry supports one explicitly selected module/target per run; it is not an
+Xcode UI plugin or a multi-module/multi-architecture archive command. Each run
+currently performs both build stages without a persistent incremental cache.
+The macOS CLI export/execute and failure-cleanup checks passed; cold-build cost,
+signed distribution and the complete iOS orchestration remain separate checks.
 
 ### Code Generation
 
@@ -285,13 +396,14 @@ let codegen = try LuxoCodegen(
     endpoint: "http://localhost:4000/luvia",
     introspectionKey: "YOUR_KEY"
 )
-try await codegen.generate(outputDir: "Sources/YourApp/Luxo")
+try await codegen.generate(outputDir: "Sources/YourApp/Luxo", packageName: "YourApp")
 ```
 
 Generates:
 - `Models.swift` — typed Codable outputs and `LuxoBinaryEncodable` inputs; native binary writers and typed JSON projections avoid intermediate JSON encoding/decoding
 - `Decoders.swift` — binary decoders per model
 - `Schema.swift` — API schema map
+- `LuxoSelection.json` — build-time API/field catalog, resolved to real compiler symbols before injection
 - `Client.swift` — typed client with async/await methods
 
 Generated output fields use `Selected<Value>` to distinguish unselected,

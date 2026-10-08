@@ -90,7 +90,7 @@ private func projectionFailure(_ message: String) -> LuxoError {
     LuxoError(code: 0, message: message, name: "ConsumerError")
 }
 
-private struct ProjectionTransport: Transport {
+private struct ProjectionTransport: ConsumerTransport {
     let data: Data
     func call(_ api: String, params: [String: LuxoValue]?) async throws -> TransportPayload {
         TransportPayload(data: data, mode: .json)

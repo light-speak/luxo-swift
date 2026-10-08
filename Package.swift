@@ -8,11 +8,22 @@ let package = Package(
         .library(name: "LuxoClient", targets: ["LuxoClient"]),
         .library(name: "LuxoCompiler", targets: ["LuxoCompiler"]),
         .executable(name: "LuxoAnalyze", targets: ["LuxoAnalyze"]),
+        .plugin(name: "LuxoBuild", targets: ["LuxoBuild"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-syntax.git", from: "603.0.2")
     ],
     targets: [
+        .plugin(
+            name: "LuxoBuild",
+            capability: .command(
+                intent: .custom(verb: "luxo-build", description: "Build with compiler-resolved call-site selections"),
+                permissions: [
+                    .writeToPackageDirectory(reason: "Create isolated source snapshots and the requested build output")
+                ]
+            ),
+            dependencies: ["LuxoAnalyze"]
+        ),
         .target(name: "LuxoClient"),
         .target(
             name: "LuxoCompiler",
@@ -30,6 +41,6 @@ let package = Package(
             dependencies: ["LuxoClient"],
             resources: [.copy("Fixtures")]
         ),
-        .testTarget(name: "LuxoCompilerTests", dependencies: ["LuxoCompiler"]),
+        .testTarget(name: "LuxoCompilerTests", dependencies: ["LuxoCompiler", "LuxoClient"]),
     ]
 )

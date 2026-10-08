@@ -139,6 +139,14 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
     }
 
     public func call(_ api: String, params: [String: LuxoValue]? = nil) async throws -> TransportPayload {
+        try await callRequest(api, params: .dynamic(params))
+    }
+
+    public func call(_ api: String, request: any GeneratedRequest) async throws -> TransportPayload {
+        try await callRequest(api, params: .generated(request))
+    }
+
+    private func callRequest(_ api: String, params: RequestParameters) async throws -> TransportPayload {
         try await withCheckedThrowingContinuation { continuation in
             do {
                 try sendOrder.withLock {
@@ -166,6 +174,24 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
         observer: StreamObserver? = nil,
         handler: @escaping @Sendable (Value) -> Void
     ) async throws -> (@Sendable () -> Void) {
+        try await subscribeRequest(
+            api, decoder: decoder, params: .dynamic(params), observer: observer, handler: handler)
+    }
+
+    public func subscribe<Value: Sendable>(
+        _ api: String, decoder: @escaping @Sendable (TransportPayload) throws -> Value,
+        request: any GeneratedRequest, observer: StreamObserver?,
+        handler: @escaping @Sendable (Value) -> Void
+    ) async throws -> (@Sendable () -> Void) {
+        try await subscribeRequest(
+            api, decoder: decoder, params: .generated(request), observer: observer, handler: handler)
+    }
+
+    private func subscribeRequest<Value: Sendable>(
+        _ api: String, decoder: @escaping @Sendable (TransportPayload) throws -> Value,
+        params: RequestParameters, observer: StreamObserver?,
+        handler: @escaping @Sendable (Value) -> Void
+    ) async throws -> (@Sendable () -> Void) {
         let attempt = SubscriptionAttempt()
         let id = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -185,7 +211,7 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
 
     private func startSubscription<Value: Sendable>(
         _ api: String, decoder: @escaping @Sendable (TransportPayload) throws -> Value,
-        params: [String: LuxoValue]?, observer: StreamObserver?,
+        params: RequestParameters, observer: StreamObserver?,
         handler: @escaping @Sendable (Value) -> Void,
         attempt: SubscriptionAttempt, continuation: CheckedContinuation<UInt64, Error>
     ) {
@@ -248,8 +274,7 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
         DispatchQueue.global().async { notify(error) }
     }
 
-    private func prepareRequestLocked(_ api: String, params: [String: LuxoValue]?, subscription: Bool) throws -> Request
-    {
+    private func prepareRequestLocked(_ api: String, params: RequestParameters, subscription: Bool) throws -> Request {
         guard let socket = task else {
             throw LuxoError(code: 0, message: "WebSocket not connected", name: "ConnectionError")
         }
@@ -263,14 +288,14 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
                 throw LuxoError(
                     code: 0, message: "no schema for API \"\(api)\" — binary mode requires schema", name: "ConfigError")
             }
-            let body = try LuxoBinaryProtocol.encodeRequest(schema: apiSchema, params: params)
+            let body = try params.binary(schema: apiSchema)
             message = .data(
                 subscription
                     ? LuxoBinaryProtocol.subscribeFrame(sequence: sequence, body: body)
                     : LuxoBinaryProtocol.callFrame(sequence: sequence, body: body))
         } else {
             let body = try LuxoJSONRequest.encode(
-                api: api, params: params, plan: schema[api]?.jsonParameters, sequence: sequence,
+                api: api, params: params.json(), plan: schema[api]?.jsonParameters, sequence: sequence,
                 subscription: subscription)
             message = .string(String(decoding: body, as: UTF8.self))
         }

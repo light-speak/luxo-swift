@@ -163,7 +163,7 @@ func verifyResponseModeOwnership() async throws {
     print("Generated client keeps the decoding mode of in-flight calls and subscriptions")
 }
 
-private final class ModeSwitchTransport: Transport, @unchecked Sendable {
+private final class ModeSwitchTransport: ConsumerTransport, @unchecked Sendable {
     let starts: AsyncStream<Void>
     private let started: AsyncStream<Void>.Continuation
     private let lock = NSLock()
@@ -276,7 +276,7 @@ private func scalarFailure(_ message: String) -> LuxoError {
     LuxoError(code: 0, message: message, name: "ConsumerError")
 }
 
-private struct ScalarTransport: Transport {
+private struct ScalarTransport: ConsumerTransport {
     let payload: Data
     let mode: TransportMode
 

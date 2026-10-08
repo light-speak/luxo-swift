@@ -159,7 +159,7 @@ private func structuredClient(_ data: Data, binary: Bool) throws -> LuxoGenerate
     return client
 }
 
-private struct StructuredTransport: Transport {
+private struct StructuredTransport: ConsumerTransport {
     let data: Data
     let mode: TransportMode
     func call(_ api: String, params: [String: LuxoValue]?) async throws -> TransportPayload {

@@ -1,6 +1,21 @@
 import Foundation
 import LuxoClient
 
+// Response-only fixtures inspect JSON projections explicitly; production Binary transports never use this adapter.
+protocol ConsumerTransport: Transport {}
+extension ConsumerTransport {
+    func call(_ api: String, request: any GeneratedRequest) async throws -> TransportPayload {
+        try await call(api, params: request.toJSONParameters())
+    }
+    func subscribe<Value: Sendable>(
+        _ api: String, decoder: @escaping @Sendable (TransportPayload) throws -> Value,
+        request: any GeneratedRequest, observer: StreamObserver?, handler: @escaping @Sendable (Value) -> Void
+    ) async throws -> (@Sendable () -> Void) {
+        try await subscribe(
+            api, decoder: decoder, params: request.toJSONParameters(), observer: observer, handler: handler)
+    }
+}
+
 let profile = ProfileInput(name: "Luxo", bio: nil)
 var profileEncoder = Encoder()
 try profile.writeLuxo(to: &profileEncoder)
@@ -38,7 +53,7 @@ func verifyRegistrationFailure() throws {
     throw LuxoError(code: 0, message: "client swallowed schema registration failure", name: "ConsumerError")
 }
 
-private struct RejectedSchemaTransport: Transport {
+private struct RejectedSchemaTransport: ConsumerTransport {
     func setSchema(_ schema: [String: APISchema]) throws {
         throw LuxoError(code: 0, message: "registration rejected", name: "ConfigError")
     }
@@ -106,7 +121,7 @@ func callPrecision(
         decimals: [input.decimal], flags: [true, false], metadata: [input.metadata], input: input, note: note)
 }
 
-struct PrecisionTransport: Transport {
+struct PrecisionTransport: ConsumerTransport {
     let input: PrecisionInput
     let expectedNote: LuxoValue?
 

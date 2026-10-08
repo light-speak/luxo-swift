@@ -123,7 +123,7 @@ private func enumFailure(_ message: String) -> LuxoError {
     LuxoError(code: 0, message: message, name: "ConsumerError")
 }
 
-private struct EnumParameterTransport: Transport {
+private struct EnumParameterTransport: ConsumerTransport {
     let expected: [String: LuxoValue]
     func call(_ api: String, params: [String: LuxoValue]?) async throws -> TransportPayload {
         guard api == "enumOptions", params == expected else { throw enumFailure("enum parameter projection") }

@@ -34,6 +34,12 @@ public final class StreamObserver: Sendable {
 /// Transport protocol — all transports implement this.
 public protocol Transport: Sendable {
     func call(_ api: String, params: [String: LuxoValue]?) async throws -> TransportPayload
+    func call(_ api: String, request: any GeneratedRequest) async throws -> TransportPayload
+    func subscribe<Value: Sendable>(
+        _ api: String, decoder: @escaping @Sendable (TransportPayload) throws -> Value,
+        request: any GeneratedRequest, observer: StreamObserver?,
+        handler: @escaping @Sendable (Value) -> Void
+    ) async throws -> (@Sendable () -> Void)
     func subscribe<Value: Sendable>(
         _ api: String,
         decoder: @escaping @Sendable (TransportPayload) throws -> Value,
@@ -47,6 +53,17 @@ public protocol Transport: Sendable {
 }
 
 public extension Transport {
+    func call(_ api: String, request: any GeneratedRequest) async throws -> TransportPayload {
+        throw LuxoError(code: 0, message: "transport must implement generated requests", name: "ConfigError")
+    }
+
+    func subscribe<Value: Sendable>(
+        _ api: String, decoder: @escaping @Sendable (TransportPayload) throws -> Value,
+        request: any GeneratedRequest, observer: StreamObserver?,
+        handler: @escaping @Sendable (Value) -> Void
+    ) async throws -> (@Sendable () -> Void) {
+        throw LuxoError(code: 0, message: "transport must implement generated subscriptions", name: "ConfigError")
+    }
     func subscribe<Value: Sendable>(
         _ api: String,
         decoder: @escaping @Sendable (TransportPayload) throws -> Value,
@@ -88,6 +105,7 @@ public enum TransportMode: String, Sendable {
 public enum LuxoFilterValue: Sendable {
     case string(String)
     case int(Int)
+    case int64(Int64)
     case double(Double)
     case bool(Bool)
 
@@ -95,6 +113,7 @@ public enum LuxoFilterValue: Sendable {
         switch self {
         case .string(let value): return value
         case .int(let value): return String(value)
+        case .int64(let value): return String(value)
         case .double(let value): return String(value)
         case .bool(let value): return value ? "true" : "false"
         }
@@ -104,6 +123,7 @@ public enum LuxoFilterValue: Sendable {
         switch self {
         case .string(let value): return value
         case .int(let value): return value
+        case .int64(let value): return value
         case .double(let value): return value
         case .bool(let value): return value
         }
@@ -113,6 +133,7 @@ public enum LuxoFilterValue: Sendable {
         switch self {
         case .string(let value): return .string(value)
         case .int(let value): return .int(Int64(value))
+        case .int64(let value): return .int(value)
         case .double(let value): return .float(value)
         case .bool(let value): return .bool(value)
         }
@@ -330,6 +351,21 @@ enum LuxoBinaryProtocol {
     static let streamComplete: UInt64 = 0x15
     static let streamError: UInt64 = 0x16
 
+    static func encodeRequest(schema: APISchema, request: any GeneratedRequest) throws -> Data {
+        guard schema.id == request.apiID else {
+            throw LuxoError(
+                code: 0, message: "generated request API ID differs from registered schema", name: "ConfigError")
+        }
+        var encoder = Encoder()
+        encoder.writeVarint(UInt64(request.apiID))
+        try writeFieldMask(&encoder, schema: schema, selection: request.selection)
+        try request.writeParameters(to: &encoder)
+        if let filters = request.filters { try encodeTypedFilters(&encoder, values: filters) }
+        if let sorters = request.sorters { try encodeTypedSorters(&encoder, values: sorters) }
+        encoder.writeEnd()
+        return encoder.data
+    }
+
     static func encodeRequest(schema: APISchema, params: [String: LuxoValue]?) throws -> Data {
         var encoder = Encoder()
         encoder.writeVarint(UInt64(schema.id))
@@ -463,6 +499,36 @@ enum LuxoBinaryProtocol {
             encoder.writeString(filter.field)
             encoder.writeVarint(UInt64(operatorID))
             encoder.writeString(filter.value)
+        }
+    }
+
+    private static func encodeTypedFilters(_ encoder: inout Encoder, values: [LuxoFilter]) throws {
+        guard values.count <= 1000 else { throw configError("$filters must contain at most 1000 entries") }
+        encoder.writeVarint(filtersFieldID)
+        encoder.writeVarint(UInt64(values.count))
+        for (index, filter) in values.enumerated() {
+            guard !filter.field.isEmpty, let operatorID = filterOperatorIDs[filter.op] else {
+                throw configError("invalid $filters entry at index \(index)")
+            }
+            if case .double(let value) = filter.value, !value.isFinite {
+                throw configError("invalid $filters entry at index \(index)")
+            }
+            encoder.writeString(filter.field)
+            encoder.writeVarint(UInt64(operatorID))
+            encoder.writeString(filter.value.wireText)
+        }
+    }
+
+    private static func encodeTypedSorters(_ encoder: inout Encoder, values: [LuxoSorter]) throws {
+        guard values.count <= 100 else { throw configError("$sorters must contain at most 100 entries") }
+        encoder.writeVarint(sortersFieldID)
+        encoder.writeVarint(UInt64(values.count))
+        for (index, sorter) in values.enumerated() {
+            guard !sorter.field.isEmpty, sorter.order == "asc" || sorter.order == "desc" else {
+                throw configError("invalid $sorters entry at index \(index)")
+            }
+            encoder.writeString(sorter.field)
+            encoder.writeBool(sorter.order == "desc")
         }
     }
 
@@ -661,6 +727,14 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
     }
 
     public func call(_ api: String, params: [String: LuxoValue]? = nil) async throws -> TransportPayload {
+        try await callRequest(api, params: .dynamic(params))
+    }
+
+    public func call(_ api: String, request: any GeneratedRequest) async throws -> TransportPayload {
+        try await callRequest(api, params: .generated(request))
+    }
+
+    private func callRequest(_ api: String, params: RequestParameters) async throws -> TransportPayload {
         do {
             return try await doCall(api, params: params)
         } catch let failure as HTTPFailure {
@@ -681,7 +755,7 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
         }
     }
 
-    private func doCall(_ api: String, params: [String: LuxoValue]?) async throws -> TransportPayload {
+    private func doCall(_ api: String, params: RequestParameters) async throws -> TransportPayload {
         let state = lock.withLock {
             State(headers: headers, mode: mode, schema: schema)
         }
@@ -689,7 +763,7 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
         switch state.mode {
         case .json:
             data = try await jsonCall(
-                api, params: params, headers: state.headers, plan: state.schema[api]?.jsonParameters)
+                api, params: params.json(), headers: state.headers, plan: state.schema[api]?.jsonParameters)
         case .binary:
             data = try await binaryCall(
                 api,
@@ -742,7 +816,7 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
 
     private func binaryCall(
         _ api: String,
-        params: [String: LuxoValue]?,
+        params: RequestParameters,
         headers: [String: String],
         schema: [String: APISchema]
     ) async throws -> Data {
@@ -753,7 +827,7 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
                 name: "ConfigError"
             )
         }
-        let body = try LuxoBinaryProtocol.encodeRequest(schema: apiSchema, params: params)
+        let body = try params.binary(schema: apiSchema)
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"

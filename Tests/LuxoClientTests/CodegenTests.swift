@@ -159,7 +159,10 @@ final class CodegenTests: XCTestCase {
                         models: [:], apis: ["values": api],
                         enums: ["Status": LuxoEnum(name: "Status", values: ["OPEN", "CLOSED"])], types: nil)
                     let source = try makeCodegen().generateClient(schema)
-                    if !stream { XCTAssertTrue(source.contains("transport.call(\"values\", params: nil)")) }
+                    if !stream {
+                        XCTAssertTrue(
+                            source.contains("transport.call(\"values\", request: _valuesRequest(values: .init()))"))
+                    }
                     XCTAssertTrue(source.contains("try decodeLuxoResponse(result"))
                     XCTAssertFalse(source.contains("try? decodeLuxoResponse"))
                     if type == "Status" {
@@ -170,7 +173,8 @@ final class CodegenTests: XCTestCase {
                     if stream {
                         XCTAssertTrue(
                             source.contains(
-                                "decoder: Self.decode_values, params: nil, observer: observer, handler: handler"))
+                                "decoder: Self.decode_values, request: _valuesRequest(values: .init()), observer: observer, handler: handler"
+                            ))
                     }
                 }
             }
@@ -595,7 +599,7 @@ final class CodegenTests: XCTestCase {
             ))
         XCTAssertTrue(
             source.contains(
-                "try await transport.subscribe(\"watchOrders\", decoder: Self.decode_watchOrders, params: callParams, observer: observer, handler: handler)"
+                "try await transport.subscribe(\"watchOrders\", decoder: Self.decode_watchOrders, request: _watchOrdersRequest(values: .init(status: status, select: select)), observer: observer, handler: handler)"
             ))
         XCTAssertTrue(
             source.contains("private static func decode_watchOrders(_ result: TransportPayload) throws -> OrderEvent"))
@@ -668,7 +672,7 @@ final class CodegenTests: XCTestCase {
 
         try await codegen.generate(outputDir: output)
 
-        for file in ["Models.swift", "Decoders.swift", "Schema.swift", "Client.swift"] {
+        for file in ["Models.swift", "Decoders.swift", "Schema.swift", "Client.swift", "LuxoSelection.json"] {
             XCTAssertTrue(FileManager.default.fileExists(atPath: "\(output)/\(file)"))
         }
         let models = try String(contentsOfFile: "\(output)/Models.swift", encoding: .utf8)
