@@ -21,15 +21,10 @@ struct LuxoConsumer {
         var encoder = Encoder()
         try encoder.writeField(1, value: 7, type: "Int")
 
-        let analyzer = SelectAnalyzer()
-        analyzer.analyzeSource(
-            """
-            let user = await client.getUser()
-            print(user.name)
-            """
-        )
-        guard analyzer.buildHints() == ["getUser": "name"] else {
-            throw LuxoError(code: 0, message: "unexpected select hints", name: "ConsumerError")
+        let fields = FieldNode.root()
+        fields.addChild("name")
+        guard fields.toSelectString() == "name" else {
+            throw LuxoError(code: 0, message: "unexpected field tree", name: "ConsumerError")
         }
 
         _ = try await transport.call("getUser", params: ["id": 7])

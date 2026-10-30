@@ -1,6 +1,18 @@
 import Foundation
 
 enum SwiftRequestCodegen {
+    static func selectionFactory(api: String, method: String) -> String {
+        """
+            public static func prepareSelection_\(method)(_ text: String) throws -> PreparedSelection {
+                guard let schema = LUXO_SCHEMA["\(api)"] else {
+                    throw LuxoError(code: 0, message: "Missing generated selection schema", name: "ConfigError")
+                }
+                return try PreparedSelection(text, schema: schema)
+            }
+
+        """
+    }
+
     private static let pagination = ["page", "pageSize"]
     private static func optional(_ api: LuxoAPI, _ param: LuxoParam) -> Bool {
         param.hasDefault == true || (api.paginated == true && pagination.contains(param.name))
@@ -14,7 +26,7 @@ enum SwiftRequestCodegen {
                 : base + (param.nullable == true || optional(api, param) ? "?" : "")
             return (param.name, value)
         }
-        if selection { result.append(("select", "String?")) }
+        if selection { result += [("select", "String?"), ("selectionPlan", "PreparedSelection?")] }
         if api.paginated == true {
             for name in pagination where !(api.params ?? []).contains(where: { $0.name == name }) {
                 result.append((name, "Int?"))
@@ -38,13 +50,19 @@ enum SwiftRequestCodegen {
         var out = "\nprivate struct _\(api.name)Request: GeneratedRequest {\n    struct Values: Sendable {\n"
         for (name, type) in stored { out += "        let \(name): \(type)\n" }
         out += "    }\n    let values: Values\n    var apiID: Int { \(api.id) }\n"
-        if selection { out += "    var selection: String? { values.select }\n" }
+        if selection {
+            out += "    var selection: String? { values.select ?? values.selectionPlan?.text }\n"
+            out += "    var selectionPlan: PreparedSelection? { values.selectionPlan }\n"
+        }
         if api.paginated == true {
             out +=
                 "    var filters: [LuxoFilter]? { values.filters }\n    var sorters: [LuxoSorter]? { values.sorters }\n"
         }
         out += "    func toJSONParameters() throws -> [String: LuxoValue] {\n"
-        for (name, _) in stored { out += "        let \(name) = values.\(name)\n" }
+        for (name, _) in stored where name != "selectionPlan" {
+            let value = selection && name == "select" ? "selection" : "values.\(name)"
+            out += "        let \(name) = \(value)\n"
+        }
         out += jsonSetup
         out += "        return \(jsonSetup.isEmpty ? "[:]" : "callParams")\n    }\n"
         out += "    func writeParameters(to encoder: inout Encoder) throws {\n"

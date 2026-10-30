@@ -162,7 +162,7 @@ public enum SelectionBuild {
                 ])
             graphs.append(try Data(contentsOf: directory.appendingPathComponent(module + ".symbols.json")))
         }
-        return try SelectionCatalog(manifest: data, graphs: graphs)
+        return try SelectionCatalog(manifest: data, graphs: graphs, currentModule: invocation.module)
     }
 
     private static func analyze(
@@ -181,7 +181,8 @@ public enum SelectionBuild {
                 source: snapshot.source)
             let selections = try ProjectionInference.infer(
                 root: root, apis: catalog.apis, fields: catalog.fields, transparent: catalog.transparent)
-            return try SelectionSourceRewriter.rewrite(source: snapshot.source, index: index, selections: selections)
+            return try SelectionSourceRewriter.rewrite(
+                source: snapshot.source, index: index, selections: selections, planFactories: catalog.planFactories)
         }
     }
 }

@@ -167,7 +167,8 @@ private final class ProjectionFlow {
     ) throws -> Origin? {
         if let function = node["fn"] { try consume(function) }
         let explicit = arguments.contains {
-            $0["label"]?.text == "select" && $0["expr"]?.kind != "default_argument_expr"
+            ["select", "selectionPlan"].contains($0["label"]?.text ?? "")
+                && $0["expr"]?.kind != "default_argument_expr"
         }
         guard let offset = node["range"]?["start"]?.integer else { throw Failure.invalidAST }
         let origin = explicit ? nil : Origin(call: offset)

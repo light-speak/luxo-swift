@@ -6,6 +6,7 @@ public struct SelectionManifest: Decodable, Sendable {
     public let module: String
     public let client: String
     public let runtimeModule: String?
+    public let selectionPlans: Bool?
     public let apis: [String: ProjectionInference.API]
     public let fields: [String: [String: Bool]]
 
@@ -32,16 +33,24 @@ public struct SelectionCatalog: Sendable {
     public let apis: [String: ProjectionInference.API]
     public let fields: [String: ProjectionInference.Field]
     public let transparent: Set<String>
+    public let planFactories: [String: String]
 
-    public init(manifest data: Data, graphs: [Data]) throws {
+    public init(manifest data: Data, graphs: [Data], currentModule: String? = nil) throws {
         let manifest = try JSONDecoder().decode(SelectionManifest.self, from: data)
         try manifest.validate()
         let graphs = try graphs.map { try JSONDecoder().decode(SymbolGraph.self, from: $0) }
         let symbols = graphs.filter { $0.module.name == manifest.module }.flatMap(\.symbols)
         var apis: [String: ProjectionInference.API] = [:]
+        var factories: [String: String] = [:]
         for (name, api) in manifest.apis {
             let symbol = try Self.resolve(symbols, owner: manifest.client, member: name, method: true)
             apis[symbol] = api
+            if manifest.selectionPlans == true {
+                let factory = "prepareSelection_" + name
+                _ = try Self.resolve(symbols, owner: manifest.client, member: factory, method: true)
+                let prefix = currentModule == manifest.module ? "" : manifest.module + "."
+                factories[symbol] = prefix + manifest.client + "." + factory
+            }
         }
         var fields: [String: ProjectionInference.Field] = [:]
         for (owner, members) in manifest.fields {
@@ -51,6 +60,7 @@ public struct SelectionCatalog: Sendable {
             }
         }
         self.apis = apis
+        planFactories = factories
         self.fields = fields
         transparent = Set(
             graphs.filter { $0.module.name == "LuxoClient" }.flatMap(\.symbols).filter {

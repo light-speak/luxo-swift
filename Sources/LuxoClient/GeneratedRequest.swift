@@ -4,6 +4,7 @@ import Foundation
 public protocol GeneratedRequest: Sendable {
     var apiID: Int { get }
     var selection: String? { get }
+    var selectionPlan: PreparedSelection? { get }
     var filters: [LuxoFilter]? { get }
     var sorters: [LuxoSorter]? { get }
     func writeParameters(to encoder: inout Encoder) throws
@@ -12,6 +13,7 @@ public protocol GeneratedRequest: Sendable {
 
 public extension GeneratedRequest {
     var selection: String? { nil }
+    var selectionPlan: PreparedSelection? { nil }
     var filters: [LuxoFilter]? { nil }
     var sorters: [LuxoSorter]? { nil }
 }

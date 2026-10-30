@@ -11,6 +11,7 @@ cd "${fixture}"
 # Mock only llvm-cov; exercise the real artifact discovery and coverage gate.
 function xcrun() {
   [[ "$1" == llvm-cov && "$3" == */debug/*.xctest/Contents/MacOS/*PackageTests ]] || return 9
+  [[ " $* " == *" Sources/LuxoNIO "* ]] || return 9
   case "$2" in
     report) printf '%s\n' 'TOTAL 1 0 100% 1 0 100% 1 0 100%' ;;
     export) printf '%s\n' 'TN:coverage-script-regression' ;;

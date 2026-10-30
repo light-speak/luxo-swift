@@ -73,7 +73,10 @@ public struct SemanticCallIndex: Sendable {
         guard selections.count == 1, let kind = selections[0]["expr"]?["_kind"]?.text else {
             throw Failure.invalidAST
         }
-        let explicit = kind != "default_argument_expr"
+        let explicitPlan = arguments.contains {
+            $0["label"]?.text == "selectionPlan" && $0["expr"]?["_kind"]?.text != "default_argument_expr"
+        }
+        let explicit = kind != "default_argument_expr" || explicitPlan
         let following = arguments.drop(while: { $0["label"]?.text != "select" }).dropFirst()
         let labels = try following.map { argument in
             guard let label = argument["label"]?.text else { throw Failure.invalidAST }

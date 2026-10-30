@@ -13,12 +13,13 @@ public enum SelectionSourceRewriter {
     }
 
     public static func rewrite(
-        source: String, index: SemanticCallIndex, selections: [Int: [[String]]]
+        source: String, index: SemanticCallIndex, selections: [Int: [[String]]],
+        planFactories: [String: String] = [:]
     ) throws -> String {
         guard index.source == source else { throw Failure.sourceMismatch }
         let tree = Parser.parse(source: source)
         guard !tree.hasError else { throw Failure.invalidSource }
-        let visitor = CallVisitor(index: index, selections: selections)
+        let visitor = CallVisitor(index: index, selections: selections, factories: planFactories, source: source)
         visitor.walk(tree)
         if let failure = visitor.failure { throw failure }
         for call in index.calls where !visitor.seen.contains(call.startOffset) {
@@ -28,7 +29,7 @@ public enum SelectionSourceRewriter {
         for edit in visitor.edits.sorted(by: { $0.offset > $1.offset }) {
             bytes.insert(contentsOf: edit.text.utf8, at: edit.offset)
         }
-        return String(decoding: bytes, as: UTF8.self)
+        return String(decoding: bytes, as: UTF8.self) + visitor.declarations
     }
 
     fileprivate static func render(_ paths: [[String]]) throws -> String {
@@ -59,8 +60,13 @@ private final class CallVisitor: SyntaxVisitor {
     var seen: Set<Int> = []
     var edits: [(offset: Int, text: String)] = []
     var failure: Failure?
+    let factories: [String: String]
+    let source: String
+    var declarations = ""
 
-    init(index: SemanticCallIndex, selections: [Int: [[String]]]) {
+    init(index: SemanticCallIndex, selections: [Int: [[String]]], factories: [String: String], source: String) {
+        self.factories = factories
+        self.source = source
         calls = Dictionary(uniqueKeysWithValues: index.calls.map { ($0.startOffset, $0) })
         self.selections = selections
         super.init(viewMode: .sourceAccurate)
@@ -79,7 +85,18 @@ private final class CallVisitor: SyntaxVisitor {
             else { throw Failure.unsupportedCall(start) }
             guard let paths = selections[start], !paths.isEmpty else { throw Failure.missingSelection(start) }
             let selection = try SelectionSourceRewriter.render(paths)
-            edits.append(insertion(node, call: call, selection: selection))
+            var value = "select: \"\(selection)\""
+            if let factory = factories[call.symbol] {
+                guard call.labelsAfterSelection.first == "selectionPlan" else {
+                    throw Failure.unsupportedCall(start)
+                }
+                var name = "_luxoSelection\(start)"
+                while source.contains(name) { name += "_" }
+                let declaration = "private let \(name) = Swift.Result { try \(factory)(\"\(selection)\") }\n"
+                declarations += "\n" + scopedDeclaration(declaration, node: Syntax(node))
+                value += ", selectionPlan: try \(name).get()"
+            }
+            edits.append(insertion(node, call: call, value: value))
         } catch let error as Failure {
             failure = error
         } catch {
@@ -88,10 +105,30 @@ private final class CallVisitor: SyntaxVisitor {
         return .visitChildren
     }
 
+    private func scopedDeclaration(_ declaration: String, node: Syntax) -> String {
+        var result = declaration
+        var ancestor: Syntax? = node
+        while let current = ancestor {
+            if let clause = current.as(IfConfigClauseSyntax.self),
+                let directive = clause.parent?.parent?.as(IfConfigDeclSyntax.self)
+            {
+                var wrapped = ""
+                for branch in directive.clauses {
+                    wrapped += branch.poundKeyword.text
+                    if let condition = branch.condition { wrapped += " " + condition.trimmedDescription }
+                    wrapped += "\n"
+                    if branch.id == clause.id { break }
+                }
+                result = wrapped + result + "#endif\n"
+            }
+            ancestor = current.parent
+        }
+        return result
+    }
+
     private func insertion(
-        _ node: FunctionCallExprSyntax, call: SemanticCallIndex.Call, selection: String
+        _ node: FunctionCallExprSyntax, call: SemanticCallIndex.Call, value: String
     ) -> (offset: Int, text: String) {
-        let value = "select: \"\(selection)\""
         guard let rightParen = node.rightParen else {
             return (node.calledExpression.endPositionBeforeTrailingTrivia.utf8Offset, "(" + value + ")")
         }

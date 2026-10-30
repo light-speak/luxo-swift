@@ -4,6 +4,12 @@ import Foundation
 @main
 enum TransportMetadataBenchmark {
     static func main() async throws {
+        #if LUXO_SELECTION_PLAN_BENCHMARK
+            if CommandLine.arguments.contains("--selection-plans") {
+                try SelectionPlanBenchmark.run()
+                return
+            }
+        #endif
         if CommandLine.arguments.contains("--schema-registration") {
             try SchemaRegistrationBenchmark.run()
             return

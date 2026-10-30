@@ -6,6 +6,75 @@ import XCTest
 #endif
 
 final class TransportTests: XCTestCase {
+    func testHTTPResponseLimitsRejectOversizeAndPreserveExactBodies() async throws {
+        for size in [0, 64, 65] {
+            let transport = try makeURLSessionTransport(maxResponseBytes: 64) { request in
+                try self.mockResponse(request, status: 200, data: Data(repeating: 1, count: size))
+            }
+            try transport.setSchema(["echo": APISchema(id: 1)])
+            transport.setMode(.binary)
+            do {
+                let result = try await transport.call("echo")
+                XCTAssertLessThanOrEqual(size, 64)
+                XCTAssertEqual(result.data.count, size)
+            } catch let error as LuxoError {
+                XCTAssertEqual(size, 65)
+                XCTAssertEqual(error.name, "ParseError")
+            }
+        }
+    }
+
+    func testHTTPResponseLimitsRejectInvalidConfiguration() {
+        for maximum in [0, -1, Int.max] {
+            XCTAssertThrowsError(try URLSessionTransport(endpoint: "https://example.com", maxResponseBytes: maximum))
+        }
+    }
+
+    func testHTTPRequestsDisableResponseCaching() async throws {
+        let transport = try makeURLSessionTransport { request in
+            XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalCacheData)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Cache-Control"), "no-store")
+            return try self.mockResponse(request, status: 200, data: Data(#"{"data":1}"#.utf8))
+        }
+        _ = try await transport.call("echo")
+    }
+    func testHTTPRequestSnapshotsKeepBodiesTokensAndModesIndependent() async throws {
+        let lock = NSLock()
+        var sent: [(URLRequest, Data)] = []
+        let transport = try makeURLSessionTransport { request in
+            let body = try self.requestBody(request)
+            lock.withLock { sent.append((request, body)) }
+            return try self.mockResponse(
+                request, status: 200,
+                data: request.value(forHTTPHeaderField: "X-Luxo-Mode") == "binary"
+                    ? Data([84]) : Data(#"{"data":42}"#.utf8))
+        }
+        try transport.setSchema(["echo": APISchema(id: 1, params: [.init(fieldID: 1, name: "id", type: "Int")])])
+        for index in 0..<6 {
+            transport.setToken("token\(index)")
+            transport.setMode(index.isMultiple(of: 2) ? .json : .binary)
+            _ = try await transport.call("echo", params: ["id": .int(Int64(index))])
+        }
+        let snapshots = lock.withLock { sent }
+        XCTAssertEqual(snapshots.count, 6)
+        for (index, entry) in snapshots.enumerated() {
+            let (request, body) = entry
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer token\(index)")
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.timeoutInterval, 12)
+            if index.isMultiple(of: 2) {
+                XCTAssertNil(request.value(forHTTPHeaderField: "X-Luxo-Mode"))
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+                XCTAssertEqual(
+                    try LuxoValue.decodeJSONData(body), .object(["$api": .string("echo"), "id": .int(Int64(index))]))
+            } else {
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/x-luxo")
+                XCTAssertEqual(request.value(forHTTPHeaderField: "X-Luxo-Mode"), "binary")
+                XCTAssertEqual(body, Data([1, 0, 1, UInt8(index * 2), 0]))
+            }
+        }
+    }
+
     func testHTTPSuccessRequiresDataButAllowsExplicitNull() async throws {
         for body in ["{}", #"{"ok":true}"#, #"{"value":42}"#] {
             let transport = try makeURLSessionTransport { request in
@@ -884,7 +953,9 @@ final class TransportTests: XCTestCase {
         XCTAssertThrowsError(try URLSessionTransport(endpoint: "ws://localhost/socket")) { error in
             XCTAssertEqual((error as? LuxoError)?.name, "ConfigError")
         }
-        XCTAssertThrowsError(try URLSessionTransport(endpoint: "https://example.com", timeout: 0))
+        for timeout in [0.0, -1.0, .infinity, -.infinity, .nan] {
+            XCTAssertThrowsError(try URLSessionTransport(endpoint: "https://example.com", timeout: timeout))
+        }
     }
 
     func testURLSessionTransportJSONCallIncludesStateSnapshot() async throws {
@@ -1769,6 +1840,7 @@ final class TransportTests: XCTestCase {
     }
 
     private func makeURLSessionTransport(
+        maxResponseBytes: Int = 2 * 1024 * 1024,
         handler: @escaping (URLRequest) throws -> (URLResponse, Data)
     ) throws -> URLSessionTransport {
         let handlerID = MockURLProtocol.registerHandler(handler)
@@ -1779,6 +1851,7 @@ final class TransportTests: XCTestCase {
         return try URLSessionTransport(
             endpoint: "https://example.com/api",
             timeout: 12,
+            maxResponseBytes: maxResponseBytes,
             session: session
         )
     }

@@ -4,6 +4,33 @@ import XCTest
 @testable import LuxoCompiler
 
 final class GeneratedSelectionBuildTests: XCTestCase {
+    func testGeneratedEmptySchemaDirectoriesCompile() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let directory = root.appendingPathComponent(".tmp/empty-schema-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let process = SelectionCompilerProcess(workspace: root, scratch: directory)
+        let generator = try LuxoCodegen(endpoint: "https://example.com/luvia", introspectionKey: "test")
+        let cases = [
+            #"{"models":{},"apis":{}}"#,
+            #"{"models":{},"apis":{"echo":{"id":1,"name":"echo","module":"test","returnType":"Bytes"}}}"#,
+            #"{"models":{},"apis":{"hidden":{"id":1,"name":"hidden","module":"test","returnType":"Bytes","isInternal":true}}}"#,
+            #"{"models":{"Empty":{"name":"Empty","usage":"output","fields":[]}},"apis":{}}"#,
+        ]
+        for raw in cases {
+            let schema = try JSONDecoder().decode(LuxoSchema.self, from: Data(raw.utf8))
+            let file = directory.appendingPathComponent("Schema.swift")
+            try generator.generateSchema(schema).write(to: file, atomically: true, encoding: .utf8)
+            _ = try process.run(
+                "swiftc",
+                [
+                    "-typecheck", "-swift-version", "6", "-warnings-as-errors", "-I",
+                    root.appendingPathComponent(".build/debug/Modules").path, file.path,
+                ])
+        }
+    }
+
     func testActualGeneratedRequestsUseInferredSelections() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
@@ -41,7 +68,8 @@ final class GeneratedSelectionBuildTests: XCTestCase {
                 "-L", directory.path, "-l", "LuxoClient", "-o", output.path,
             ] + sources.keys.sorted().map { directory.appendingPathComponent($0).path })
         let result = try process.run(output.path, [])
-        XCTAssertEqual(String(decoding: result, as: UTF8.self), "id\n7\nprofile{name}\nAda\nname\nBee\n")
+        XCTAssertEqual(
+            String(decoding: result, as: UTF8.self), "id\nprofile{name}\nid\n7\nprofile{name}\nAda\nname\nBee\n")
         XCTAssertEqual(
             try String(contentsOf: directory.appendingPathComponent("App.swift"), encoding: .utf8), Self.application)
         try verifyImportedClient(
@@ -112,7 +140,8 @@ final class GeneratedSelectionBuildTests: XCTestCase {
                 "-L", directory.path, "-l", "LuxoClient", "-l", "FixtureSDK", "-o", output.path, source.path,
             ])
         XCTAssertEqual(
-            String(decoding: try process.run(output.path, []), as: UTF8.self), "id\n7\nprofile{name}\nAda\nname\nBee\n")
+            String(decoding: try process.run(output.path, []), as: UTF8.self),
+            "id\nprofile{name}\nid\n7\nprofile{name}\nAda\nname\nBee\n")
         XCTAssertEqual(try String(contentsOf: source, encoding: .utf8), original)
     }
 
@@ -125,14 +154,30 @@ final class GeneratedSelectionBuildTests: XCTestCase {
         struct Mock: Transport {
             func call(_ api: String, params: [String: LuxoValue]?) async throws -> TransportPayload { throw LuxoError(code: 1, message: "dynamic path") }
             func call(_ api: String, request: any GeneratedRequest) async throws -> TransportPayload {
+                precondition(request.selectionPlan != nil, "missing prepared call-site selection")
                 print(request.selection ?? "MISSING")
+                if let plan = request.selectionPlan {
+                    let json = try request.toJSONParameters()
+                    guard case .string(let text) = json["$select"], text == request.selection,
+                        json["selectionPlan"] == nil, !plan.text.isEmpty else {
+                        throw LuxoError(code: 1, message: "plan JSON mismatch")
+                    }
+                }
                 var encoder = LuxoClient.Encoder()
                 try request.writeParameters(to: &encoder)
                 return TransportPayload(data: Data((request.selection == "id" ? "{\"id\":7}" : "{\"profile\":{\"name\":\"Ada\"}}").utf8), mode: .json)
             }
             func subscribe<Value: Sendable>(_ api: String, decoder: @escaping @Sendable (TransportPayload) throws -> Value,
                 request: any GeneratedRequest, observer: StreamObserver?, handler: @escaping @Sendable (Value) -> Void) async throws -> (@Sendable () -> Void) {
+                precondition(request.selectionPlan != nil, "missing prepared call-site selection")
                 print(request.selection ?? "MISSING")
+                if let plan = request.selectionPlan {
+                    let json = try request.toJSONParameters()
+                    guard case .string(let text) = json["$select"], text == request.selection,
+                        json["selectionPlan"] == nil, !plan.text.isEmpty else {
+                        throw LuxoError(code: 1, message: "plan JSON mismatch")
+                    }
+                }
                 handler(try decoder(TransportPayload(data: Data("{\"name\":\"Bee\"}".utf8), mode: .json)))
                 return {}
             }
@@ -143,6 +188,17 @@ final class GeneratedSelectionBuildTests: XCTestCase {
         @main struct App {
             static func main() async throws {
                 let client = try LuxoGeneratedClient(transport: Mock())
+                guard let userSchema = LUXO_SCHEMA["getUser"] else {
+                    throw LuxoError(code: 1, message: "missing schema")
+                }
+                let plan = try PreparedSelection("id", schema: userSchema)
+                let planned = try await client.getUser(selectionPlan: plan)
+                let plannedID = try planned.id.requireValue()
+                precondition(plannedID == 7)
+                let overridden = try await client.getUser(select: "profile{name}", selectionPlan: plan)
+                let selectedProfile = try overridden.profile.requireValue()
+                let selectedName = try selectedProfile.name.requireValue()
+                precondition(selectedName == "Ada")
                 let first = try await client.getUser()
                 print(try first.id.requireValue())
                 let second = try await client.getUser()

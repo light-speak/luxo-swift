@@ -50,8 +50,13 @@ jobs:
           swiftc -typecheck -module-name LuxoClient -swift-version 6 -warnings-as-errors -strict-concurrency=complete \
             -target x86_64-apple-macos13.0 -sdk "$macos_sdk_path" Sources/LuxoClient/*.swift
 
-      - name: Test with coverage
-        run: swift test --parallel --enable-code-coverage -Xswiftc -warnings-as-errors
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Test with coverage and real NIO TLS fixtures
+        run: python3 Scripts/test-nio.py --all --coverage
 
       - name: Enforce source coverage
         run: |
@@ -73,6 +78,14 @@ jobs:
 
       - name: Test transport concurrency
         run: swift test --sanitize=thread --filter 'TransportTests|WebSocketSubscriptionTests|WebSocketTerminalTests'
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Test NIO lifecycle with Thread Sanitizer
+        run: python3 Scripts/test-nio.py --sanitize-thread
 
   external-consumer:
     runs-on: macos-26
@@ -116,10 +129,7 @@ jobs:
             -Xswiftc -warnings-as-errors \
             -Xswiftc -strict-concurrency=complete
           .tmp/generated-consumer-build/debug/LuxoGeneratedConsumer
-          swift run LuxoAnalyze \
-            --source-dir Tests/Consumer/.tmp/generated-consumer \
-            --output Tests/Consumer/.tmp/SelectHints.swift
-          grep -F '"getRecord": "profile{name}"' Tests/Consumer/.tmp/SelectHints.swift
+          # GeneratedSelectionBuildTests in the quality job verifies per-call selections.
 
       - name: Run optimized generated consumer
         run: |

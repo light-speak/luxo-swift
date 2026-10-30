@@ -185,6 +185,7 @@ public struct APISchema: Sendable {
     public let fields: [String: SelectionFieldSchema]
     public let types: [String: [String: SelectionFieldSchema]]
     let jsonParameters: JSONParameterPlan?
+    let selectionIdentity: SelectionSchemaIdentity?
 
     public struct SelectionFieldSchema: Sendable {
         public let fieldID: Int
@@ -243,94 +244,9 @@ public struct APISchema: Sendable {
         self.params = params
         self.fields = fields
         self.types = types
+        self.selectionIdentity = fields.isEmpty ? nil : SelectionSchemaIdentity()
         self.jsonParameters = JSONParameterPlan(params: params, types: types)
     }
-}
-
-private struct SelectedField {
-    let name: String
-    let children: [SelectedField]?
-}
-
-private final class SelectionParser {
-    private let input: [UInt8]
-    private var offset = 0
-
-    init(_ selection: String) {
-        input = Array(selection.utf8)
-    }
-
-    func parse() throws -> [SelectedField] {
-        let fields = try parseList(nested: false, depth: 0)
-        skipSpaces()
-        if offset != input.count { throw error("unexpected character") }
-        return fields
-    }
-
-    private func parseList(nested: Bool, depth: Int) throws -> [SelectedField] {
-        if depth >= 32 { throw error("selection depth exceeds 32") }
-        var fields: [SelectedField] = []
-        var names = Set<String>()
-        while true {
-            skipSpaces()
-            if offset >= input.count || (nested && input[offset] == 125) { break }
-            let name = readIdentifier()
-            if name.isEmpty { throw error("expected field name") }
-            if !names.insert(name).inserted { throw error("duplicate field '\(name)'") }
-            skipSpaces()
-            let children = try readChildren(name: name, depth: depth)
-            fields.append(SelectedField(name: name, children: children))
-            skipSpaces()
-            if offset >= input.count || input[offset] != 44 { break }
-            offset += 1
-            skipSpaces()
-            if offset >= input.count || (nested && input[offset] == 125) {
-                throw error("expected field after ','")
-            }
-        }
-        return fields
-    }
-
-    private func readChildren(name: String, depth: Int) throws -> [SelectedField]? {
-        guard offset < input.count, input[offset] == 123 else { return nil }
-        offset += 1
-        let children = try parseList(nested: true, depth: depth + 1)
-        if children.isEmpty { throw error("empty selection for '\(name)'") }
-        skipSpaces()
-        guard offset < input.count, input[offset] == 125 else {
-            throw error("missing '}' for '\(name)'")
-        }
-        offset += 1
-        return children
-    }
-
-    private func readIdentifier() -> String {
-        let start = offset
-        guard offset < input.count, isIdentifierStart(input[offset]) else { return "" }
-        offset += 1
-        while offset < input.count, isIdentifierPart(input[offset]) { offset += 1 }
-        return String(decoding: input[start..<offset], as: UTF8.self)
-    }
-
-    private func skipSpaces() {
-        while offset < input.count,
-            input[offset] == 32 || input[offset] == 9 || input[offset] == 10 || input[offset] == 13
-        {
-            offset += 1
-        }
-    }
-
-    private func error(_ message: String) -> LuxoError {
-        LuxoError(code: 0, message: "\(message) at position \(offset)", name: "ConfigError")
-    }
-}
-
-private func isIdentifierStart(_ byte: UInt8) -> Bool {
-    byte == 95 || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
-}
-
-private func isIdentifierPart(_ byte: UInt8) -> Bool {
-    isIdentifierStart(byte) || (byte >= 48 && byte <= 57)
 }
 
 enum LuxoBinaryProtocol {
@@ -358,7 +274,7 @@ enum LuxoBinaryProtocol {
         }
         var encoder = Encoder()
         encoder.writeVarint(UInt64(request.apiID))
-        try writeFieldMask(&encoder, schema: schema, selection: request.selection)
+        try writeFieldMask(&encoder, schema: schema, selection: request.selection, plan: request.selectionPlan)
         try request.writeParameters(to: &encoder)
         if let filters = request.filters { try encodeTypedFilters(&encoder, values: filters) }
         if let sorters = request.sorters { try encodeTypedSorters(&encoder, values: sorters) }
@@ -422,61 +338,6 @@ enum LuxoBinaryProtocol {
         encoder.writeVarint(type)
         encoder.writeVarint(id)
         encoder.writeRawBytes(payload)
-        return encoder.data
-    }
-
-    private static func writeFieldMask(
-        _ encoder: inout Encoder,
-        schema: APISchema,
-        selection: String?
-    ) throws {
-        guard !schema.fields.isEmpty else {
-            encoder.writeVarint(0)
-            return
-        }
-        guard let selection, !selection.trimmingCharacters(in: .whitespaces).isEmpty else {
-            throw configError("$select is required for structured responses")
-        }
-        let selected = try SelectionParser(selection).parse()
-        let mask = try encodeSelectionNode(selected, fields: schema.fields, types: schema.types)
-        encoder.writeVarint(UInt64(mask.count))
-        encoder.writeRawBytes(mask)
-    }
-
-    private static func encodeSelectionNode(
-        _ selected: [SelectedField],
-        fields: [String: APISchema.SelectionFieldSchema],
-        types: [String: [String: APISchema.SelectionFieldSchema]]
-    ) throws -> Data {
-        var fieldMask: [UInt8] = []
-        var children: [(fieldID: Int, data: Data)] = []
-        for field in selected {
-            guard let metadata = fields[field.name] else {
-                throw configError("unknown selected field: \(field.name)")
-            }
-            try fieldMaskSet(&fieldMask, fieldID: metadata.fieldID)
-            guard let childSelection = field.children else { continue }
-            guard let typeName = metadata.typeName, let nestedFields = types[typeName] else {
-                throw configError("field \(field.name) does not support nested selection")
-            }
-            children.append(
-                (
-                    metadata.fieldID,
-                    try encodeSelectionNode(
-                        childSelection,
-                        fields: nestedFields,
-                        types: types
-                    )
-                ))
-        }
-        var encoder = Encoder()
-        encoder.writeVarint(UInt64(fieldMask.count))
-        encoder.writeRawBytes(Data(fieldMask))
-        for child in children.sorted(by: { $0.fieldID < $1.fieldID }) {
-            encoder.writeVarint(UInt64(child.fieldID))
-            encoder.writeVarint(UInt64(child.data.count))
-            encoder.writeRawBytes(child.data)
-        }
         return encoder.data
     }
 
@@ -644,211 +505,6 @@ enum LuxoBinaryProtocol {
 
     private static func invalidValue(_ type: String) -> LuxoError {
         LuxoError(code: 0, message: "invalid \(type) parameter", name: "ConfigError")
-    }
-}
-
-// MARK: - URLSession Transport (HTTP/2)
-
-/// HTTP/2 transport using URLSession. Single connection, multiplexed requests.
-/// Supports both JSON and binary (Luxo codec) modes.
-/// Supports timeout configuration and 401 auto-refresh.
-public final class URLSessionTransport: Transport, @unchecked Sendable {
-    private struct HTTPFailure: Error {
-        let statusCode: Int
-        let error: LuxoError
-    }
-
-    private struct State {
-        let headers: [String: String]
-        let mode: TransportMode
-        let schema: [String: APISchema]
-    }
-
-    private let endpoint: URL
-    private let session: URLSession
-    private let lock = NSLock()
-    private var headers: [String: String] = [:]
-    private var mode: TransportMode = .json
-    private var schema: [String: APISchema] = [:]
-    private let timeout: TimeInterval
-    private var tokenExpiredHandler: (() async -> String?)?
-
-    /// Called only when HTTP status and the validated error code are both 401.
-    /// Return a new token to retry once, or nil to propagate the original error.
-    public var onTokenExpired: (() async -> String?)? {
-        get { lock.withLock { tokenExpiredHandler } }
-        set { lock.withLock { tokenExpiredHandler = newValue } }
-    }
-
-    public convenience init(
-        endpoint: String,
-        token: String? = nil,
-        timeout: TimeInterval = 30
-    ) throws {
-        // HTTP/2 multiplexing via shared URLSession
-        let config = URLSessionConfiguration.default
-        config.httpAdditionalHeaders = ["Content-Type": "application/json"]
-        try self.init(
-            endpoint: endpoint,
-            token: token,
-            timeout: timeout,
-            session: URLSession(configuration: config)
-        )
-    }
-
-    init(
-        endpoint: String,
-        token: String? = nil,
-        timeout: TimeInterval = 30,
-        session: URLSession
-    ) throws {
-        self.endpoint = try validatedURL(endpoint, schemes: ["http", "https"])
-        guard timeout > 0 else {
-            throw LuxoError(code: 0, message: "timeout must be greater than zero", name: "ConfigError")
-        }
-        self.timeout = timeout
-        self.session = session
-        if let token = token {
-            headers["Authorization"] = "Bearer \(token)"
-        }
-    }
-
-    public func setToken(_ token: String) {
-        lock.withLock { headers["Authorization"] = "Bearer \(token)" }
-    }
-
-    public func setMode(_ mode: TransportMode) {
-        lock.withLock { self.mode = mode }
-    }
-
-    public func setSchema(_ schema: [String: APISchema]) throws {
-        try validateRuntimeSchemaIDs(schema)
-        lock.withLock { self.schema = schema }
-    }
-
-    public func call(_ api: String, params: [String: LuxoValue]? = nil) async throws -> TransportPayload {
-        try await callRequest(api, params: .dynamic(params))
-    }
-
-    public func call(_ api: String, request: any GeneratedRequest) async throws -> TransportPayload {
-        try await callRequest(api, params: .generated(request))
-    }
-
-    private func callRequest(_ api: String, params: RequestParameters) async throws -> TransportPayload {
-        do {
-            return try await doCall(api, params: params)
-        } catch let failure as HTTPFailure {
-            let error = failure.error
-            guard failure.statusCode == 401, error.code == 401, error.name != "ParseError" else {
-                throw error
-            }
-            let refresh = lock.withLock { tokenExpiredHandler }
-            if let refresh, let newToken = await refresh() {
-                setToken(newToken)
-                do {
-                    return try await doCall(api, params: params)
-                } catch let retryFailure as HTTPFailure {
-                    throw retryFailure.error
-                }
-            }
-            throw error
-        }
-    }
-
-    private func doCall(_ api: String, params: RequestParameters) async throws -> TransportPayload {
-        let state = lock.withLock {
-            State(headers: headers, mode: mode, schema: schema)
-        }
-        let data: Data
-        switch state.mode {
-        case .json:
-            data = try await jsonCall(
-                api, params: params.json(), headers: state.headers, plan: state.schema[api]?.jsonParameters)
-        case .binary:
-            data = try await binaryCall(
-                api,
-                params: params,
-                headers: state.headers,
-                schema: state.schema
-            )
-        }
-        return TransportPayload(data: data, mode: state.mode)
-    }
-
-    private func jsonCall(
-        _ api: String,
-        params: [String: LuxoValue]?,
-        headers: [String: String],
-        plan: JSONParameterPlan?
-    ) async throws -> Data {
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.timeoutInterval = timeout
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
-        request.httpBody = try LuxoJSONRequest.encode(api: api, params: params, plan: plan)
-
-        let (data, response) = try await session.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw LuxoError(code: 0, message: "Invalid response")
-        }
-
-        let envelope = try decodeJSONEnvelope(data, statusCode: httpResponse.statusCode)
-        if httpResponse.statusCode != 200 || envelope.fields["error"] != nil {
-            throw HTTPFailure(
-                statusCode: httpResponse.statusCode,
-                error: JSONEnvelope.decodeError(envelope, statusCode: httpResponse.statusCode))
-        }
-        guard let data = envelope.responseData else {
-            throw LuxoError(code: httpResponse.statusCode, message: "missing JSON response data", name: "ParseError")
-        }
-        return data
-    }
-
-    private func decodeJSONEnvelope(_ data: Data, statusCode: Int) throws -> JSONEnvelope {
-        do {
-            return try JSONEnvelope.decode(data, errorResponse: statusCode != 200)
-        } catch {
-            throw LuxoError(code: statusCode, message: "invalid JSON response", name: "ParseError")
-        }
-    }
-
-    private func binaryCall(
-        _ api: String,
-        params: RequestParameters,
-        headers: [String: String],
-        schema: [String: APISchema]
-    ) async throws -> Data {
-        guard let apiSchema = schema[api] else {
-            throw LuxoError(
-                code: 0,
-                message: "no schema for API \"\(api)\" — binary mode requires schema",
-                name: "ConfigError"
-            )
-        }
-        let body = try params.binary(schema: apiSchema)
-
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.timeoutInterval = timeout
-        request.setValue("application/x-luxo", forHTTPHeaderField: "Content-Type")
-        request.setValue("binary", forHTTPHeaderField: "X-Luxo-Mode")
-        for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
-        request.httpBody = body
-
-        let (data, response) = try await session.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw LuxoError(code: 0, message: "Invalid response", name: "NetworkError")
-        }
-        guard httpResponse.statusCode == 200 else {
-            throw HTTPFailure(
-                statusCode: httpResponse.statusCode,
-                error: LuxoBinaryProtocol.decodeError(data, statusCode: httpResponse.statusCode))
-        }
-
-        return data  // Return raw bytes for binary decoding
     }
 }
 

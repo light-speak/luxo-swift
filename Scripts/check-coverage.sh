@@ -15,7 +15,7 @@ fi
 report="$(xcrun llvm-cov report "${binary}" \
   -instr-profile="${profile}" \
   -ignore-filename-regex='(.build|Tests)/' \
-  Sources/LuxoClient Sources/LuxoCompiler)"
+  Sources/LuxoClient Sources/LuxoCompiler Sources/LuxoNIO)"
 printf '%s\n' "${report}"
 
 coverage="$(awk '/^TOTAL/ { gsub("%", "", $10); print $10 }' <<<"${report}")"
@@ -34,6 +34,6 @@ xcrun llvm-cov export "${binary}" \
   -instr-profile="${profile}" \
   -format=lcov \
   -ignore-filename-regex='(.build|Tests)/' \
-  Sources/LuxoClient Sources/LuxoCompiler >"${output}"
+  Sources/LuxoClient Sources/LuxoCompiler Sources/LuxoNIO >"${output}"
 
 echo "Source line coverage ${coverage}% meets ${minimum}%"

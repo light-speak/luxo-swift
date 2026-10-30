@@ -200,6 +200,7 @@ public final class LuxoCodegen {
             let module: String
             let client = "LuxoGeneratedClient"
             let runtimeModule = "LuxoClient"
+            let selectionPlans = true
             let apis: [String: APIEntry]
             let fields: [String: [String: Bool]]
         }
@@ -523,7 +524,7 @@ public final class LuxoCodegen {
             }
             if hasStructuredReturn {
                 if !paramList.isEmpty { paramList += ", " }
-                paramList += "select: String? = nil"
+                paramList += "select: String? = nil, selectionPlan: PreparedSelection? = nil"
                 if paramSetup.isEmpty {
                     paramSetup = "        var callParams: [String: LuxoValue] = [:]\n"
                 }
@@ -551,6 +552,12 @@ public final class LuxoCodegen {
                     "        if let sorters { callParams[\"$sorters\"] = .array(sorters.map(\\.transportValue)) }\n"
             }
 
+            if hasStructuredReturn {
+                let method =
+                    api.stream == true
+                    ? "subscribe" + api.name.prefix(1).uppercased() + api.name.dropFirst() : api.name
+                out += SwiftRequestCodegen.selectionFactory(api: api.name, method: method)
+            }
             let request = SwiftRequestCodegen.invocation(api, selection: hasStructuredReturn)
             requests += SwiftRequestCodegen.generate(
                 api, selection: hasStructuredReturn,
@@ -994,11 +1001,13 @@ public final class LuxoCodegen {
         }
         if !selectionTypes.isEmpty { out += "\n" }
         out += "private let LUXO_SELECTION_TYPES: [String: [String: APISchema.SelectionFieldSchema]] = [\n"
+        if selectionTypes.isEmpty { out += "    :\n" }
         for (name, _) in selectionTypes.sorted(by: { $0.0 < $1.0 }) {
             out += "    \"\(name)\": \(selectionFieldsName(name)),\n"
         }
         out += "]\n\n"
         out += "public let LUXO_SCHEMA: [String: APISchema] = [\n"
+        if !schema.apis.values.contains(where: { $0.isInternal != true }) { out += "    :\n" }
 
         for (_, api) in schema.apis.sorted(by: { $0.key < $1.key }) {
             if api.isInternal == true { continue }

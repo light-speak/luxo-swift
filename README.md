@@ -132,11 +132,76 @@ let posts = try await transport.call("listPosts", params: ["page": 1, "pageSize"
 
 ### URLSession HTTP/2 Transport
 
+`maxResponseBytes` defaults to 2 MiB and must be positive. Response data is
+collected incrementally; exceeding the limit produces `ParseError` and cancels
+only that task, preserving the shared session. Foundation may buffer an untyped
+prefix before delivering callbacks; this is not a limit on all network buffers.
+The default session disables response caching, and ordinary RPC requests use
+`no-store` with a reload policy. Schema discovery has a separate cache policy.
+
+`timeout` must be finite and positive. The built-in session bounds both idle
+response waits and the total duration of each HTTP attempt, including slow
+streaming response bodies. A token-refresh callback and a subsequent retry are
+separate from that attempt's deadline.
+
+
 Native `URLSession` with HTTP/2 multiplexing. Works on iOS 15+, macOS 13+:
 
 ```swift
 let transport = try URLSessionTransport(endpoint: "https://api.example.com/luvia")
 ```
+
+### Optional NIO HTTP/2 Transport
+
+Add the `LuxoNIO` product for automatic H2-first selection (recommended), or strict H2:
+
+```swift
+import LuxoClient
+import LuxoNIO
+
+let transport = try await AutomaticHTTPTransport.connect(endpoint: "https://api.example.com/luvia")
+transport.setMode(.binary)
+// Pass transport to the generated client; its initializer registers the Schema.
+// Close after the application's requests finish.
+try await transport.close()
+```
+
+`AutomaticHTTPTransport.connect` tries verified TLS with H2 preferred. Only a successful
+TLS handshake selecting HTTP/1.1 (or no ALPN) chooses URLSession before any business
+request is sent. Certificate errors, timeouts and disconnections do not trigger
+fallback. The selected backend stays fixed for that instance and is exposed as
+`transport.backend.selectedBackend`; no per-request probing or cross-backend replay
+occurs. Fallback establishes a separate system connection, so H1 startup incurs
+an extra TLS connection. URLSession may negotiate H2 itself if the CDN changes.
+Custom `trustRootsFile` is supported on the H2 path; if H1 is required it fails
+explicitly rather than silently replacing custom trust with system trust.
+
+Use `NIOHTTPTransport.connect` for strict H2 without fallback.
+`URLSessionTransport` remains available for explicit system networking and HTTP URLs.
+All backends share the same
+`HTTPTransport<Backend>` implementation for generated requests, JSON/Binary,
+response mode snapshots and strict 401 refresh handling. NIO requires HTTPS and
+verified `h2` negotiation. System trust roots are used unless `trustRootsFile`
+explicitly supplies a CA file; certificate verification is never disabled.
+
+Each instance owns one connection and event-loop thread. Defaults are 16 active
+requests, no admission wait queue, and 2 MiB request/response body limits.
+Cancellation and response overflow close only the affected stream. `close()` is
+idempotent and ends in-flight requests; dropped instances also initiate cleanup.
+A disconnected instance fails subsequent calls: explicitly connect a replacement.
+Requests are never automatically replayed after a send failure. Automatic selection
+also preserves request/response limits and the active-request limit on fallback. Use the
+existing WebSocket transport for subscriptions. Connection/TLS establishment
+has independent 10-second deadlines; `timeout` applies to each HTTP attempt.
+
+Run `python3 Scripts/test-nio.py` for all 33 TLS, backend-selection and lifecycle tests.
+The harness requires Go 1.27.1 and keeps disposable servers, certificates and
+reports under `.tmp/`. CI uses `--all --coverage` to include the same network
+contract in the full source coverage gate.
+
+NIO dependencies are linked only by the optional target, but SwiftPM can still
+resolve/download them for the package. Benchmark prototype results do not
+constitute performance acceptance of this production integration.
 
 ### WebSocket — Real-time Subscriptions
 
@@ -310,6 +375,8 @@ an entire model to an opaque function, mutable model bindings, function referenc
 or unsupported data-flow constructs require explicit selection; there is no
 implicit select-all fallback. The compiler AST is pinned to the tested Apple Swift
 6.3.3 toolchain and mismatched versions fail explicitly.
+
+The legacy `SelectAnalyzer.buildHints()` and `generateHintsFile()` API-wide hints are removed before beta.1. Use the call-site build integration described here; selections from separate calls must not be merged by API name.
 
 The standalone `LuxoAnalyze package` command accepts the same options plus
 `--workspace`; `LuxoAnalyze build --manifest <file> -- <swiftc arguments>` supports

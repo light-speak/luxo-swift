@@ -6,6 +6,24 @@ import XCTest
 #endif
 
 final class CodegenTests: XCTestCase {
+
+    func testGeneratedSelectionPlanPreservesTextAndManualOverride() throws {
+        let schema = try JSONDecoder().decode(
+            LuxoSchema.self,
+            from: Data(
+                """
+                {"models":{},"types":{"Snapshot":{"name":"Snapshot","usage":"output",
+                "fields":[{"id":1,"name":"id","type":"Int"}]}},
+                "apis":{"read":{"id":1,"name":"read","module":"test","returnType":"Snapshot"}}}
+                """.utf8))
+        let source = try makeCodegen().generateClient(schema)
+        XCTAssertTrue(source.contains("selectionPlan: PreparedSelection? = nil"))
+        XCTAssertTrue(source.contains("var selection: String? { values.select ?? values.selectionPlan?.text }"))
+        XCTAssertTrue(source.contains("var selectionPlan: PreparedSelection? { values.selectionPlan }"))
+        XCTAssertTrue(source.contains("let select = selection"))
+        XCTAssertFalse(source.contains("callParams[\"selectionPlan\"]"))
+    }
+
     func testNullableRootResponsesPreserveSchemaAndGeneratedTypes() throws {
         let generator = try makeCodegen()
         for (name, type) in [("Int", "Int"), ("DateTime", "String"), ("Snapshot", "Snapshot")] {
@@ -595,11 +613,11 @@ final class CodegenTests: XCTestCase {
 
         XCTAssertTrue(
             source.contains(
-                "public func subscribeWatchOrders(status: String, select: String? = nil, observer: StreamObserver? = nil, handler: @escaping @Sendable (OrderEvent) -> Void) async throws -> (@Sendable () -> Void)"
+                "public func subscribeWatchOrders(status: String, select: String? = nil, selectionPlan: PreparedSelection? = nil, observer: StreamObserver? = nil, handler: @escaping @Sendable (OrderEvent) -> Void) async throws -> (@Sendable () -> Void)"
             ))
         XCTAssertTrue(
             source.contains(
-                "try await transport.subscribe(\"watchOrders\", decoder: Self.decode_watchOrders, request: _watchOrdersRequest(values: .init(status: status, select: select)), observer: observer, handler: handler)"
+                "try await transport.subscribe(\"watchOrders\", decoder: Self.decode_watchOrders, request: _watchOrdersRequest(values: .init(status: status, select: select, selectionPlan: selectionPlan)), observer: observer, handler: handler)"
             ))
         XCTAssertTrue(
             source.contains("private static func decode_watchOrders(_ result: TransportPayload) throws -> OrderEvent"))

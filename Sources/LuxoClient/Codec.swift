@@ -34,7 +34,7 @@ public struct Encoder {
             throw LuxoError(code: 0, message: "Float must be finite", name: "ConfigError")
         }
         var v = value.bitPattern
-        data.append(contentsOf: withUnsafeBytes(of: &v) { Array($0) })
+        withUnsafeBytes(of: &v) { data.append(contentsOf: $0) }
     }
 
     public mutating func writeBool(_ value: Bool) {
@@ -42,9 +42,15 @@ public struct Encoder {
     }
 
     public mutating func writeString(_ value: String) {
-        let bytes = Array(value.utf8)
-        writeVarint(UInt64(bytes.count))
-        data.append(contentsOf: bytes)
+        if value.isEmpty {
+            data.append(0)
+            return
+        }
+        var value = value
+        value.withUTF8 { bytes in
+            writeVarint(UInt64(bytes.count))
+            data.append(contentsOf: bytes)
+        }
     }
 
     public mutating func writeBytes(_ value: Data) {
@@ -344,14 +350,10 @@ public struct Decoder {
             if error == nil { error = "truncated uuid at offset \(offset)" }
             return UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
         }
-        let b = data[offset..<offset + 16]
+        let position = offset - data.startIndex
+        let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: position, as: uuid_t.self) }
         offset += 16
-        let a = Array(b)
-        return UUID(
-            uuid: (
-                a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
-                a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]
-            ))
+        return UUID(uuid: value)
     }
 
     /// Read a nullable UUID (null flag + 16 bytes).
@@ -777,7 +779,7 @@ public struct ColumnarDecoder {
         return true
     }
 
-    private mutating func readVarintValue(_ context: String) -> UInt64? {
+    private mutating func readVarintValue(_ context: @autoclosure () -> String) -> UInt64? {
         let start = off
         var result: UInt64 = 0
         var shift: UInt64 = 0
@@ -785,26 +787,26 @@ public struct ColumnarDecoder {
             let byte = data[off]
             off += 1
             if shift >= 64 || (shift == 63 && byte & 0x7E != 0) {
-                fail("varint overflow in \(context) at offset \(start)")
+                fail("varint overflow in \(context()) at offset \(start)")
                 return nil
             }
             result |= UInt64(byte & 0x7F) << shift
             if byte & 0x80 == 0 { return result }
             shift += 7
         }
-        fail("truncated varint in \(context) at offset \(start)")
+        fail("truncated varint in \(context()) at offset \(start)")
         return nil
     }
 
-    private mutating func readSvarintValue(_ context: String) -> Int64? {
-        guard let value = readVarintValue(context) else { return nil }
+    private mutating func readSvarintValue(_ context: @autoclosure () -> String) -> Int64? {
+        guard let value = readVarintValue(context()) else { return nil }
         return Int64(bitPattern: (value >> 1) ^ UInt64(bitPattern: -Int64(value & 1)))
     }
 
-    private mutating func readFixed64Value(_ context: String) -> Double? {
+    private mutating func readFixed64Value(_ context: @autoclosure () -> String) -> Double? {
         guard error == nil else { return nil }
         guard off <= data.endIndex, data.endIndex - off >= 8 else {
-            fail("truncated \(context) at offset \(off)")
+            fail("truncated \(context()) at offset \(off)")
             return nil
         }
         let bits = data[off..<off + 8].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
@@ -816,14 +818,14 @@ public struct ColumnarDecoder {
         return Double(bitPattern: bits)
     }
 
-    private mutating func readBytesValue(_ context: String) -> Data? {
-        guard let rawLength = readVarintValue("\(context) length"), rawLength <= UInt64(Int.max) else {
-            if error == nil { fail("\(context) length exceeds platform integer range") }
+    private mutating func readBytesValue(_ context: @autoclosure () -> String) -> Data? {
+        guard let rawLength = readVarintValue("\(context()) length"), rawLength <= UInt64(Int.max) else {
+            if error == nil { fail("\(context()) length exceeds platform integer range") }
             return nil
         }
         let length = Int(rawLength)
         guard off <= data.endIndex, length <= data.endIndex - off else {
-            fail("truncated \(context) at offset \(off)")
+            fail("truncated \(context()) at offset \(off)")
             return nil
         }
         let result = Data(data[off..<off + length])
@@ -831,19 +833,19 @@ public struct ColumnarDecoder {
         return result
     }
 
-    private mutating func readStringValue(_ context: String) -> String? {
+    private mutating func readStringValue(_ context: @autoclosure () -> String) -> String? {
         let start = off
-        guard let bytes = readBytesValue(context) else { return nil }
+        guard let bytes = readBytesValue(context()) else { return nil }
         guard let value = String(data: bytes, encoding: .utf8) else {
-            fail("invalid UTF-8 in \(context) at offset \(start)")
+            fail("invalid UTF-8 in \(context()) at offset \(start)")
             return nil
         }
         return value
     }
 
-    private mutating func readMarker(_ context: String) -> Bool? {
+    private mutating func readMarker(_ context: @autoclosure () -> String) -> Bool? {
         guard off < data.endIndex else {
-            fail("truncated \(context) at offset \(off)")
+            fail("truncated \(context()) at offset \(off)")
             return nil
         }
         let markerOffset = off
@@ -855,23 +857,20 @@ public struct ColumnarDecoder {
         case 0x01:
             return true
         default:
-            fail("invalid \(context) at offset \(markerOffset)")
+            fail("invalid \(context()) at offset \(markerOffset)")
             return nil
         }
     }
 
-    private mutating func readUUIDValue(_ context: String) -> UUID? {
+    private mutating func readUUIDValue(_ context: @autoclosure () -> String) -> UUID? {
         guard off <= data.endIndex, data.endIndex - off >= 16 else {
-            fail("truncated \(context) at offset \(off)")
+            fail("truncated \(context()) at offset \(off)")
             return nil
         }
-        let a = Array(data[off..<off + 16])
+        let position = off - data.startIndex
+        let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: position, as: uuid_t.self) }
         off += 16
-        return UUID(
-            uuid: (
-                a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
-                a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]
-            ))
+        return UUID(uuid: value)
     }
 
     private mutating func fail(_ message: String) {
