@@ -3,10 +3,118 @@ import XCTest
 @testable import LuxoClient
 
 final class JSONParameterTests: XCTestCase {
+    func testModel64AndIndependentJSON128AcceptRawAndProjectedLists() throws {
+        for projected in [false, true] {
+            for lists in [false, true] {
+                for rootList in [false, true] {
+                    for layers in [63, 64] {
+                        let counter = Counter()
+                        let schema = depthSchema(rootList: rootList)
+                        let value = depthInput(layers, lists: lists, json: 128, projected: projected, counter: counter)
+                        XCTAssertNoThrow(
+                            try LuxoJSONRequest.encode(
+                                api: "echo", params: ["value": rootList ? .array([value]) : value],
+                                plan: schema.jsonParameters))
+                        XCTAssertEqual(counter.count, projected ? layers : 0)
+                    }
+                }
+            }
+        }
+    }
+
+    func testModel65RejectsBeforeProjectingThe65thObject() {
+        for projected in [false, true] {
+            for lists in [false, true] {
+                for rootList in [false, true] {
+                    let counter = Counter()
+                    let schema = depthSchema(rootList: rootList)
+                    let value = depthInput(65, lists: lists, json: 128, projected: projected, counter: counter)
+                    XCTAssertThrowsError(
+                        try LuxoJSONRequest.encode(
+                            api: "echo", params: ["value": rootList ? .array([value]) : value],
+                            plan: schema.jsonParameters)
+                    ) { error in
+                        XCTAssertEqual((error as? LuxoError)?.name, "ConfigError")
+                        XCTAssertTrue((error as? LuxoError)?.message.contains("64") == true)
+                        XCTAssertTrue((error as? LuxoError)?.message.contains(rootList ? "value[0]" : "value") == true)
+                    }
+                    XCTAssertEqual(counter.count, projected ? 64 : 0)
+                }
+            }
+        }
+    }
+
+    func testModelJSON129RejectsAndIndependentCallRecovers() {
+        let schema = depthSchema(rootList: false)
+        for lists in [false, true] {
+            let invalid = depthInput(64, lists: lists, json: 129, projected: false, counter: Counter())
+            XCTAssertThrowsError(
+                try LuxoJSONRequest.encode(api: "echo", params: ["value": invalid], plan: schema.jsonParameters))
+            let valid = depthInput(64, lists: lists, json: 128, projected: false, counter: Counter())
+            XCTAssertNoThrow(
+                try LuxoJSONRequest.encode(api: "echo", params: ["value": valid], plan: schema.jsonParameters))
+        }
+    }
+
     func testOnlyIntegerAndStructuredParametersNeedPlans() {
         XCTAssertNil(APISchema(id: 1).jsonParameters)
         XCTAssertNil(APISchema(id: 1, params: [.init(fieldID: 1, name: "value", type: "Float")]).jsonParameters)
         XCTAssertNil(APISchema(id: 1, params: [], types: ["Unused": [:]]).jsonParameters)
+    }
+
+    func testJSONRootsCannotResetDepthInsideGenericValues() throws {
+        let schema = APISchema(id: 1, params: [.init(fieldID: 1, name: "value", type: "JSON")])
+        var deep: JSONValue = .null
+        for _ in 0..<128 { deep = .array([deep]) }
+        XCTAssertNoThrow(
+            try LuxoJSONRequest.encode(api: "echo", params: ["value": .json(deep)], plan: schema.jsonParameters))
+        for value: LuxoValue in [
+            .array([.json(deep)]), .object(["v": .json(deep)]),
+            .bytes(Data([1])), .array([.bytes(Data([1]))]),
+            .structured(RecursiveProjection()), .object(["v": .structured(RecursiveProjection())]),
+            .float(.infinity), .json(.number(.nan)),
+        ] {
+            XCTAssertThrowsError(
+                try LuxoJSONRequest.encode(api: "echo", params: ["value": value], plan: schema.jsonParameters))
+        }
+        let mixed: LuxoValue = .object(["a": .array([.json(.integer(1)), .int(2)]), "b": .json(.object(["n": .null]))])
+        XCTAssertEqual(
+            try LuxoJSONRequest.encode(api: "echo", params: ["value": mixed], plan: schema.jsonParameters),
+            Data("{\"$api\":\"echo\",\"value\":{\"a\":[1,2],\"b\":{\"n\":null}}}".utf8))
+    }
+
+    func testGenericJSONParameterValidationMatchesBinary() throws {
+        let counter = Counter()
+        var deep: JSONValue = .null
+        for _ in 0..<128 { deep = .array([deep]) }
+        for isList in [false, true] {
+            let schema = APISchema(id: 1, params: [.init(fieldID: 1, name: "value", type: "JSON", isList: isList)])
+            for value: LuxoValue in [
+                .bytes(Data([1])), .array([.bytes(Data([1]))]),
+                .structured(ProjectedInput(counter: counter, id: .int(1))),
+                .array([.json(deep)]), .object(["v": .json(deep)]),
+            ] {
+                let value = isList ? LuxoValue.array([value]) : value
+                XCTAssertThrowsError(
+                    try LuxoJSONRequest.encode(api: "echo", params: ["value": value], plan: schema.jsonParameters))
+                XCTAssertThrowsError(try LuxoBinaryProtocol.encodeRequest(schema: schema, params: ["value": value]))
+            }
+            XCTAssertEqual(counter.count, 0, "generic JSON must not invoke model projection")
+            for value in [LuxoValue(deep), .json(deep)] {
+                let value = isList ? LuxoValue.array([value]) : value
+                let binary = try LuxoBinaryProtocol.encodeRequest(schema: schema, params: ["value": value])
+                XCTAssertNotNil(binary.range(of: try deep.jsonData()))
+            }
+        }
+    }
+
+    func testDateTimeListsPreserveTextAndReportTypedPaths() throws {
+        let schema = APISchema(id: 1, params: [.init(fieldID: 1, name: "value", type: "DateTime", isList: true)])
+        let dates = ["1970-01-01T00:00:00Z", "2026-09-13T00:00:00.123456789Z"]
+        XCTAssertEqual(
+            try object(["value": .array(dates.map(LuxoValue.string))], schema: schema)["value"] as? [String], dates)
+        assertInvalid(["value": .array([.string(dates[0]), .int(1)])], schema: schema, path: "value[1]")
+        assertInvalid(["value": .array([.string(dates[0]), .string("invalid")])], schema: schema, path: "value[1]")
     }
 
     func testSignedBoundariesAreExactWithoutChangingOpaqueValues() throws {
@@ -100,6 +208,9 @@ final class JSONParameterTests: XCTestCase {
         for _ in 0..<140 { value = ["next": value] }
         assertInvalid(["value": value], schema: recursiveSchema(), path: "value.next")
         assertInvalid(["value": .structured(RecursiveProjection())], schema: recursiveSchema(), path: "value")
+        var listAtLimit: LuxoValue = ["children": .array([])]
+        for _ in 0..<127 { listAtLimit = ["next": listAtLimit] }
+        assertInvalid(["value": listAtLimit], schema: recursiveSchema(), path: "value.next")
     }
 
     func testRequestMetadataCannotBeOverriddenInEitherJSONEnvelope() throws {
@@ -135,6 +246,32 @@ final class JSONParameterTests: XCTestCase {
                     "metadata": .init(fieldID: 4, type: "JSON"), "ratio": .init(fieldID: 5, type: "Float"),
                 ]
             ])
+    }
+
+    private func depthSchema(rootList: Bool) -> APISchema {
+        APISchema(
+            id: 1, params: [.init(fieldID: 1, name: "value", type: "Model", typeName: "Input", isList: rootList)],
+            types: [
+                "Input": [
+                    "metadata": .init(fieldID: 1, type: "JSON"),
+                    "documents": .init(fieldID: 2, type: "JSON", isList: true),
+                    "next": .init(fieldID: 3, typeName: "Input", type: "Model", nullable: true),
+                    "children": .init(fieldID: 4, typeName: "Input", type: "Model", isList: true, nullable: true),
+                ]
+            ])
+    }
+
+    private func depthInput(
+        _ layers: Int, lists: Bool, json: Int, projected: Bool, counter: Counter
+    ) -> LuxoValue {
+        var data = JSONValue.string("leaf")
+        for _ in 0..<json { data = .array([data]) }
+        func wrap(_ value: LuxoValue) -> LuxoValue {
+            projected ? .structured(DepthProjection(value: value, counter: counter)) : value
+        }
+        var value = wrap(.object(["metadata": .json(data), "documents": .array([.json(data)]), "children": []]))
+        for _ in 1..<layers { value = wrap(.object([lists ? "children" : "next": lists ? .array([value]) : value])) }
+        return value
     }
 
     private func object(_ params: [String: LuxoValue], schema: APISchema) throws -> [String: Any] {
@@ -173,5 +310,16 @@ final class JSONParameterTests: XCTestCase {
     private struct RecursiveProjection: Encodable, LuxoBinaryEncodable {
         func writeLuxo(to encoder: inout LuxoClient.Encoder) throws { XCTFail("not a binary fixture") }
         func luxoJSONValue() throws -> LuxoValue { .structured(self) }
+    }
+
+    private struct DepthProjection: LuxoBinaryEncodable {
+        let value: LuxoValue
+        let counter: Counter
+        func encode(to encoder: any Swift.Encoder) throws { XCTFail("must use the typed projection") }
+        func writeLuxo(to encoder: inout LuxoClient.Encoder) throws { XCTFail("not a Binary fixture") }
+        func luxoJSONValue() throws -> LuxoValue {
+            counter.count += 1
+            return value
+        }
     }
 }

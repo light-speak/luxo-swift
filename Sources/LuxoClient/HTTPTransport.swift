@@ -16,6 +16,8 @@ public struct HTTPBackendResponse: Sendable {
 }
 
 public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Sendable {
+    private final class CredentialRevision: Sendable {}
+
     private struct HTTPFailure: Error {
         let statusCode: Int
         let error: LuxoError
@@ -25,12 +27,15 @@ public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Se
         let headers: [String: String]
         let mode: TransportMode
         let schema: [String: APISchema]
+        let credentialRevision: CredentialRevision?
     }
 
     /// The concrete backend owns its network lifecycle.
     public let backend: Backend
+    private let timeout: TimeInterval
     private let lock = NSLock()
     private var headers: [String: String] = [:]
+    private var credentialRevision: CredentialRevision?
     private var mode: TransportMode = .json
     private var schema: [String: APISchema] = [:]
     private var tokenExpiredHandler: (() async -> String?)?
@@ -42,13 +47,17 @@ public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Se
         set { lock.withLock { tokenExpiredHandler = newValue } }
     }
 
-    public init(backend: Backend, token: String? = nil) {
+    public init(backend: Backend, token: String? = nil, timeout: TimeInterval = 30) {
+        self.timeout = timeout
         self.backend = backend
         if let token { headers["Authorization"] = "Bearer \(token)" }
     }
 
     public func setToken(_ token: String) {
-        lock.withLock { headers["Authorization"] = "Bearer \(token)" }
+        lock.withLock {
+            credentialRevision = CredentialRevision()
+            headers["Authorization"] = "Bearer \(token)"
+        }
     }
 
     public func setMode(_ mode: TransportMode) {
@@ -69,18 +78,46 @@ public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Se
     }
 
     private func callRequest(_ api: String, params: RequestParameters) async throws -> TransportPayload {
+        guard timeout.isFinite && timeout > 0 else {
+            throw LuxoError(code: 0, message: "timeout must be finite and greater than zero", name: "ConfigError")
+        }
+        let state = lock.withLock {
+            State(headers: headers, mode: mode, schema: schema, credentialRevision: credentialRevision)
+        }
+        let operation = HTTPCallDeadline(parameters: params)
+        return try await operation.run(timeout: timeout) {
+            try operation.prepareRequest { try self.encodeRequest(api, params: $0, state: state) }
+            return try await self.performRequest(api, operation: operation, state: state)
+        }
+    }
+
+    private func performRequest(_ api: String, operation: HTTPCallDeadline, state: State) async throws
+        -> TransportPayload
+    {
         do {
-            return try await doCall(api, params: params)
+            return try await doCall(operation: operation, state: state, responseSchema: state.schema[api]?.response)
         } catch let failure as HTTPFailure {
             let error = failure.error
             guard failure.statusCode == 401, error.code == 401, error.name != "ParseError" else {
                 throw error
             }
-            let refresh = lock.withLock { tokenExpiredHandler }
+            try Task.checkCancellation()
+            let refresh = lock.withLock {
+                credentialRevision === state.credentialRevision ? tokenExpiredHandler : nil
+            }
             if let refresh, let newToken = await refresh() {
-                setToken(newToken)
+                try Task.checkCancellation()
+                let retry = try lock.withLock {
+                    guard credentialRevision === state.credentialRevision else { throw error }
+                    credentialRevision = CredentialRevision()
+                    headers["Authorization"] = "Bearer \(newToken)"
+                    return State(
+                        headers: headers, mode: state.mode, schema: state.schema,
+                        credentialRevision: credentialRevision)
+                }
                 do {
-                    return try await doCall(api, params: params)
+                    return try await doCall(
+                        operation: operation, state: retry, responseSchema: state.schema[api]?.response)
                 } catch let retryFailure as HTTPFailure {
                     throw retryFailure.error
                 }
@@ -89,36 +126,31 @@ public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Se
         }
     }
 
-    private func doCall(_ api: String, params: RequestParameters) async throws -> TransportPayload {
-        let state = lock.withLock {
-            State(headers: headers, mode: mode, schema: schema)
-        }
-        let data: Data
+    private func doCall(operation: HTTPCallDeadline, state: State, responseSchema: LuxoJSONReadSchema?) async throws
+        -> TransportPayload
+    {
+        try Task.checkCancellation()
+        let response = try await backend.send(body: operation.requestBody(), mode: state.mode, headers: state.headers)
         switch state.mode {
         case .json:
-            data = try await jsonCall(
-                api, params: params.json(), headers: state.headers, plan: state.schema[api]?.jsonParameters)
+            return TransportPayload(data: try decodeJSONResponse(response, schema: responseSchema), mode: .json)
         case .binary:
-            data = try await binaryCall(
-                api,
-                params: params,
-                headers: state.headers,
-                schema: state.schema
-            )
+            guard response.status == 200 else {
+                throw HTTPFailure(
+                    statusCode: response.status,
+                    error: LuxoBinaryProtocol.decodeError(response.body, statusCode: response.status))
+            }
+            guard !response.body.isEmpty else {
+                throw LuxoBinaryProtocol.missingResponse(statusCode: response.status)
+            }
+            // Return raw bytes for binary decoding.
+            return TransportPayload(data: response.body, mode: .binary)
         }
-        return TransportPayload(data: data, mode: state.mode)
     }
 
-    private func jsonCall(
-        _ api: String,
-        params: [String: LuxoValue]?,
-        headers: [String: String],
-        plan: JSONParameterPlan?
-    ) async throws -> Data {
-        let body = try LuxoJSONRequest.encode(api: api, params: params, plan: plan)
-        let response = try await backend.send(body: body, mode: .json, headers: headers)
+    private func decodeJSONResponse(_ response: HTTPBackendResponse, schema: LuxoJSONReadSchema?) throws -> Data {
         let data = response.body
-        let envelope = try decodeJSONEnvelope(data, statusCode: response.status)
+        let envelope = try decodeJSONEnvelope(data, statusCode: response.status, schema: schema)
         if response.status != 200 || envelope.fields["error"] != nil {
             throw HTTPFailure(
                 statusCode: response.status,
@@ -130,37 +162,27 @@ public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Se
         return data
     }
 
-    private func decodeJSONEnvelope(_ data: Data, statusCode: Int) throws -> JSONEnvelope {
+    private func decodeJSONEnvelope(_ data: Data, statusCode: Int, schema: LuxoJSONReadSchema?) throws -> JSONEnvelope {
         do {
-            return try JSONEnvelope.decode(data, errorResponse: statusCode != 200)
+            return try JSONEnvelope.decode(
+                data, errorResponse: statusCode != 200, schema: schema, untypedSuccess: schema == nil)
         } catch {
             throw LuxoError(code: statusCode, message: "invalid JSON response", name: "ParseError")
         }
     }
 
-    private func binaryCall(
-        _ api: String,
-        params: RequestParameters,
-        headers: [String: String],
-        schema: [String: APISchema]
-    ) async throws -> Data {
-        guard let apiSchema = schema[api] else {
-            throw LuxoError(
-                code: 0,
-                message: "no schema for API \"\(api)\" — binary mode requires schema",
-                name: "ConfigError"
-            )
+    private func encodeRequest(_ api: String, params: RequestParameters, state: State) throws -> Data {
+        switch state.mode {
+        case .json:
+            return try LuxoJSONRequest.encode(api: api, params: params.json(), plan: state.schema[api]?.jsonParameters)
+        case .binary:
+            guard let apiSchema = state.schema[api] else {
+                throw LuxoError(
+                    code: 0,
+                    message: "no schema for API \"\(api)\" — binary mode requires schema",
+                    name: "ConfigError")
+            }
+            return try params.binary(schema: apiSchema)
         }
-        let body = try params.binary(schema: apiSchema)
-
-        let response = try await backend.send(body: body, mode: .binary, headers: headers)
-        let data = response.body
-        guard response.status == 200 else {
-            throw HTTPFailure(
-                statusCode: response.status,
-                error: LuxoBinaryProtocol.decodeError(data, statusCode: response.status))
-        }
-
-        return data  // Return raw bytes for binary decoding
     }
 }

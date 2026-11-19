@@ -57,9 +57,9 @@ func benchmarkScalarResponses() throws {
         encoder.writeSvarint(value)
         return encoder.data
     }
-    let lists = values.map { value in
+    let lists = try values.map { value in
         var encoder = Encoder()
-        encoder.writeArrayHeader(16)
+        try encoder.writeArrayHeader(16)
         for _ in 0..<16 { encoder.writeSvarint(value) }
         return encoder.data
     }

@@ -123,7 +123,7 @@ public extension HTTPTransport where Backend == NIOHTTPBackend {
             endpoint: endpoint, timeout: timeout,
             maxResponseBytes: maxResponseBytes, maxRequestBytes: maxRequestBytes,
             maximumConcurrent: maximumConcurrent, trustRootsFile: trustRootsFile)
-        return NIOHTTPTransport(backend: backend, token: token)
+        return NIOHTTPTransport(backend: backend, token: token, timeout: timeout)
     }
 
     func close() async throws { try await backend.close() }

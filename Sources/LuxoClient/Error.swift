@@ -63,6 +63,7 @@ public struct LuxoError: LocalizedError, @unchecked Sendable {
         let traceId = rawTrace as? String
         let cause = rawCause as? String
         guard let rawCode, let code = jsonCode(rawCode),
+            !requireFields || (400...599).contains(code),
             let name = rawName as? String, let message = rawMessage as? String,
             traceId != nil || isMissingOrNull(rawTrace), cause != nil || isMissingOrNull(rawCause)
         else {
@@ -122,6 +123,7 @@ extension LuxoBinaryProtocol {
         if !ended { return binaryParseError(statusCode, "missing end marker") }
         if decoder.remaining != 0 { return binaryParseError(statusCode, "trailing bytes") }
         if seen & 0b1110 != 0b1110 { return binaryParseError(statusCode, "missing required fields") }
+        if !(400...599).contains(fields.code) { return binaryParseError(statusCode, "invalid error status") }
         return fields.finish()
     }
 
@@ -157,7 +159,7 @@ private struct BinaryErrorFields {
         case .traceId: traceId = decoder.readString()
         case .data:
             do {
-                data = try LuxoValue.decodeJSONData(decoder.readBytes()).foundationValue()
+                data = try LuxoValue.decodeJSONData(decoder.readBytes(), allowDocumentBOM: false).foundationValue()
             } catch {
                 return "invalid JSON data"
             }

@@ -84,13 +84,62 @@ func verifyScalarResponses() async throws {
     try await verifyRejectedResponse(
         Data([1, 0xff]), read: { try await $0.readString() },
         watch: { try await $0.subscribeWatchString(handler: $1) })
-    try await verifyRejectedResponse(
-        scalarText("{"), read: { try await $0.readJSON() },
-        watch: { try await $0.subscribeWatchJSON(handler: $1) })
-    try await verifyRejectedResponse(
-        Data([1]) + scalarText("{"), read: { try await $0.readJSONList() },
-        watch: { try await $0.subscribeWatchJSONList(handler: $1) })
+    try await verifyBinaryJSONValueBoundaries()
     print("44 generated scalar/list call/stream methods passed JSON/Binary and malformed-response checks")
+}
+
+private func verifyBinaryJSONValueBoundaries() async throws {
+    try await verifyJSONContainerDepth()
+    for text in ["{", "\u{feff}null", "\u{feff}42", "\u{feff}{}", "\u{feff}[]"] {
+        try await verifyRejectedResponse(
+            scalarText(text), read: { try await $0.readJSON() },
+            watch: { try await $0.subscribeWatchJSON(handler: $1) })
+        try await verifyRejectedResponse(
+            Data([1]) + scalarText(text), read: { try await $0.readJSONList() },
+            watch: { try await $0.subscribeWatchJSONList(handler: $1) })
+    }
+    try await verifyScalar(
+        JSONValue.string("\u{feff}text"), wire: scalarText("\"\u{feff}text\""),
+        read: { try await $0.readJSON() }, readList: { try await $0.readJSONList() },
+        watch: { try await $0.subscribeWatchJSON(handler: $1) },
+        watchList: { try await $0.subscribeWatchJSONList(handler: $1) })
+}
+
+private func verifyJSONContainerDepth() async throws {
+    for depth in 127...129 {
+        for empty in [false, true] {
+            let count = depth - (empty ? 1 : 0)
+            let raw =
+                String(repeating: "[", count: count) + (empty ? "[]" : "0")
+                + String(repeating: "]", count: count)
+            var encoder = Encoder()
+            encoder.writeString(raw)
+            if depth > 128 {
+                try await verifyRejectedResponse(
+                    encoder.data, read: { try await $0.readJSON() },
+                    watch: { try await $0.subscribeWatchJSON(handler: $1) })
+                try await verifyRejectedResponse(
+                    Data([1]) + encoder.data, read: { try await $0.readJSONList() },
+                    watch: { try await $0.subscribeWatchJSONList(handler: $1) })
+                try await verifyRejectedResponse(
+                    Data(raw.utf8), binary: false, read: { try await $0.readJSON() },
+                    watch: { try await $0.subscribeWatchJSON(handler: $1) })
+            } else {
+                let expected = try JSONValue.parseBinary(Data(raw.utf8))
+                try await verifyReply(
+                    expected, wire: encoder.data, read: { try await $0.readJSON() },
+                    watch: { try await $0.subscribeWatchJSON(handler: $1) })
+                let client = try scalarClient(Data([1]) + encoder.data, binary: true)
+                guard try await client.readJSONList() == [expected] else {
+                    throw scalarFailure("JSON list depth changed")
+                }
+                let received = ScalarReceiver<[JSONValue]>()
+                let cancel = try await client.subscribeWatchJSONList { received.append($0) }
+                cancel()
+                guard received.values == [[expected]] else { throw scalarFailure("JSON list stream depth changed") }
+            }
+        }
+    }
 }
 
 private func verifyDecoderErrorNames() throws {

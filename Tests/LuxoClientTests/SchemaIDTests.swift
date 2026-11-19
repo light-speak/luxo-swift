@@ -7,6 +7,88 @@ import XCTest
 #endif
 
 final class SchemaIDTests: XCTestCase {
+    func testRuntimeRegistrationRejectsDuplicateParameterNamesWithDistinctIDs() throws {
+        let transports: [any Transport] = [
+            try URLSessionTransport(endpoint: "https://example.com/luvia"),
+            try WebSocketTransport(url: "wss://example.com/socket"),
+        ]
+        for transport in transports {
+            for name in ["value", "__proto__", "用户"] {
+                let first = APISchema.ParamSchema(fieldID: 1, name: name, type: "Int")
+                let second = APISchema.ParamSchema(fieldID: 2, name: name, type: "Int")
+                XCTAssertThrowsError(try transport.setSchema(["read": APISchema(id: 1, params: [first, second])])) {
+                    error in
+                    XCTAssertEqual((error as? LuxoError)?.name, "ConfigError")
+                    XCTAssertTrue((error as? LuxoError)?.message.contains("duplicate name") == true)
+                }
+                XCTAssertNoThrow(
+                    try transport.setSchema([
+                        "read": APISchema(id: 1, params: [first]), "other": APISchema(id: 2, params: [first]),
+                    ]))
+            }
+        }
+    }
+
+    func testDuplicateParameterNamesKeepPreviousHTTPRegistration() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let transport = HTTPTransport(backend: RegistrationBackend())
+            transport.setMode(mode)
+            try transport.setSchema(["read": APISchema(id: 1, params: [.init(fieldID: 1, name: "value", type: "Int")])])
+            XCTAssertThrowsError(
+                try transport.setSchema([
+                    "read": APISchema(
+                        id: 9,
+                        params: [
+                            .init(fieldID: 1, name: "value", type: "Int"),
+                            .init(fieldID: 2, name: "value", type: "Int"),
+                        ])
+                ]))
+            let response = try await transport.call("read", params: ["value": .int(7)])
+            XCTAssertEqual(response.data, mode == .binary ? Data([1]) : Data("true".utf8))
+        }
+    }
+
+    private struct RegistrationBackend: HTTPBackend {
+        func send(body: Data, mode: TransportMode, headers: [String: String]) async throws -> HTTPBackendResponse {
+            if mode == .binary {
+                XCTAssertEqual(Array(body), [1, 0, 1, 14, 0])
+                return HTTPBackendResponse(status: 200, body: Data([1]))
+            }
+            XCTAssertEqual(String(data: body, encoding: .utf8), #"{"$api":"read","value":7}"#)
+            return HTTPBackendResponse(status: 200, body: Data(#"{"data":true}"#.utf8))
+        }
+    }
+
+    func testPaginationRequiresStableParameterDirectory() throws {
+        for missing in ["page", "pageSize"] {
+            let other = missing == "page" ? "pageSize" : "page"
+            let data = Data(
+                """
+                {"models":{},"apis":{"browse":{"id":1,"name":"browse","module":"test","paginated":true,
+                "params":[{"id":7,"name":"\(other)","type":"Int"}]}}}
+                """.utf8)
+            let schema = try JSONDecoder().decode(LuxoSchema.self, from: data)
+            XCTAssertThrowsError(try schema.validateIDs())
+        }
+    }
+
+    func testPaginationRejectsMalformedParameterShapes() throws {
+        for invalid in [
+            #"{"id":7,"name":"page","type":"String"}"#,
+            #"{"id":7,"name":"page","type":"Int","nullable":true}"#,
+            #"{"id":7,"name":"page","type":"Int","isList":true}"#,
+            #"{"id":7,"name":"page","type":"Int"},{"id":8,"name":"page","type":"Int"}"#,
+        ] {
+            let data = Data(
+                """
+                {"models":{},"apis":{"browse":{"id":1,"name":"browse","module":"test","paginated":true,
+                "params":[\(invalid),{"id":9,"name":"pageSize","type":"Int"}]}}}
+                """.utf8)
+            let schema = try JSONDecoder().decode(LuxoSchema.self, from: data)
+            XCTAssertThrowsError(try schema.validateIDs())
+        }
+    }
+
     func testRuntimeRegistrationRejectsInvalidIDs() throws {
         let transports: [any Transport] = [
             try URLSessionTransport(endpoint: "https://example.com/luvia"),

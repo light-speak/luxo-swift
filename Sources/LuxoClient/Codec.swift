@@ -8,7 +8,7 @@ private enum CodecLimits {
 
 // MARK: - Encoder
 
-/// Binary encoder for Luxo protocol. Zero-copy, varint-based.
+/// Binary encoder for the statically typed Luxo wire format.
 public struct Encoder {
     public private(set) var data = Data()
 
@@ -59,6 +59,11 @@ public struct Encoder {
     }
 
     public mutating func writeDateTime(_ value: String) throws {
+        writeDateTime(try dateTimeParts(value))
+    }
+
+    /// Encode a native Date after validating its seconds and nanoseconds.
+    public mutating func writeDateTime(_ value: Date) throws {
         writeDateTime(try dateTimeParts(value))
     }
 
@@ -131,99 +136,13 @@ public struct Encoder {
     }
 
     /// Write the array header (varint element count).
-    public mutating func writeArrayHeader(_ count: Int) {
+    public mutating func writeArrayHeader(_ count: Int) throws {
+        guard count >= 0, count <= Int(CodecLimits.maxArrayElements) else {
+            throw LuxoError(code: 0, message: "invalid array count", name: "ConfigError")
+        }
         writeVarint(UInt64(count))
     }
 
-    public mutating func writeField(_ fieldID: Int, value: Any, type: String) throws {
-        var encoded = Encoder()
-        try encoded.writeValue(value, type: type)
-        writeVarint(UInt64(fieldID))
-        writeRawBytes(encoded.data)
-    }
-
-    /// Write a list param field: [fieldID][varint count][item0][item1]...
-    /// Each item is encoded by its element type (no per-item field ID).
-    public mutating func writeFieldList(_ fieldID: Int, values: [Any], type: String) throws {
-        var encoded = Encoder()
-        encoded.writeArrayHeader(values.count)
-        for value in values {
-            try encoded.writeValue(value, type: type)
-        }
-        writeVarint(UInt64(fieldID))
-        writeRawBytes(encoded.data)
-    }
-
-    private mutating func writeValue(_ value: Any, type: String) throws {
-        switch type {
-        case "Int", "Duration":
-            if let value = value as? Int64 {
-                writeSvarint(value)
-            } else if let value = value as? Int {
-                writeSvarint(Int64(value))
-            } else {
-                throw invalidValue(type)
-            }
-        case "Float":
-            if let value = value as? Double {
-                try writeFixed64(value)
-            } else if let value = value as? Float {
-                try writeFixed64(Double(value))
-            } else {
-                throw invalidValue(type)
-            }
-        case "Boolean":
-            guard let value = value as? Bool else { throw invalidValue(type) }
-            writeBool(value)
-        case "UUID":
-            if let value = value as? UUID {
-                writeUUID(value)
-            } else if let value = value as? String, let uuid = UUID(uuidString: value) {
-                writeUUID(uuid)
-            } else {
-                throw invalidValue(type)
-            }
-        case "String", "Enum", "Decimal":
-            guard let value = value as? String else { throw invalidValue(type) }
-            writeString(value)
-        case "DateTime":
-            if let value = value as? Date {
-                writeDateTime(try dateTimeParts(value))
-            } else if let value = value as? String {
-                try writeDateTime(value)
-            } else if let value = value as? Int64 {
-                guard validDateTimeSeconds(value) else { throw invalidValue(type) }
-                writeDateTime(DateTimeParts(seconds: value, nanoseconds: 0))
-            } else {
-                throw invalidValue(type)
-            }
-        case "Bytes":
-            guard let value = value as? Data else { throw invalidValue(type) }
-            writeBytes(value)
-        case "JSON":
-            if let value = value as? JSONValue {
-                try writeJSON(value)
-            } else {
-                guard
-                    JSONSerialization.isValidJSONObject(value) || value is String || value is NSNumber
-                        || value is NSNull
-                else {
-                    throw invalidValue(type)
-                }
-                let encoded = try JSONSerialization.data(
-                    withJSONObject: value,
-                    options: [.fragmentsAllowed, .sortedKeys]
-                )
-                writeBytes(encoded)
-            }
-        default:
-            throw LuxoError(code: 0, message: "unsupported binary type: \(type)", name: "ConfigError")
-        }
-    }
-
-    private func invalidValue(_ type: String) -> LuxoError {
-        LuxoError(code: 0, message: "invalid \(type) value", name: "ConfigError")
-    }
 }
 
 // MARK: - Decoder
@@ -323,7 +242,7 @@ public struct Decoder {
             if error == nil { error = "truncated string at offset \(offset)" }
             return ""
         }
-        guard let str = String(data: data[offset..<offset + len], encoding: .utf8) else {
+        guard let str = strictUTF8String(data[offset..<offset + len]) else {
             if error == nil { error = "invalid UTF-8 string at offset \(offset)" }
             return ""
         }
@@ -836,7 +755,7 @@ public struct ColumnarDecoder {
     private mutating func readStringValue(_ context: @autoclosure () -> String) -> String? {
         let start = off
         guard let bytes = readBytesValue(context()) else { return nil }
-        guard let value = String(data: bytes, encoding: .utf8) else {
+        guard let value = strictUTF8String(bytes) else {
             fail("invalid UTF-8 in \(context()) at offset \(start)")
             return nil
         }

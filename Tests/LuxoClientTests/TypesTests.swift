@@ -2,6 +2,90 @@ import XCTest
 @testable import LuxoClient
 
 final class TypesTests: XCTestCase {
+    func testSchemaEnumValuesRejectNonStringMembers() throws {
+        for value in ["null", "false", "true", "0", "7", "[]", "{}"] {
+            XCTAssertThrowsError(
+                try JSONDecoder().decode(LuxoEnum.self, from: Data(#"{"name":"State","values":[\#(value)]}"#.utf8)))
+        }
+        let valid = try JSONDecoder().decode(
+            LuxoEnum.self, from: Data(#"{"name":"State","values":["READY","0"]}"#.utf8))
+        XCTAssertEqual(valid.values, ["READY", "0"])
+    }
+
+    func testSchemaMemberStringsRejectMalformedValues() {
+        for target in ["model", "type", "param"] {
+            func document(_ field: String) -> Data {
+                let body: String
+                switch target {
+                case "model":
+                    body = #"{"models":{"Payload":{"name":"Payload","fields":[\#(field)]}},"apis":{}}"#
+                case "type":
+                    body = #"{"models":{},"types":{"Input":{"name":"Input","fields":[\#(field)]}},"apis":{}}"#
+                default:
+                    body = #"{"models":{},"apis":{"read":{"id":1,"name":"read","module":"test","params":[\#(field)]}}}"#
+                }
+                return Data(body.utf8)
+            }
+            XCTAssertNoThrow(
+                try JSONDecoder().decode(LuxoSchema.self, from: document(#"{"id":1,"name":"value","type":"String"}"#)))
+            for member in ["name", "type", "typeName"] {
+                let values =
+                    member == "typeName"
+                    ? ["false", "true", "0", "7", "[]", "{}"]
+                    : ["missing", "null", "false", "true", "0", "7", "[]", "{}"]
+                for value in values {
+                    var properties = [#""id":1"#]
+                    if member != "name" { properties.append(#""name":"value""#) }
+                    if member != "type" { properties.append(#""type":"String""#) }
+                    if value != "missing" { properties.append(#""\#(member)":\#(value)"#) }
+                    let field = "{\(properties.joined(separator: ","))}"
+                    XCTAssertThrowsError(
+                        try JSONDecoder().decode(LuxoSchema.self, from: document(field)), "\(target).\(member)=\(value)"
+                    )
+                }
+            }
+            XCTAssertNoThrow(
+                try JSONDecoder().decode(
+                    LuxoSchema.self, from: document(#"{"id":1,"name":"value","type":"String","typeName":null}"#)))
+        }
+    }
+
+    func testSchemaFlagsRejectNonBooleanMetadata() {
+        let groups: [(flags: [String], decode: (Data) throws -> Void)] = [
+            (
+                ["internal", "returnList", "returnNullable", "paginated", "stream"],
+                {
+                    _ = try JSONDecoder().decode(LuxoAPI.self, from: $0)
+                }
+            ),
+            (
+                ["nullable", "isList", "relation"],
+                {
+                    _ = try JSONDecoder().decode(LuxoField.self, from: $0)
+                }
+            ),
+            (
+                ["nullable", "isList", "hasDefault"],
+                {
+                    _ = try JSONDecoder().decode(LuxoParam.self, from: $0)
+                }
+            ),
+        ]
+        for group in groups {
+            for flag in group.flags {
+                for value in ["true", "false", #""true""#, #""false""#, "0", "1", "[]", "{}"] {
+                    let json =
+                        "{\"id\":1,\"name\":\"value\",\"type\":\"String\",\"module\":\"test\",\"\(flag)\":\(value)}"
+                    if value == "true" || value == "false" {
+                        XCTAssertNoThrow(try group.decode(Data(json.utf8)), "\(flag)=\(value)")
+                    } else {
+                        XCTAssertThrowsError(try group.decode(Data(json.utf8)), "\(flag)=\(value)")
+                    }
+                }
+            }
+        }
+    }
+
     func testComputedSourceMetadataRoundTrips() throws {
         let input = #"""
             {"name":"User","fields":[{"id":1,"name":"postCount","type":"Int"}],
@@ -86,6 +170,9 @@ final class TypesTests: XCTestCase {
             let converted = try LuxoValue(finiteFloat: value)
             guard case .float(let number) = converted else { return XCTFail("expected Float") }
             XCTAssertEqual(number.bitPattern, value.bitPattern)
+            let encoded = try converted.jsonData()
+            let decoded = try LuxoJSONDecoder().decode(Double.self, from: encoded)
+            XCTAssertEqual(decoded.bitPattern, value.bitPattern)
         }
         for value in [Double.nan, .infinity, -.infinity] {
             XCTAssertThrowsError(try LuxoValue(finiteFloat: value)) { error in

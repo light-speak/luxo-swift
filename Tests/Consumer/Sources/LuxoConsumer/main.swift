@@ -19,7 +19,8 @@ struct LuxoConsumer {
         try transport.setSchema(["getUser": APISchema(id: 1)])
 
         var encoder = Encoder()
-        try encoder.writeField(1, value: 7, type: "Int")
+        encoder.writeVarint(1)
+        encoder.writeSvarint(7)
 
         let fields = FieldNode.root()
         fields.addChild("name")

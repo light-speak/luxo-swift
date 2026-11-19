@@ -3,45 +3,134 @@ import XCTest
 @testable import LuxoClient
 
 final class WebSocketTerminalTests: XCTestCase {
-    func testMalformedJSONFailsPendingCallsAcknowledgementsAndObservers() async throws {
+    func testInvalidErrorStatusOnlyEndsItsOwnSubscription() async throws {
         for mode in [TransportMode.json, .binary] {
             let (transport, socket) = try fixture(mode)
             defer { transport.close() }
-            let ended = expectation(description: "all established subscriptions fail")
-            ended.expectedFulfillmentCount = 2
-            let observer = StreamObserver(
-                onComplete: { XCTFail("parse failure is not completion") },
-                onError: { error in
-                    XCTAssertEqual(error.name, "ParseError"); ended.fulfill()
+            let failed = TerminalValues(), peer = TerminalValues()
+            let cancel = try await transport.subscribe("watch", decoder: { $0 }, observer: failed.observer) {
+                failed.append($0.data)
+            }
+            let cancelPeer = try await transport.subscribe("watch", decoder: { $0 }, observer: peer.observer) {
+                peer.append($0.data)
+            }
+            socket.deliver(.success(try failure(mode, 1, code: 0)))
+            socket.deliver(.success(try failure(mode, 1, code: 0)))
+            socket.deliver(.success(data(mode, 2, 7)))
+            XCTAssertEqual(failed.errors.map(\.name), ["ParseError"])
+            XCTAssertEqual(failed.completed, 0)
+            XCTAssertTrue(failed.rows.isEmpty)
+            XCTAssertEqual(peer.rows.count, 1)
+            XCTAssertTrue(peer.errors.isEmpty)
+            cancel()
+            cancelPeer()
+        }
+    }
+
+    func testExpiredAccessRejectsOldWorkAndDoesNotReconnectExpiredCredential() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let (transport, socket) = try fixture(mode)
+            defer { transport.close() }
+            let ended = expectation(description: "expired subscription")
+            let cancel = try await transport.subscribe(
+                "watch", decoder: { $0 },
+                observer: StreamObserver(onError: { error in
+                    XCTAssertEqual(error.code, 401)
+                    XCTAssertEqual(error.name, "Unauthorized")
+                    ended.fulfill()
                 })
-            let first = try await transport.subscribe("watch", decoder: { $0 }, observer: observer) { _ in
-                XCTFail("bad data")
-            }
-            let second = try await transport.subscribe("watch", decoder: { $0 }, observer: observer) { _ in
-                XCTFail("bad data")
-            }
-            let sent = expectation(description: "call and pending acknowledgement sent")
-            sent.expectedFulfillmentCount = 2
+            ) { _ in XCTFail("expired data") }
+            let sent = expectation(description: "pending call")
             socket.onSend = { _ in sent.fulfill() }
             let call = Task { try await transport.call("watch") }
-            let setup = Task {
-                try await transport.subscribe("watch", decoder: { $0 }, observer: observer) { _ in XCTFail("bad data") }
-            }
             await fulfillment(of: [sent], timeout: 1)
             socket.onSend = nil
-            socket.deliver(.success(.string(#"{"$id":3,"data":"#)))
-            do { _ = try await call.value; XCTFail("expected ParseError") } catch let error as LuxoError {
-                XCTAssertEqual(error.name, "ParseError")
-            }
-            do { _ = try await setup.value; XCTFail("expected ParseError") } catch let error as LuxoError {
-                XCTAssertEqual(error.name, "ParseError")
+            socket.expireAccess()
+            do { _ = try await call.value; XCTFail("expected expiry") } catch let error as LuxoError {
+                XCTAssertEqual(error.code, 401)
             }
             await fulfillment(of: [ended], timeout: 1)
-            XCTAssertEqual(socket.cancelCode, .goingAway)
-            socket.deliver(.failure(URLError(.networkConnectionLost)))
-            first(); second()
-            XCTAssertEqual(socket.sentMessages.count, 4)
+            transport.connect()
+            do { _ = try await transport.call("watch"); XCTFail("expired token must not reconnect") } catch let error
+                as LuxoError
+            { XCTAssertEqual(error.code, 401) }
+            cancel()
+            XCTAssertEqual(socket.sentMessages.count, 2)
         }
+    }
+
+    func testExplicitNewAccessCanReconnectWithoutRestoringExpiredWork() async throws {
+        let old = MockWebSocketTask(), fresh = MockWebSocketTask()
+        let session = MockWebSocketSession(sockets: [old, fresh])
+        let transport = try WebSocketTransport(url: "ws://localhost/test", token: "old", session: session)
+        defer { transport.close() }
+        transport.connect()
+        old.expireAccess()
+        transport.setToken("new")
+        transport.connect()
+        XCTAssertEqual(session.lastRequest?.value(forHTTPHeaderField: "Authorization"), "Bearer new")
+        XCTAssertTrue(fresh.sentMessages.isEmpty)
+        old.expireAccess()
+        fresh.onSend = { [weak fresh] _ in fresh?.deliver(.success(.string(#"{"$id":1,"data":42}"#))) }
+        let response = try await transport.call("echo")
+        XCTAssertEqual(response.data, Data("42".utf8))
+        XCTAssertEqual(fresh.sentMessages.count, 1)
+    }
+
+    func testMalformedJSONFailsPendingCallsAcknowledgementsAndObservers() async throws {
+        for mode in [TransportMode.json, .binary] {
+            try await verifyMalformedMessage(mode, message: .string(#"{"$id":3,"data":"#))
+        }
+    }
+
+    func testMalformedBinaryFailsPendingCallsAcknowledgementsAndObservers() async throws {
+        for mode in [TransportMode.json, .binary] {
+            for data in [
+                Data(), Data([2]), Data([2, 128]), Data([2]) + Data(repeating: 128, count: 9) + Data([2]),
+                Data([0x82, 0, 1]), Data([0xff, 1]), Data([0x15, 128]),
+            ] {
+                try await verifyMalformedMessage(mode, message: .data(data))
+            }
+        }
+    }
+
+    private func verifyMalformedMessage(_ mode: TransportMode, message: URLSessionWebSocketTask.Message) async throws {
+        let (transport, socket) = try fixture(mode)
+        defer { transport.close() }
+        let ended = expectation(description: "all established subscriptions fail")
+        ended.expectedFulfillmentCount = 2
+        let observer = StreamObserver(
+            onComplete: { XCTFail("parse failure is not completion") },
+            onError: { error in
+                XCTAssertEqual(error.name, "ParseError"); ended.fulfill()
+            })
+        let first = try await transport.subscribe("watch", decoder: { $0 }, observer: observer) { _ in
+            XCTFail("bad data")
+        }
+        let second = try await transport.subscribe("watch", decoder: { $0 }, observer: observer) { _ in
+            XCTFail("bad data")
+        }
+        let sent = expectation(description: "call and pending acknowledgement sent")
+        sent.expectedFulfillmentCount = 2
+        socket.onSend = { _ in sent.fulfill() }
+        let call = Task { try await transport.call("watch") }
+        let setup = Task {
+            try await transport.subscribe("watch", decoder: { $0 }, observer: observer) { _ in XCTFail("bad data") }
+        }
+        await fulfillment(of: [sent], timeout: 1)
+        socket.onSend = nil
+        socket.deliver(.success(message))
+        do { _ = try await call.value; XCTFail("expected ParseError") } catch let error as LuxoError {
+            XCTAssertEqual(error.name, "ParseError")
+        }
+        do { _ = try await setup.value; XCTFail("expected ParseError") } catch let error as LuxoError {
+            XCTAssertEqual(error.name, "ParseError")
+        }
+        await fulfillment(of: [ended], timeout: 1)
+        XCTAssertEqual(socket.cancelCode, .goingAway)
+        socket.deliver(.failure(URLError(.networkConnectionLost)))
+        first(); second()
+        XCTAssertEqual(socket.sentMessages.count, 4)
     }
 
     func testMalformedJSONNotifiesOutsideLocksAndNeverReplaysOldSubscriptions() async throws {
@@ -322,23 +411,49 @@ final class WebSocketTerminalTests: XCTestCase {
         }
     }
 
-    func testUnknownAndTruncatedBinaryFramesCannotTerminate() async throws {
+    func testValidRetiredBinaryFramesDoNotTerminate() async throws {
         let (transport, socket) = try fixture(.binary)
         defer { transport.close() }
         let values = TerminalValues()
         _ = try await transport.subscribe("watch", decoder: { $0 }, observer: values.observer) {
             values.append($0.data)
         }
-        for bytes in [
-            Data(), Data([0x15]), Data([0x95, 0, 1]), Data([0x15]) + Data(repeating: 0xff, count: 10),
-            frame(0x15, 2), frame(0x17, 1),
-        ] {
-            socket.deliver(.success(.data(bytes)))
-        }
+        socket.deliver(.success(.data(frame(0x15, 2))))
         XCTAssertEqual(values.completed, 0)
         XCTAssertTrue(values.errors.isEmpty)
         socket.deliver(.success(completion(.binary, 1)))
         XCTAssertEqual(values.completed, 1)
+    }
+
+    func testCorrelatedBinaryAcknowledgementPayloadOnlyFailsItsSubscription() async throws {
+        let (transport, socket) = try fixture(.binary)
+        defer { transport.close() }
+        let peer = TerminalValues()
+        socket.onSend = { [weak socket] message in
+            guard case .data(let data) = message else { return }
+            var decoder = Decoder(data)
+            let type = decoder.readVarint(), id = decoder.readVarint()
+            var response = Encoder()
+            response.writeVarint(type == 0x10 ? 0x13 : 2)
+            response.writeVarint(id)
+            if id == 1 || type == 1 { response.writeRawBytes(Data([42])) }
+            socket?.deliver(.success(.data(response.data)))
+        }
+        do {
+            _ = try await transport.subscribe("watch", decoder: { $0 }) { _ in XCTFail("bad ACK delivered data") }
+            XCTFail("malformed ACK succeeded")
+        } catch let error as LuxoError { XCTAssertEqual(error.name, "ParseError") }
+        let cancel = try await transport.subscribe("watch", decoder: { $0 }, observer: peer.observer) {
+            peer.append($0.data)
+        }
+        socket.deliver(.success(.data(frame(0x13, 99, Data([42])))))
+        socket.deliver(.success(data(.binary, 2, 7)))
+        XCTAssertEqual(peer.rows, [Data([7])])
+        XCTAssertTrue(peer.errors.isEmpty)
+        let result = try await transport.call("watch")
+        XCTAssertEqual(result.data, Data([42]))
+        XCTAssertNil(socket.cancelCode)
+        cancel()
     }
 
     func testExplicitCancellationAndAbsentObserversRemainSilent() async throws {
@@ -442,17 +557,17 @@ final class WebSocketTerminalTests: XCTestCase {
         mode == .json ? .string("{\"$end\":\(id),\"ok\":true}") : .data(frame(0x15, id))
     }
 
-    private func failure(_ mode: TransportMode, _ id: UInt64, acknowledgement: Bool = false) throws
+    private func failure(_ mode: TransportMode, _ id: UInt64, acknowledgement: Bool = false, code: Int64 = 409) throws
         -> URLSessionWebSocketTask.Message
     {
         let json = #"{"n":123456789012345678901234567890,"fraction":1.2345678901234567890123456789,"zero":-0}"#
         if mode == .json {
             return .string(
-                "{\"$\(acknowledgement ? "sub" : "end")\":\(id),\"data\":\(json),\"error\":\"Rejected\",\"code\":409,\"message\":\"no\",\"traceId\":\"trace\",\"cause\":\"details\"}"
+                "{\"$\(acknowledgement ? "sub" : "end")\":\(id),\"data\":\(json),\"error\":\"Rejected\",\"code\":\(code),\"message\":\"no\",\"traceId\":\"trace\",\"cause\":\"details\"}"
             )
         }
         var encoder = Encoder()
-        encoder.writeVarint(1); encoder.writeSvarint(409)
+        encoder.writeVarint(1); encoder.writeSvarint(code)
         encoder.writeVarint(2); encoder.writeString("Rejected")
         encoder.writeVarint(3); encoder.writeString("no")
         encoder.writeVarint(4); encoder.writeString("trace")

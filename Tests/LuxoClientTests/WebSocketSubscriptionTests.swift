@@ -3,6 +3,112 @@ import XCTest
 @testable import LuxoClient
 
 final class WebSocketSubscriptionTests: XCTestCase {
+    private struct ReentrantRequest: GeneratedRequest {
+        let apiID = 77
+        let encode: @Sendable () throws -> Void
+        func writeParameters(to encoder: inout Encoder) throws { try encode() }
+        func toJSONParameters() throws -> [String: LuxoValue] { try encode(); return [:] }
+    }
+
+    func testGeneratedUnaryCancellationDuringEncodingDoesNotSend() async throws {
+        try await verifyEncodingRetirement(subscription: false, close: false)
+    }
+
+    func testGeneratedSubscriptionCancellationDuringEncodingDoesNotSend() async throws {
+        try await verifyEncodingRetirement(subscription: true, close: false)
+    }
+
+    func testGeneratedUnaryCloseDuringEncodingDoesNotSend() async throws {
+        try await verifyEncodingRetirement(subscription: false, close: true)
+    }
+
+    func testGeneratedSubscriptionCloseDuringEncodingDoesNotSend() async throws {
+        try await verifyEncodingRetirement(subscription: true, close: true)
+    }
+
+    private func verifyEncodingRetirement(subscription: Bool, close: Bool) async throws {
+        for mode in [TransportMode.json, .binary] {
+            let socket = MockWebSocketTask()
+            let transport = try makeTransport(socket, mode: mode)
+            defer { transport.close() }
+            let request = ReentrantRequest {
+                if close { transport.close() } else { withUnsafeCurrentTask { $0?.cancel() } }
+            }
+            let operation = Task {
+                if subscription {
+                    _ = try await transport.subscribe("watch", decoder: { $0 }, request: request, observer: nil) { _ in
+                        XCTFail("retired handler ran")
+                    }
+                } else {
+                    _ = try await transport.call("watch", request: request)
+                }
+            }
+            do { try await operation.value; XCTFail("retired encoding succeeded") } catch is CancellationError {
+                XCTAssertFalse(close)
+            } catch let error as LuxoError { XCTAssertTrue(close); XCTAssertEqual(error.name, "ConnectionError") }
+            XCTAssertTrue(socket.sentMessages.isEmpty)
+            if close { continue }
+            XCTAssertNil(socket.cancelCode)
+            socket.onSend = { [weak socket] _ in
+                socket?.deliver(.success(mode == .json ? .string("{\"$id\":2,\"data\":42}") : .data(Data([2, 2, 84]))))
+            }
+            let next = try await transport.call("watch")
+            XCTAssertEqual(next.mode, mode)
+            XCTAssertEqual(socket.sentMessages.count, 1)
+        }
+    }
+
+    func testEncodingReconnectRejectsAReusedSocketIdentity() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let socket = MockWebSocketTask()
+            let transport = try makeTransport(socket, mode: mode)
+            defer { transport.close() }
+            let request = ReentrantRequest { transport.connect() }
+            do {
+                _ = try await transport.call("watch", request: request); XCTFail("stale connection accepted")
+            } catch let error as LuxoError { XCTAssertEqual(error.name, "ConnectionError") }
+            XCTAssertTrue(socket.sentMessages.isEmpty)
+        }
+    }
+
+    func testEncodingRetainsItsModeAndSchemaSnapshot() async throws {
+        for mode in [TransportMode.json, .binary] {
+            for subscription in [false, true] {
+                let socket = MockWebSocketTask()
+                let transport = try makeTransport(socket, mode: mode)
+                defer { transport.close() }
+                let request = ReentrantRequest {
+                    transport.setMode(mode == .json ? .binary : .json)
+                    try transport.setSchema(["watch": APISchema(id: 88)])
+                }
+                let response: URLSessionWebSocketTask.Message =
+                    mode == .json
+                    ? .string(subscription ? "{\"$sub\":1,\"ok\":true}" : "{\"$id\":1,\"data\":42}")
+                    : .data(Data(subscription ? [0x13, 1] : [2, 1, 84]))
+                socket.onSend = { [weak socket] message in
+                    if case .string(let text) = message, text.contains("$unsub") { return }
+                    if case .data(let bytes) = message, bytes.first == 0x11 { return }
+                    socket?.deliver(.success(response))
+                }
+                if subscription {
+                    let stop = try await transport.subscribe("watch", decoder: { $0 }, request: request, observer: nil)
+                    { _ in }
+                    stop()
+                } else {
+                    let result = try await transport.call("watch", request: request)
+                    XCTAssertEqual(result.mode, mode)
+                }
+                if mode == .binary, case .data(let body) = socket.sentMessages[0] {
+                    XCTAssertEqual(body, Data([subscription ? 0x10 : 1, 1, 77, 0, 0]))
+                } else if case .string = socket.sentMessages[0] {
+                    XCTAssertEqual(mode, .json)
+                } else {
+                    XCTFail("request mode changed while encoding")
+                }
+            }
+        }
+    }
+
     func testCompletionBeforeAcknowledgementRejectsEstablishment() async throws {
         for mode in [TransportMode.json, .binary] {
             let socket = MockWebSocketTask()
@@ -146,6 +252,65 @@ final class WebSocketSubscriptionTests: XCTestCase {
                 XCTAssertEqual(error.name, "RequestIDExhausted")
             }
         }
+    }
+
+    func testFailedCancellationWritePreservesTimeoutAndOtherSubscription() async throws {
+        for mode in [TransportMode.json, .binary] {
+            try await verifyFailedCancellationWrite(mode: mode, cancelCaller: false)
+        }
+    }
+
+    func testFailedCancellationWritePreservesCallerCancellation() async throws {
+        for mode in [TransportMode.json, .binary] {
+            try await verifyFailedCancellationWrite(mode: mode, cancelCaller: true)
+        }
+    }
+
+    private func verifyFailedCancellationWrite(mode: TransportMode, cancelCaller: Bool) async throws {
+        let socket = MockWebSocketTask()
+        let transport = try makeTransport(socket, mode: mode)
+        defer { transport.close() }
+        acknowledgeSentSubscriptions(socket, mode: mode)
+        let activeValues = SubscriptionValues()
+        let activeCancel = try await transport.subscribe("watch", decoder: { $0 }) { activeValues.append($0.data) }
+        let sent = expectation(description: "unacknowledged subscription sent")
+        let cancelled = expectation(description: "cancellation send failed")
+        socket.onSend = { [weak socket] message in
+            if (try? Self.subscriptionID(message)) != nil {
+                socket?.sendError = URLError(.networkConnectionLost)
+                sent.fulfill()
+            } else {
+                socket?.sendError = nil
+                cancelled.fulfill()
+            }
+        }
+        let retiredValues = SubscriptionValues()
+        let pending = Task {
+            try await transport.subscribe("watch", decoder: { $0 }) { retiredValues.append($0.data) }
+        }
+        await fulfillment(of: [sent], timeout: 2)
+        if cancelCaller { pending.cancel() }
+        do {
+            _ = try await pending.value
+            XCTFail("expected establishment failure")
+        } catch is CancellationError {
+            XCTAssertTrue(cancelCaller)
+        } catch let error as LuxoError {
+            XCTAssertFalse(cancelCaller)
+            XCTAssertEqual(error.name, "TimeoutError")
+        }
+        await fulfillment(of: [cancelled], timeout: 2)
+        XCTAssertNil(socket.cancelCode)
+        socket.deliver(.success(acknowledgement(mode, 2)))
+        socket.deliver(.success(stream(mode, 2, 9)))
+        socket.deliver(.success(stream(mode, 1, 1)))
+        XCTAssertTrue(retiredValues.values.isEmpty)
+        XCTAssertEqual(activeValues.values.count, 1)
+        acknowledgeSentSubscriptions(socket, mode: mode)
+        let retryCancel = try await transport.subscribe("watch", decoder: { $0 }) { _ in }
+        XCTAssertEqual(try sentIDs(socket), [1, 2, 3])
+        retryCancel()
+        activeCancel()
     }
 
     func testTimeoutSendsCancellationForTheOriginalID() async throws {
@@ -292,6 +457,34 @@ final class WebSocketSubscriptionTests: XCTestCase {
         }
     }
 
+    func testRetiredSocketFramesCannotAffectAnExplicitNewSubscription() async throws {
+        for mode in [TransportMode.json, .binary] {
+            for invalid in [false, true] {
+                let first = MockWebSocketTask()
+                let second = MockWebSocketTask()
+                let transport = try WebSocketTransport(
+                    url: "wss://example.com/socket", session: MockWebSocketSession(sockets: [first, second]))
+                defer { transport.close() }
+                transport.setMode(mode)
+                try transport.setSchema(["watch": APISchema(id: 77)])
+                transport.connect()
+                acknowledgeSentSubscriptions(first, mode: mode)
+                acknowledgeSentSubscriptions(second, mode: mode)
+                let old = try await transport.subscribe("watch", decoder: { $0 }) { _ in XCTFail("old handler ran") }
+                transport.connect()
+                let values = SubscriptionValues()
+                let current = try await transport.subscribe("watch", decoder: { $0 }) { values.append($0.data) }
+                first.deliver(.success(invalid ? .string("{") : stream(mode, 2, 9)))
+                XCTAssertNil(second.cancelCode)
+                XCTAssertTrue(values.values.isEmpty)
+                second.deliver(.success(stream(mode, 2, 42)))
+                XCTAssertEqual(values.values.count, 1)
+                old()
+                current()
+            }
+        }
+    }
+
     func testOldSendFailureAndCancelCannotRemoveAnExplicitNewSubscription() async throws {
         for mode in [TransportMode.json, .binary] {
             let first = MockWebSocketTask()
@@ -373,6 +566,150 @@ final class WebSocketSubscriptionTests: XCTestCase {
                 group.addTask { transport.close() }
             }
             transport.close()
+        }
+    }
+
+    func testCancelledUnaryCallDoesNotSend() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let socket = MockWebSocketTask()
+            let transport = try makeTransport(socket, mode: mode)
+            defer { transport.close() }
+            let call = Task {
+                withUnsafeCurrentTask { $0?.cancel() }
+                return try await transport.call("watch")
+            }
+            do {
+                _ = try await call.value
+                XCTFail("cancelled call succeeded")
+            } catch is CancellationError {
+            } catch {
+                XCTFail("cancelled call returned another error: \(error)")
+            }
+            XCTAssertTrue(socket.sentMessages.isEmpty)
+        }
+    }
+
+    func testUnaryCancellationRetiresOnlyItsRequest() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let socket = MockWebSocketTask()
+            let transport = try makeTransport(socket, mode: mode)
+            defer { transport.close() }
+            let sent = expectation(description: "first call sent")
+            socket.onSend = { _ in sent.fulfill() }
+            let first = Task { try await transport.call("watch") }
+            await fulfillment(of: [sent], timeout: 1)
+            first.cancel()
+            do {
+                _ = try await first.value
+                XCTFail("cancelled call succeeded")
+            } catch is CancellationError {
+            } catch {
+                XCTFail("cancelled call returned another error: \(error)")
+            }
+            socket.onSend = { [weak socket] _ in
+                socket?.deliver(
+                    .success(
+                        mode == .json
+                            ? .string(#"{"$id":1,"data":999}"#) : .data(Data([0x02, 1, 99]))))
+                socket?.deliver(
+                    .success(
+                        mode == .json
+                            ? .string(#"{"$id":2,"data":42}"#) : .data(Data([0x02, 2, 42]))))
+            }
+            let next = try await transport.call("watch")
+            XCTAssertEqual(next.mode, mode)
+            XCTAssertEqual(next.data, mode == .json ? Data("42".utf8) : Data([42]))
+            XCTAssertNil(socket.cancelCode)
+        }
+    }
+
+    func testUnaryCancellationAndInlineResponseHaveOneWinner() async throws {
+        for mode in [TransportMode.json, .binary] {
+            for cancelFirst in [false, true] {
+                let socket = MockWebSocketTask()
+                let transport = try makeTransport(socket, mode: mode)
+                defer { transport.close() }
+                socket.onSend = { [weak socket] _ in
+                    if cancelFirst { withUnsafeCurrentTask { $0?.cancel() } }
+                    socket?.deliver(
+                        .success(
+                            mode == .json
+                                ? .string(#"{"$id":1,"data":42}"#) : .data(Data([0x02, 1, 42]))))
+                    if !cancelFirst { withUnsafeCurrentTask { $0?.cancel() } }
+                }
+                let call = Task { try await transport.call("watch") }
+                do {
+                    let result = try await call.value
+                    XCTAssertFalse(cancelFirst)
+                    XCTAssertEqual(result.data, mode == .json ? Data("42".utf8) : Data([42]))
+                } catch is CancellationError {
+                    XCTAssertTrue(cancelFirst)
+                }
+                XCTAssertNil(socket.cancelCode)
+                XCTAssertEqual(socket.sentMessages.count, 1)
+            }
+        }
+    }
+
+    func testCancelledUnaryLateSendFailureDoesNotRetireSibling() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let socket = MockWebSocketTask()
+            socket.holdSendCompletions = true
+            let transport = try makeTransport(socket, mode: mode)
+            defer { transport.close() }
+            let sent = expectation(description: "cancelled call sent")
+            socket.onSend = { _ in sent.fulfill() }
+            let cancelled = Task { try await transport.call("watch") }
+            await fulfillment(of: [sent], timeout: 1)
+            cancelled.cancel()
+            do {
+                _ = try await cancelled.value
+                XCTFail("cancelled call succeeded")
+            } catch is CancellationError {
+            }
+            socket.onSend = { [weak socket] _ in
+                socket?.completeSend(at: 0, error: URLError(.networkConnectionLost))
+                socket?.deliver(
+                    .success(
+                        mode == .json
+                            ? .string(#"{"$id":2,"data":42}"#) : .data(Data([0x02, 2, 42]))))
+                socket?.completeSend(at: 1, error: nil)
+            }
+            let result = try await transport.call("watch")
+            XCTAssertEqual(result.mode, mode)
+            XCTAssertEqual(result.data, mode == .json ? Data("42".utf8) : Data([42]))
+            XCTAssertEqual(socket.sentMessages.count, 2)
+            XCTAssertNil(socket.cancelCode)
+        }
+    }
+
+    func testUnaryResponseAndCancellationConcurrentRetirement() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let socket = MockWebSocketTask()
+            let transport = try makeTransport(socket, mode: mode)
+            defer { transport.close() }
+            for id in UInt64(1)...32 {
+                let sent = expectation(description: "concurrent call \(id) sent")
+                socket.onSend = { _ in sent.fulfill() }
+                let call = Task { try await transport.call("watch") }
+                await fulfillment(of: [sent], timeout: 1)
+                let reply: URLSessionWebSocketTask.Message =
+                    mode == .json
+                    ? .string("{\"$id\":\(id),\"data\":42}") : .data(frame(0x02, id, Data([42])))
+                await withTaskGroup(of: Void.self) { group in
+                    group.addTask { call.cancel() }
+                    group.addTask { socket.deliver(.success(reply)) }
+                }
+                do {
+                    let result = try await call.value
+                    XCTAssertEqual(result.mode, mode)
+                    XCTAssertEqual(result.data, mode == .json ? Data("42".utf8) : Data([42]))
+                } catch is CancellationError {
+                    // Either response or cancellation may win; both retire this request exactly once.
+                }
+            }
+            XCTAssertEqual(socket.sentMessages.count, 32)
+            XCTAssertNil(socket.cancelCode)
         }
     }
 

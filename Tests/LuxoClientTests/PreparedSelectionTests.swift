@@ -17,6 +17,27 @@ private struct PlannedRequest: GeneratedRequest {
 }
 
 final class PreparedSelectionTests: XCTestCase {
+    func testUnicodeDSLLettersPreserveWireFieldIDs() throws {
+        let schema = APISchema(
+            id: 1, fields: ["café": .init(fieldID: 1), "中文2": .init(fieldID: 2, typeName: "Nested")],
+            types: ["Nested": ["𐐀_name": .init(fieldID: 3)]])
+        let ascii = APISchema(
+            id: 1, fields: ["cafe": .init(fieldID: 1), "nested": .init(fieldID: 2, typeName: "Nested")],
+            types: ["Nested": ["name": .init(fieldID: 3)]])
+        let text = "café,中文2{𐐀_name}"
+        let expected = try LuxoBinaryProtocol.encodeRequest(
+            schema: ascii, params: ["$select": .string("cafe,nested{name}")])
+        XCTAssertEqual(
+            try LuxoBinaryProtocol.encodeRequest(schema: schema, params: ["$select": .string(text)]), expected)
+        let plan = try PreparedSelection(text, schema: schema)
+        XCTAssertEqual(
+            try LuxoBinaryProtocol.encodeRequest(
+                schema: schema,
+                request: PlannedRequest(selection: text, selectionPlan: plan)), expected)
+        for invalid in ["2café", "café²", "e\u{0301}", "😀", "字\u{200d}"] {
+            XCTAssertThrowsError(try PreparedSelection(invalid))
+        }
+    }
     func testBoundAndUnboundPlansPreserveWireAndSchemaIsolation() throws {
         let first = selectionSchema(1)
         let other = selectionSchema(65535)

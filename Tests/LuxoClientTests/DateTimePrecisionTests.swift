@@ -12,7 +12,8 @@ final class DateTimePrecisionTests: XCTestCase {
             XCTAssertEqual((error as? LuxoError)?.name, "ConfigError")
         }
         let plan = JSONParameterPlan(params: [.init(fieldID: 1, name: "date", type: "DateTime")], types: [:])!
-        XCTAssertThrowsError(try plan.jsonValue(.string(invalid), named: "date")) { error in
+        XCTAssertThrowsError(try LuxoJSONRequest.encode(api: "echo", params: ["date": .string(invalid)], plan: plan)) {
+            error in
             XCTAssertEqual((error as? LuxoError)?.name, "ConfigError")
             XCTAssertTrue((error as? LuxoError)?.message.contains("date") == true)
         }

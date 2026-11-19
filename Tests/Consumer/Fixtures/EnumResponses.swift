@@ -3,6 +3,7 @@ import LuxoClient
 
 func verifyEnums() async throws {
     try verifyEnumIdentity()
+    try verifyEscapedEnumIdentity()
     try verifyEnumModels()
     let value = Status(rawValue: "FUTURE")
     let cases: [(LuxoOptional<Status>, [Status]?, [String: LuxoValue])] = [
@@ -28,7 +29,7 @@ private func verifyEnumIdentity() throws {
     guard Status.knownCases == [.open, .closed, .k], Status(rawValue: "OPEN") == .open else {
         throw enumFailure("known members")
     }
-    let raws = ["FUTURE", "", "open", "K", "é", "e\u{301}"]
+    let raws = ["FUTURE", "", "open", "K", "é", "e\u{301}", "\u{feff}OPEN", "\u{feff}\u{feff}FUTURE"]
     guard Set(raws.map { Status(rawValue: $0) }).count == raws.count else {
         throw enumFailure("distinct raw enum values collapsed")
     }
@@ -41,9 +42,17 @@ private func verifyEnumIdentity() throws {
         }
         let json = try JSONEncoder().encode(value)
         guard try JSONDecoder().decode(Status.self, from: json) == value else { throw enumFailure("Codable") }
+        var encoder = Encoder()
+        encoder.writeString(raw)
+        let binary = try decodeLuxoResponse(encoder.data) { Status(rawValue: $0.readString()) }
+        guard binary.rawValue.utf8.elementsEqual(raw.utf8) else { throw enumFailure("Binary enum text changed") }
     }
+}
+
+private func verifyEscapedEnumIdentity() throws {
     let escaped = [
-        "OPEN", "open", "UNKNOWN", "unknown", "case", "init", "self", "quote\"", "slash\\", "line\n", "é", "e\u{301}",
+        "OPEN", "Open", "open", "UNKNOWN", "unknown", "case", "init", "self", "quote\"", "slash\\", "line\n", "é",
+        "e\u{301}",
     ]
     guard EscapedStatus.knownCases.count == escaped.count, Set(EscapedStatus.knownCases).count == escaped.count else {
         throw enumFailure("escaped members collided")
@@ -52,6 +61,17 @@ private func verifyEnumIdentity() throws {
         let value = EscapedStatus(rawValue: raw)
         if case .unknown = value { throw enumFailure("declared escaped member became unknown") }
         guard value.rawValue.utf8.elementsEqual(raw.utf8) else { throw enumFailure("escaped raw text") }
+        let json = try LuxoJSONEncoder().encode(value)
+        guard try LuxoJSONDecoder().decode(EscapedStatus.self, from: json) == value else {
+            throw enumFailure("escaped JSON member changed")
+        }
+        var encoder = Encoder()
+        encoder.writeString(raw)
+        let binary = try decodeLuxoResponse(encoder.data) { EscapedStatus(rawValue: $0.readString()) }
+        guard binary == value else { throw enumFailure("escaped Binary member changed") }
+    }
+    guard case .unknown("oPeN") = EscapedStatus(rawValue: "oPeN") else {
+        throw enumFailure("undeclared mixed case member became known")
     }
 }
 
@@ -92,7 +112,7 @@ private func checkEnumRecord(_ record: EnumRecord, optional: Status?) throws {
     }
 }
 
-private func enumColumns(optional: Status?) -> Data {
+private func enumColumns(optional: Status?) throws -> Data {
     var encoder = Encoder()
     encoder.writeVarint(1)
     encoder.writeVarint(0)
@@ -103,7 +123,7 @@ private func enumColumns(optional: Status?) -> Data {
     if let optional { encoder.writeString(optional.rawValue) }
     encoder.writeVarint(3)
     var list = Encoder()
-    list.writeArrayHeader(2)
+    try list.writeArrayHeader(2)
     list.writeString("OPEN")
     list.writeString("FUTURE")
     encoder.writeBytes(list.data)
@@ -111,7 +131,7 @@ private func enumColumns(optional: Status?) -> Data {
     encoder.writeBool(optional != nil)
     if let optional {
         var nested = Encoder()
-        nested.writeArrayHeader(1)
+        try nested.writeArrayHeader(1)
         nested.writeString(optional.rawValue)
         encoder.writeBytes(nested.data)
     }
@@ -147,7 +167,7 @@ func benchmarkEnums() throws {
                 let values = Array(repeating: raw, count: count)
                 if !binary { return try JSONEncoder().encode(values) }
                 var encoder = Encoder()
-                encoder.writeArrayHeader(count)
+                try encoder.writeArrayHeader(count)
                 for value in values { encoder.writeString(value) }
                 return encoder.data
             }

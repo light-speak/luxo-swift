@@ -6,6 +6,53 @@ import XCTest
 #endif
 
 final class HTTPResponseCollectorTests: XCTestCase {
+    func testRedirectDelegateAlwaysRejectsProposedRequest() async throws {
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let original = try XCTUnwrap(URL(string: "https://original.test/api"))
+        let task = session.dataTask(with: original)
+        defer { task.cancel() }
+        let collector = HTTPResponseCollector(maximum: 1024)
+        for code in [301, 302, 303, 307, 308] {
+            for destination in ["https://original.test/other", "https://different.test/api"] {
+                let response = try XCTUnwrap(
+                    HTTPURLResponse(
+                        url: original, statusCode: code, httpVersion: "HTTP/1.1", headerFields: nil))
+                let proposed = URLRequest(url: try XCTUnwrap(URL(string: destination)))
+                let completed = expectation(description: "reject redirect once")
+                completed.assertForOverFulfill = true
+                collector.urlSession(session, task: task, willPerformHTTPRedirection: response, newRequest: proposed) {
+                    request in
+                    XCTAssertNil(request)
+                    completed.fulfill()
+                }
+                await fulfillment(of: [completed], timeout: 1)
+            }
+        }
+    }
+
+    func testBusinessRedirectsDoNotReplayCredentialsOrBody() async throws {
+        guard let base = ProcessInfo.processInfo.environment["LUXO_HTTP_REDIRECT_URL"] else {
+            throw XCTSkip("requires isolated real HTTP redirect fixture")
+        }
+        for mode in [TransportMode.json, .binary] {
+            for code in [301, 302, 303, 307, 308] {
+                for origin in ["same", "cross"] {
+                    let backend = try URLSessionHTTPBackend(
+                        endpoint: base + "/redirect/\(code)?\(origin)", timeout: 5, maximum: 1024,
+                        session: URLSession(configuration: .ephemeral))
+                    defer { backend.close() }
+                    let response = try await backend.send(
+                        body: Data("private-input".utf8), mode: mode,
+                        headers: ["X-Project-Key": "test-only-key"])
+                    XCTAssertEqual(response.status, code)
+                }
+            }
+        }
+        let (captured, _) = try await URLSession.shared.data(from: XCTUnwrap(URL(string: base + "/captured")))
+        XCTAssertEqual(String(decoding: captured, as: UTF8.self), "[]")
+    }
+
     func testHeaderOnlyResponsePreservesTimeoutAndEmptyCompletionChecksLength() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [UnfinishedHTTPProtocol.self]

@@ -71,6 +71,6 @@ extension HTTPTransport where Backend == URLSessionHTTPBackend {
     ) throws {
         let backend = try URLSessionHTTPBackend(
             endpoint: endpoint, timeout: timeout, maximum: maxResponseBytes, session: session)
-        self.init(backend: backend, token: token)
+        self.init(backend: backend, token: token, timeout: timeout)
     }
 }

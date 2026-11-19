@@ -85,6 +85,163 @@ final class JSONEnvelopeTests: XCTestCase {
         }
     }
 
+    private var recursiveSchema: LuxoJSONReadSchema {
+        .model(
+            "Node",
+            types: [
+                "Node": [
+                    "child": .init(fieldID: 1, typeName: "Node", type: "Model"),
+                    "value": .init(fieldID: 2, type: "JSON"),
+                ]
+            ])
+    }
+
+    func testSchemaSkipMatchesValueReaderAcrossContainerShapes() throws {
+        let schemas: [LuxoJSONReadSchema] = [
+            .json, .list(.json), .dictionary(.json), .page(.json), recursiveSchema,
+            [JSONValue].luxoJSONSchema, [String: JSONValue].luxoJSONSchema,
+            Page<JSONValue>.luxoJSONSchema, Cursor<JSONValue>.luxoJSONSchema,
+        ]
+        for schema in schemas {
+            for value in [
+                "{}", "[]", "null", "1", "true", "\"text\"", "{\"items\":[{},[]],\"child\":null,\"value\":[]}",
+                "[{\"a\":1},null]",
+            ] {
+                let envelope = try JSONEnvelope.decode(Data("{\"data\":\(value)}".utf8), schema: schema)
+                XCTAssertEqual(envelope.responseData, Data(value.utf8))
+                XCTAssertNil(envelope.fields["data"])
+            }
+        }
+        let json = String(repeating: "[", count: 129) + "null" + String(repeating: "]", count: 129)
+        XCTAssertThrowsError(
+            try JSONEnvelope.decode(Data("{\"$id\":1,\"data\":\(json)}".utf8), resolvePayload: { _ in .generic }))
+        let elements = String(repeating: "0,", count: 1_000_000) + "0"
+        XCTAssertThrowsError(try JSONEnvelope.decode(Data("{\"data\":[\(elements)]}".utf8), schema: .list(.json)))
+    }
+
+    func testSchemaPayloadLimitsAndLateErrorsValidateEveryDuplicate() throws {
+        let json = String(repeating: "[", count: 128) + "null" + String(repeating: "]", count: 128)
+        let payload = "{\"value\":\(json)}"
+        let typed = try JSONEnvelope.decode(Data("{\"data\":\(payload)}".utf8), schema: recursiveSchema)
+        XCTAssertEqual(JSONEnvelope.decodeError(typed, statusCode: 400).name, "ParseError")
+        let error = "\"error\":\"Rejected\",\"code\":400,\"message\":\"no\""
+        for fields in ["\"data\":\(payload)", "\"data\":null,\"data\":\(payload)"] {
+            let envelope = try JSONEnvelope.decode(Data("{\(fields)}".utf8), schema: recursiveSchema)
+            XCTAssertEqual(envelope.responseData, Data(payload.utf8))
+            XCTAssertNil(envelope.fields["data"])
+        }
+        for fields in [
+            "\"data\":\(payload),\(error)", "\"data\":\(payload),\"data\":null,\(error)",
+            "\(error),\"data\":\(payload)",
+        ] {
+            XCTAssertThrowsError(try JSONEnvelope.decode(Data("{\(fields)}".utf8), schema: recursiveSchema))
+        }
+        let sixtyFive = String(repeating: "{\"child\":", count: 64) + "{}" + String(repeating: "}", count: 64)
+        XCTAssertThrowsError(
+            try JSONEnvelope.decode(Data("{\"data\":\(sixtyFive),\"data\":null}".utf8), schema: recursiveSchema))
+        for fields in [
+            "\"data\":\(sixtyFive),\(error)", "\(error),\"data\":\(sixtyFive)",
+            "\"data\":\(sixtyFive),\"data\":null,\(error)",
+        ] {
+            let envelope = try JSONEnvelope.decode(Data("{\(fields)}".utf8), schema: recursiveSchema)
+            XCTAssertEqual(JSONEnvelope.decodeError(envelope, statusCode: 200).name, "Rejected")
+        }
+        XCTAssertNoThrow(
+            try JSONEnvelope.decode(
+                Data("{\"data\":\(sixtyFive),\(error)}".utf8), errorResponse: true, schema: recursiveSchema))
+    }
+
+    func testDeferredPayloadUsesFinalRouteAndChecksDiscardedDuplicates() throws {
+        let json = String(repeating: "[", count: 128) + "null" + String(repeating: "]", count: 128)
+        let payload = "[\(json)]"
+        for fields in ["\"data\":\(payload),\"$id\":2", "\"$id\":1,\"data\":\(payload),\"$id\":2"] {
+            let envelope = try JSONEnvelope.decode(
+                Data("{\(fields)}".utf8),
+                resolvePayload: { fields in
+                    fields["$id"] == .int(2) ? .schema(.list(.json)) : .generic
+                })
+            XCTAssertEqual(envelope.responseData, Data(payload.utf8))
+            XCTAssertNil(envelope.fields["data"])
+        }
+        for fields in ["\"data\":[\(payload)],\"data\":null", "\"data\":null,\"data\":[\(payload)]"] {
+            XCTAssertThrowsError(
+                try JSONEnvelope.decode(Data("{\(fields)}".utf8), resolvePayload: { _ in .schema(.list(.json)) }))
+        }
+        for index in 0..<3 {
+            var values = ["null", "null", "null"]
+            values[index] = "[\(payload)]"
+            let fields = values.map { "\"data\":\($0)" }.joined(separator: ",")
+            XCTAssertThrowsError(
+                try JSONEnvelope.decode(
+                    Data("{\(fields),\"$id\":1}".utf8), resolvePayload: { _ in .schema(.list(.json)) }))
+        }
+        let repeated = Data("{\"data\":null,\"data\":[],\"data\":\(payload),\"$id\":1}".utf8)
+        XCTAssertEqual(
+            try JSONEnvelope.decode(repeated, resolvePayload: { _ in .schema(.list(.json)) }).responseData,
+            Data(payload.utf8))
+        for prefix in ["", "\"error\":\"Rejected\","] {
+            XCTAssertThrowsError(
+                try JSONEnvelope.decode(
+                    Data("{\(prefix)\"data\":\(payload),\"error\":null}".utf8),
+                    resolvePayload: { _ in .schema(.list(.json)) }))
+        }
+    }
+
+    func testDiscardedPayloadStackBoundariesAndReuse() throws {
+        for depth in [1, 126, 127, 128, 129, 5000] {
+            for leaf in ["[1,{\"k\":2},3]", "{}", "[]"] {
+                let nested = String(repeating: "[", count: depth) + leaf + String(repeating: "]", count: depth)
+                let payload = "{\"first\":\(nested),\"second\":\(nested)}"
+                let result = try JSONEnvelope.decode(
+                    Data("{\"data\":\(payload)}".utf8), resolvePayload: { _ in .discarded })
+                XCTAssertTrue(result.discardedPayload)
+            }
+            let malformed = String(repeating: "[", count: depth) + "[1,]" + String(repeating: "]", count: depth)
+            XCTAssertThrowsError(
+                try JSONEnvelope.decode(Data("{\"data\":\(malformed)}".utf8), resolvePayload: { _ in .discarded }))
+        }
+    }
+
+    func testDeferredAndDiscardedPayloadGrammarMatchesStrictReader() throws {
+        for value in [#""東京\ud83d\ude00""#, #""\uFEFF""#, #""escaped\\\"quote""#] {
+            let document = Data("{\"data\":\(value)}".utf8)
+            XCTAssertEqual(
+                try JSONEnvelope.decode(document, resolvePayload: { _ in .generic }).responseData, Data(value.utf8))
+        }
+        for text in [#"{"data":{"v":"escape\x"#, #"{"data":"escape\x"#] {
+            XCTAssertThrowsError(try JSONEnvelope.decode(Data(text.utf8), resolvePayload: { _ in .generic }))
+        }
+        let payload = #"[{"key":"東京\ud83d\ude00\n[]{}","value":-1.25e+2},null,true,false]"#
+        let bytes = Data(payload.utf8)
+        for index in bytes.indices {
+            for byte: UInt8 in [0, 34, 44, 58, 91, 93, 123, 125, 255] {
+                var changed = bytes; changed[index] = byte
+                let expected = (try? JSONReader.decode(changed)) != nil
+                let document = Data("{\"data\":".utf8) + changed + Data("}".utf8)
+                for policy in [JSONPayloadValidation.generic, .discarded, .schema(.list(.json))] {
+                    let result = try? JSONEnvelope.decode(document, resolvePayload: { _ in policy })
+                    XCTAssertEqual(result != nil, expected, "index=\(index) byte=\(byte)")
+                }
+            }
+        }
+        for depth in [129, 5000] {
+            let document = Data(
+                ("{\"data\":" + String(repeating: "[", count: depth) + "null" + String(repeating: "]", count: depth)
+                    + "}").utf8)
+            XCTAssertTrue(try JSONEnvelope.decode(document, resolvePayload: { _ in .discarded }).discardedPayload)
+            XCTAssertThrowsError(try JSONEnvelope.decode(document, resolvePayload: { _ in .generic }))
+        }
+        let values = String(repeating: "0,", count: 999_999) + "0"
+        XCTAssertNoThrow(
+            try JSONEnvelope.decode(Data("{\"data\":[\(values)]}".utf8), resolvePayload: { _ in .discarded }))
+        XCTAssertThrowsError(
+            try JSONEnvelope.decode(Data("{\"data\":[\(values),0]}".utf8), resolvePayload: { _ in .discarded }))
+        for value in ["[", "{", "[}", "{]", "[1,]", "{\"a\":1,}", "[1 2]", "{\"a\" 1}", "{\"a\":1 \"b\":2}"] {
+            XCTAssertThrowsError(
+                try JSONEnvelope.decode(Data("{\"data\":\(value)}".utf8), resolvePayload: { _ in .discarded }))
+        }
+    }
+
     func testPreservesPayloadAndOnlyMaterializesMetadata() throws {
         let payload = #"{ "z":1E+003, "z":9007199254740993, "a":"\u6771\u4eac", "zero":-0 }"#
         let text = "{\"extra\":[{\"huge\":1e400}],\"data\": \(payload),\"$id\":18446744073709551615}"
@@ -166,13 +323,19 @@ final class JSONEnvelopeTests: XCTestCase {
     }
 
     func testSkipEnforcesTheSameDepthAndArrayLimits() throws {
-        for depth in [127, 128] {
+        for depth in [127, 128, 129] {
             let array = String(repeating: "[", count: depth) + "0" + String(repeating: "]", count: depth)
-            let data = Data("{\"data\":\(array)}".utf8)
-            if depth == 127 {
-                XCTAssertNoThrow(try JSONEnvelope.decode(data))
-            } else {
-                XCTAssertThrowsError(try JSONEnvelope.decode(data))
+            let object = String(repeating: "{\"x\":", count: depth) + "0" + String(repeating: "}", count: depth)
+            for payload in [array, object] {
+                for key in ["data", "unknown"] {
+                    let data = Data("{\"\(key)\":\(payload)}".utf8)
+                    let limit = key == "data" ? 128 : 127
+                    if depth <= limit {
+                        XCTAssertNoThrow(try JSONEnvelope.decode(data))
+                    } else {
+                        XCTAssertThrowsError(try JSONEnvelope.decode(data))
+                    }
+                }
             }
         }
         let elements = String(repeating: "0,", count: 999_999) + "0"

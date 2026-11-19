@@ -155,9 +155,11 @@ public enum SelectionBuild {
             let directory = process.scratch.appendingPathComponent("graph-" + module)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let targetArgs = invocation.graph.contains("-target") ? [] : ["-target", target]
+            // The default public graph omits public declarations with leading underscores.
+            let access = module == declaration.module ? "internal" : "public"
             _ = try process.run(
                 tool,
-                invocation.graph + targetArgs + [
+                invocation.graph + targetArgs + ["-minimum-access-level", access] + [
                     "-I", process.scratch.path, "-module-name", module, "-output-dir", directory.path,
                 ])
             graphs.append(try Data(contentsOf: directory.appendingPathComponent(module + ".symbols.json")))
@@ -180,7 +182,8 @@ public enum SelectionBuild {
                 root: root, compilerVersion: compilerVersion, apiSymbols: Set(catalog.apis.keys),
                 source: snapshot.source)
             let selections = try ProjectionInference.infer(
-                root: root, apis: catalog.apis, fields: catalog.fields, transparent: catalog.transparent)
+                root: root, apis: catalog.apis, fields: catalog.fields, transparent: catalog.transparent,
+                metadata: catalog.metadata, sealeds: catalog.sealeds)
             return try SelectionSourceRewriter.rewrite(
                 source: snapshot.source, index: index, selections: selections, planFactories: catalog.planFactories)
         }

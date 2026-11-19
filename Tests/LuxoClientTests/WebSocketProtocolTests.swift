@@ -108,6 +108,8 @@ final class WebSocketProtocolTests: XCTestCase {
 
     func testSuccessfulBinaryAcknowledgementRejectsTrailingPayload() {
         let frame = LuxoWebSocketProtocol.decodeBinaryFrame(Data([0x13, 1, 42]))
-        XCTAssertNil(frame.flatMap(LuxoWebSocketProtocol.subscriptionAcknowledgement))
+        let acknowledgement = frame.flatMap(LuxoWebSocketProtocol.subscriptionAcknowledgement)
+        XCTAssertEqual(acknowledgement?.id, 1)
+        XCTAssertEqual(acknowledgement?.error?.name, "ParseError")
     }
 }

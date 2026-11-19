@@ -24,7 +24,15 @@ guard profileEncoder.data == Data([4, 1, 4, 76, 117, 120, 111, 2, 0, 0]) else {
 }
 _ = Record()
 do {
-    if CommandLine.arguments.contains("--enum-bench") {
+    if CommandLine.arguments.contains("--codable-context-bench") {
+        try benchmarkHandwrittenContextReads()
+    } else if CommandLine.arguments.contains("--codable-new-depth-bench") {
+        try benchmarkNewHandwrittenDepthReads()
+    } else if CommandLine.arguments.contains("--codable-read-bench") {
+        try benchmarkHandwrittenReads()
+    } else if CommandLine.arguments.contains("--binary-depth-bench") {
+        try benchmarkBinaryModelReads()
+    } else if CommandLine.arguments.contains("--enum-bench") {
         try await verifyEnums()
         try benchmarkEnums()
     } else if CommandLine.arguments.contains("--decoder-errors-bench") {
@@ -34,6 +42,7 @@ do {
     } else {
         try verifyRegistrationFailure()
         try await verifyPrecisionInputs()
+        try await verifyGeneratedJSONRootBudget()
         try await verifyEnums()
         try await verifyScalarResponses()
         try await verifyStructuredResponses()
@@ -64,14 +73,58 @@ private struct RejectedSchemaTransport: ConsumerTransport {
     }
 }
 
-func precisionInput(note: String? = nil) -> PrecisionInput {
+func precisionInput(note: String? = nil, metadata: JSONValue = .object(["value": .array([.number(1.25), .null])]))
+    -> PrecisionInput
+{
     PrecisionInput(
         count: Int.max, duration: Int64.min, ratio: 1.25,
         values: [Int.min, 9_007_199_254_740_993, Int.max], ratios: [1.25, 2.5], status: .open,
         blob: Data([0, 255]), uuid: UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!,
         date: "2026-09-13T00:00:00Z", decimal: "12345678901234567890.125", enabled: true,
-        metadata: .object(["value": .array([.number(1.25), .null])]),
+        metadata: metadata,
         profiles: [ProfileInput(name: "nested", bio: note)], note: note)
+}
+
+func verifyGeneratedJSONRootBudget() async throws {
+    for depth in 127...129 {
+        var value: JSONValue = .object([:])
+        for _ in 1..<depth { value = .array([value]) }
+        let input = precisionInput(metadata: value)
+        let transport = HTTPTransport(backend: JSONRootBackend(expected: value))
+        let client = try LuxoGeneratedClient(transport: transport)
+        if depth <= 128 {
+            guard try await callPrecision(client, input: input) else {
+                throw LuxoError(code: 0, message: "deep JSON request failed", name: "ConsumerError")
+            }
+            var encoder = Encoder()
+            try input.writeLuxo(to: &encoder)
+            guard encoder.data.range(of: try value.jsonData()) != nil else {
+                throw LuxoError(code: 0, message: "binary model JSON missing", name: "ConsumerError")
+            }
+        } else {
+            do {
+                _ = try await callPrecision(client, input: input)
+                throw LuxoError(code: 0, message: "deep JSON accepted", name: "ConsumerError")
+            } catch let error as LuxoError where error.name == "EncodingError" {}
+        }
+    }
+    print("Generated model and JSON-list requests preserve the independent 128-container budget")
+}
+
+private struct JSONRootBackend: HTTPBackend {
+    let expected: JSONValue
+    private struct Body: Decodable {
+        struct Input: Decodable { let metadata: JSONValue }
+        let metadata: [JSONValue]
+        let input: Input
+    }
+    func send(body: Data, mode: TransportMode, headers: [String: String]) async throws -> HTTPBackendResponse {
+        let decoded = try JSONDecoder().decode(Body.self, from: body)
+        guard decoded.metadata == [expected], decoded.input.metadata == expected else {
+            throw LuxoError(code: 0, message: "generated JSON roots changed", name: "ConsumerError")
+        }
+        return HTTPBackendResponse(status: 200, body: Data("{\"data\":true}".utf8))
+    }
 }
 
 func normalizeProjection(_ value: LuxoValue) throws -> LuxoValue {

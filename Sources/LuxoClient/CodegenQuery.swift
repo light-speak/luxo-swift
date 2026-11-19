@@ -4,17 +4,18 @@ enum SwiftQueryCodegen {
     enum Failure: Error { case invalidCapability(String) }
 
     private static func name(_ value: String) throws {
-        guard value.range(of: "^[A-Za-z_][A-Za-z0-9_]*$", options: .regularExpression) != nil else {
+        guard isLuxoDSLIdentifier(value) else {
             throw Failure.invalidCapability(value)
         }
     }
 
-    private static func fieldType(_ type: String, isEnum: Bool) throws -> (String, String, [String]) {
+    private static func fieldType(_ type: String, isEnum: Bool, schema: LuxoSchema) throws -> (String, String, [String])
+    {
         if isEnum { return (type, ".string(value.rawValue)", ["eq", "ne"]) }
         let comparisons = ["eq", "ne", "gt", "gte", "lt", "lte"]
         switch type {
-        case "Int": return ("Int64", ".int64(value)", comparisons)
-        case "Float": return ("Double", ".double(value)", comparisons)
+        case "Int": return (LuxoCodegen.builtinType("Int64", schema: schema), ".int64(value)", comparisons)
+        case "Float": return (LuxoCodegen.builtinType("Double", schema: schema), ".double(value)", comparisons)
         case "Boolean": return ("Bool", ".bool(value)", ["eq", "ne"])
         case "String": return ("String", ".string(value)", ["eq", "ne", "contains", "startswith", "endswith", "match"])
         case "UUID": return ("String", ".string(value)", ["eq", "ne"])
@@ -30,7 +31,7 @@ enum SwiftQueryCodegen {
             try name(api.name)
             let generatedName = "LuxoQuery_\(api.name)"
             guard schema.models[generatedName] == nil, schema.types?[generatedName] == nil,
-                schema.enums?[generatedName] == nil
+                schema.enums?[generatedName] == nil, schema.sealeds?[generatedName] == nil
             else { throw Failure.invalidCapability(generatedName) }
             guard api.paginated == true, api.stream != true else { throw Failure.invalidCapability(api.name) }
             out += "public enum LuxoQuery_\(api.name) {\n"
@@ -49,7 +50,8 @@ enum SwiftQueryCodegen {
             guard fields.insert(field.field).inserted, !field.operators.isEmpty else {
                 throw Failure.invalidCapability(field.field)
             }
-            let (type, value, allowed) = try fieldType(field.type, isEnum: schema.enums?[field.type] != nil)
+            let (type, value, allowed) = try fieldType(
+                field.type, isEnum: schema.enums?[field.type] != nil, schema: schema)
             var seen: Set<String> = []
             for op in field.operators {
                 guard allowed.contains(op), seen.insert(op).inserted else { throw Failure.invalidCapability(op) }

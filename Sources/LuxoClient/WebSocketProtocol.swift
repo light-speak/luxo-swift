@@ -60,11 +60,12 @@ enum LuxoWebSocketProtocol {
         else {
             return nil
         }
-        if frame.type == LuxoBinaryProtocol.subscribeSuccess && !frame.payload.isEmpty { return nil }
-        let error =
+        let error: LuxoError? =
             frame.type == LuxoBinaryProtocol.subscribeError
             ? LuxoBinaryProtocol.decodeError(frame.payload, statusCode: 0)
-            : nil
+            : frame.payload.isEmpty
+                ? nil
+                : LuxoError(code: 0, message: "trailing subscription acknowledgement bytes", name: "ParseError")
         return SubscriptionAcknowledgement(id: frame.id, error: error)
     }
 

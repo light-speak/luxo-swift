@@ -3,6 +3,303 @@ import XCTest
 @testable import LuxoClient
 
 final class JSONNumberTests: XCTestCase {
+    func testLuxoJSONWritingKeepsGenericRootInsideModelsAndLists() throws {
+        struct Packet: Encodable { let value: JSONValue; let values: [JSONValue] }
+        for depth in 127...129 {
+            var value: JSONValue = .array([])
+            for _ in 1..<depth { value = .object(["v": value]) }
+            let packet = Packet(value: value, values: [value])
+            if depth <= 128 {
+                let expected = try JSONEncoder().encode(packet)
+                let actual = try LuxoJSONEncoder().encode(packet)
+                XCTAssertEqual(
+                    try JSONSerialization.jsonObject(with: actual) as? NSDictionary,
+                    try JSONSerialization.jsonObject(with: expected) as? NSDictionary)
+                XCTAssertNoThrow(try LuxoJSONEncoder().encode([value]))
+            } else {
+                XCTAssertThrowsError(try LuxoJSONEncoder().encode(packet))
+                XCTAssertThrowsError(try LuxoJSONEncoder().encode([value]))
+            }
+        }
+    }
+
+    func testSchemaJSONRootsKeepTheirBudgetInRequests() throws {
+        let schema = APISchema(
+            id: 1,
+            params: [
+                .init(fieldID: 1, name: "value", type: "JSON"),
+                .init(fieldID: 2, name: "values", type: "JSON", isList: true),
+                .init(fieldID: 3, name: "model", type: "Model", typeName: "Packet"),
+            ],
+            types: [
+                "Packet": [
+                    "value": .init(fieldID: 1, type: "JSON"),
+                    "values": .init(fieldID: 2, type: "JSON", isList: true),
+                ]
+            ])
+        for depth in 127...129 {
+            var value: JSONValue = .object([:])
+            for _ in 1..<depth { value = .array([value]) }
+            for raw in [LuxoValue(value), .json(value)] {
+                let params: [String: LuxoValue] = [
+                    "value": raw, "values": .array([raw]),
+                    "model": .object(["value": raw, "values": .array([raw])]),
+                ]
+                if depth <= 128 {
+                    let text = String(decoding: try value.jsonData(), as: UTF8.self)
+                    let expected =
+                        "{\"$api\":\"echo\",\"model\":{\"value\":" + text
+                        + ",\"values\":[" + text + "]},\"value\":" + text + ",\"values\":[" + text + "]}"
+                    XCTAssertEqual(
+                        try LuxoJSONRequest.encode(api: "echo", params: params, plan: schema.jsonParameters),
+                        Data(expected.utf8))
+                    XCTAssertNoThrow(
+                        try LuxoWebSocketProtocol.jsonCallFrame(
+                            sequence: 1, api: "echo", params: params, plan: schema.jsonParameters))
+                } else {
+                    XCTAssertThrowsError(
+                        try LuxoJSONRequest.encode(api: "echo", params: params, plan: schema.jsonParameters))
+                }
+            }
+        }
+    }
+
+    func testJSONRootMarkerPreservesStrictTransportEqualityAndValidation() throws {
+        let values: [JSONValue] = [
+            .null, .bool(true), .integer(1), .number(1),
+            .rawNumber(try JSONNumber("1e400")), .string("x"), .array([]),
+            .array([.bool(true)]), .object([:]), .object(["v": .array([.integer(1)])]),
+        ]
+        for a in values {
+            for b in values {
+                let expected = LuxoValue(a) == LuxoValue(b)
+                XCTAssertEqual(LuxoValue.json(a) == LuxoValue(b), expected)
+                XCTAssertEqual(LuxoValue(a) == LuxoValue.json(b), expected)
+                XCTAssertEqual(LuxoValue.json(a) == LuxoValue.json(b), expected)
+            }
+            XCTAssertEqual(try JSONValue(.json(a)), a)
+            XCTAssertEqual(try LuxoValue.json(a).jsonData(), try LuxoValue(a).jsonData())
+        }
+        XCTAssertNotEqual(LuxoValue.json(.object(["a": .null])), .object(["b": .null]))
+        XCTAssertNotEqual(LuxoValue.json(.object(["a": .null])), .json(.object(["b": .null])))
+        XCTAssertNotEqual(LuxoValue.json(.null), .bytes(Data()))
+        var deep: JSONValue = .array([])
+        for _ in 1..<128 { deep = .array([deep]) }
+        XCTAssertNoThrow(try JSONValue(.json(deep)))
+        XCTAssertThrowsError(try JSONValue(.array([.json(deep)])))
+        XCTAssertNoThrow(try LuxoValue.json(deep).foundationValue())
+        deep = .array([deep])
+        XCTAssertThrowsError(try LuxoValue.json(deep).jsonData())
+        XCTAssertThrowsError(try LuxoValue.json(deep).foundationValue())
+        XCTAssertThrowsError(try JSONValue(.json(deep)))
+    }
+
+    func testJSONRootFoundationProjectionPreservesValuesAndRejectsDeepObjects() throws {
+        let value = JSONValue.object([
+            "values": .array([.null, .bool(true), .integer(Int64.max), .number(1.25), .string("text")]),
+            "empty": .object([:]),
+        ])
+        let legacy = try JSONSerialization.data(
+            withJSONObject: LuxoValue(value).foundationValue(), options: .sortedKeys)
+        let tagged = try JSONSerialization.data(
+            withJSONObject: LuxoValue.json(value).foundationValue(), options: .sortedKeys)
+        XCTAssertEqual(tagged, legacy)
+        let number = try JSONNumber("1e400")
+        XCTAssertEqual(try LuxoValue.json(.rawNumber(number)).foundationValue() as? JSONNumber, number)
+        XCTAssertEqual(try JSONEncoder().encode(JSONValue.number(1.25)), Data("1.25".utf8))
+        XCTAssertThrowsError(try JSONEncoder().encode(JSONValue.number(.nan)))
+        XCTAssertThrowsError(try LuxoValue.json(.number(.infinity)).foundationValue())
+        for depth in 127...129 {
+            var value: JSONValue = .null
+            for _ in 0..<depth { value = .object(["v": value]) }
+            if depth <= 128 {
+                XCTAssertNoThrow(try LuxoValue.json(value).foundationValue())
+            } else {
+                XCTAssertThrowsError(try LuxoValue.json(value).foundationValue())
+            }
+        }
+    }
+
+    func testFoundationJSONDepthIsIndependentOfModelsAndTypedLists() throws {
+        struct Packet: Codable { let value: JSONValue }
+        for objects in [false, true] {
+            for depth in 127...129 {
+                for leaf: JSONValue in [.null, .bool(true), .string("leaf"), .array([]), .object([:])] {
+                    let containers = depth - (leaf == .array([]) || leaf == .object([:]) ? 1 : 0)
+                    var value = leaf
+                    for _ in 0..<containers { value = objects ? .object(["v": value]) : .array([value]) }
+                    let leafText = String(decoding: try JSONEncoder().encode(leaf), as: UTF8.self)
+                    let text =
+                        String(repeating: objects ? "{\"v\":" : "[", count: containers)
+                        + leafText + String(repeating: objects ? "}" : "]", count: containers)
+                    let listText = "[" + text + "]"
+                    let modelText = "{\"value\":" + text + "}"
+                    if depth <= 128 {
+                        XCTAssertEqual(try JSONDecoder().decode(JSONValue.self, from: Data(text.utf8)), value)
+                        XCTAssertEqual(try JSONDecoder().decode([JSONValue].self, from: Data(listText.utf8)), [value])
+                        XCTAssertEqual(try JSONDecoder().decode(Packet.self, from: Data(modelText.utf8)).value, value)
+                        XCTAssertNoThrow(try JSONEncoder().encode(value))
+                        XCTAssertNoThrow(try JSONEncoder().encode([value]))
+                        XCTAssertNoThrow(try JSONEncoder().encode(Packet(value: value)))
+                    } else {
+                        XCTAssertThrowsError(try JSONDecoder().decode(JSONValue.self, from: Data(text.utf8)))
+                        XCTAssertThrowsError(try JSONDecoder().decode([JSONValue].self, from: Data(listText.utf8)))
+                        XCTAssertThrowsError(try JSONDecoder().decode(Packet.self, from: Data(modelText.utf8)))
+                        XCTAssertThrowsError(try JSONEncoder().encode(value))
+                        XCTAssertThrowsError(try JSONEncoder().encode([value]))
+                        XCTAssertThrowsError(try JSONEncoder().encode(Packet(value: value)))
+                    }
+                }
+            }
+        }
+    }
+
+    func testGenericJSONCountsContainersIncludingEmptyLeaves() throws {
+        for objects in [false, true] {
+            for depth in 127...129 {
+                for leaf in ["0", "[]", "{}", "1e400"] {
+                    let containers = depth - (["[]", "{}"].contains(leaf) ? 1 : 0)
+                    let text =
+                        String(repeating: objects ? "{\"v\":" : "[", count: containers)
+                        + leaf + String(repeating: objects ? "}" : "]", count: containers)
+                    let data = Data(text.utf8)
+                    var value: JSONValue =
+                        leaf == "[]"
+                        ? .array([])
+                        : leaf == "{}"
+                            ? .object([:])
+                            : leaf == "0" ? .integer(0) : .rawNumber(try JSONNumber(leaf))
+                    for _ in 0..<containers { value = objects ? .object(["v": value]) : .array([value]) }
+                    if depth <= 128 {
+                        XCTAssertEqual(try JSONValue.parseBinary(data), value)
+                        XCTAssertEqual(try value.jsonData(), data)
+                        XCTAssertEqual(try JSONValue(LuxoValue(value)), value)
+                    } else {
+                        XCTAssertThrowsError(try JSONValue.parseBinary(data), "\(objects) \(depth) \(leaf)")
+                        XCTAssertThrowsError(try value.jsonData())
+                        XCTAssertThrowsError(try JSONValue(LuxoValue(value)))
+                        XCTAssertThrowsError(try LuxoValue.encode(value))
+                    }
+                    for errorResponse in [false, true] {
+                        let body = Data(("{\"data\":" + text + "}").utf8)
+                        if depth <= 128 {
+                            XCTAssertNoThrow(try JSONEnvelope.decode(body, errorResponse: errorResponse))
+                        } else {
+                            XCTAssertThrowsError(try JSONEnvelope.decode(body, errorResponse: errorResponse))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func testDuplicateKeysCannotHideDeepGenericJSONSource() throws {
+        let deep = String(repeating: "[", count: 128) + "[]" + String(repeating: "]", count: 128)
+        for text in [deep, "{\"v\":" + deep + ",\"v\":0}"] {
+            XCTAssertThrowsError(try JSONValue.parseBinary(Data(text.utf8)))
+            for errorResponse in [false, true] {
+                XCTAssertThrowsError(
+                    try JSONEnvelope.decode(Data(("{\"data\":" + text + "}").utf8), errorResponse: errorResponse))
+            }
+            var encoder = Encoder()
+            encoder.writeVarint(1); encoder.writeSvarint(400)
+            encoder.writeVarint(2); encoder.writeString("Custom")
+            encoder.writeVarint(3); encoder.writeString("failed")
+            encoder.writeVarint(5); encoder.writeString(text); encoder.writeEnd()
+            XCTAssertEqual(LuxoBinaryProtocol.decodeError(encoder.data, statusCode: 502).name, "ParseError")
+        }
+    }
+
+    func testCheckedJSONProjectionStopsBeforeUnboundedConversion() throws {
+        for objects in [false, true] {
+            var value: JSONValue = .null
+            for _ in 0..<1024 { value = objects ? .object(["v": value]) : .array([value]) }
+            XCTAssertThrowsError(try LuxoValue.checkedJSON(value))
+            XCTAssertThrowsError(try LuxoValue.encode(value))
+            XCTAssertThrowsError(try value.jsonData())
+            var encoder = Encoder()
+            encoder.writeString("prefix")
+            let prefix = encoder.data
+            XCTAssertThrowsError(try encoder.writeJSON(value))
+            XCTAssertEqual(encoder.data, prefix)
+        }
+        let valid: [JSONValue] = [
+            .null, .bool(true), .integer(42), .number(1.25), .string("[{}]"),
+            .rawNumber(try JSONNumber("1e400")), .array([]), .object([:]),
+        ]
+        for value in valid { XCTAssertEqual(try LuxoValue.checkedJSON(value), LuxoValue(value)) }
+    }
+
+    func testJSONPayloadDepthDoesNotDependOnEnvelope() throws {
+        for depth in [127, 128, 129, 130] {
+            for leaf in ["0", "[]", "{}"] {
+                let text = String(repeating: "[", count: depth) + leaf + String(repeating: "]", count: depth)
+                let payload = Data(text.utf8)
+                let expected = Result { try JSONValue.parseBinary(payload) }
+                for errorResponse in [false, true] {
+                    for prefix in ["", #""error":"Custom","code":400,"message":"failed","#] {
+                        let body = Data(("{" + prefix + "\"data\":" + text + "}").utf8)
+                        let actual = Result { try JSONEnvelope.decode(body, errorResponse: errorResponse) }
+                        switch (expected, actual) {
+                        case (.success, .success(let envelope)):
+                            XCTAssertEqual(envelope.responseData, payload)
+                            XCTAssertNoThrow(try envelope.materializedFields())
+                        case (.failure, .failure): break
+                        default:
+                            XCTFail(
+                                "payload/envelope depth mismatch: depth=\(depth) leaf=\(leaf) error=\(errorResponse)")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func testBinaryJSONDoesNotAcceptDocumentBOM() throws {
+        for text in ["null", "42", "{}", "[]", #""value""#] {
+            let data = Data([0xef, 0xbb, 0xbf]) + Data(text.utf8)
+            XCTAssertThrowsError(try JSONValue.parseBinary(data))
+            XCTAssertEqual(try JSONValue.parse(data), try JSONValue.parse(Data(text.utf8)))
+            var encoder = Encoder()
+            encoder.writeVarint(1); encoder.writeSvarint(400)
+            encoder.writeVarint(2); encoder.writeString("Custom")
+            encoder.writeVarint(3); encoder.writeString("failed")
+            encoder.writeVarint(5); encoder.writeBytes(data); encoder.writeEnd()
+            XCTAssertEqual(LuxoBinaryProtocol.decodeError(encoder.data, statusCode: 502).name, "ParseError")
+        }
+        XCTAssertEqual(try JSONValue.parseBinary(Data("\"\u{feff}text\"".utf8)), .string("\u{feff}text"))
+        let envelope = Data([0xef, 0xbb, 0xbf]) + Data(#"{"data":null}"#.utf8)
+        XCTAssertTrue(try JSONEnvelope.decode(envelope).hasData)
+    }
+
+    func testPrototypeNamedErrorDataKeysSurviveBothEncodings() throws {
+        let text =
+            #"{"__proto__":{"marker":"value"},"constructor":{"prototype":{"marker":"value"}},"#
+            + #""hasOwnProperty":false,"toJSON":"literal","n":9007199254740993,"precise":1.2300}"#
+        let envelope = try JSONEnvelope.decode(
+            Data(#"{"error":"Custom","code":400,"message":"failed","data":\#(text)}"#.utf8))
+        var encoder = Encoder()
+        encoder.writeVarint(1); encoder.writeSvarint(400)
+        encoder.writeVarint(2); encoder.writeString("Custom")
+        encoder.writeVarint(3); encoder.writeString("failed")
+        encoder.writeVarint(5); encoder.writeString(text); encoder.writeEnd()
+        let errors = [
+            JSONEnvelope.decodeError(envelope, statusCode: 502),
+            LuxoBinaryProtocol.decodeError(encoder.data, statusCode: 502),
+        ]
+        for error in errors {
+            XCTAssertEqual(error.name, "Custom")
+            let data = try XCTUnwrap(error.data as? [String: Any])
+            XCTAssertEqual((data["__proto__"] as? [String: Any])?["marker"] as? String, "value")
+            let constructor = try XCTUnwrap(data["constructor"] as? [String: Any])
+            XCTAssertEqual((constructor["prototype"] as? [String: Any])?["marker"] as? String, "value")
+            XCTAssertEqual(data["hasOwnProperty"] as? Bool, false)
+            XCTAssertEqual(data["toJSON"] as? String, "literal")
+            XCTAssertEqual(data["n"] as? Int64, 9007199254740993)
+            XCTAssertEqual((data["precise"] as? JSONNumber)?.literal, "1.2300")
+        }
+    }
+
     func testLegacyUTF8KeepsBOMContentAndRejectsMalformedBytes() throws {
         for text in ["", "東京", "\u{feff}", "\u{feff}\u{feff}text", "\u{fffd}"] {
             try Data(text.utf8).withUnsafeBytes { raw in
@@ -102,6 +399,7 @@ final class JSONNumberTests: XCTestCase {
     func testRawNumberConstructionAndExplicitConversions() throws {
         for invalid in [
             "", " 1", "1 ", "+1", "01", "-01", "1.", ".1", "1e", "1e+", "NaN", "Infinity", "null", "true", "\"1\"",
+            "0,1", "0,\"extra\":true", "0,\"value\":1",
             "[]", "{}", "1,2", "١", "-", "--1",
         ] {
             XCTAssertThrowsError(try JSONNumber(invalid), invalid)

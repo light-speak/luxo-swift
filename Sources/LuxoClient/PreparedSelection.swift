@@ -91,9 +91,11 @@ private final class SelectionParser {
 
     private func readIdentifier() -> String {
         let start = offset
-        guard offset < input.count, isIdentifierStart(input[offset]) else { return "" }
-        offset += 1
-        while offset < input.count, isIdentifierPart(input[offset]) { offset += 1 }
+        while offset < input.count {
+            let width = selectionIdentifierWidth(input, at: offset, first: offset == start)
+            if width == 0 { break }
+            offset += width
+        }
         return String(decoding: input[start..<offset], as: UTF8.self)
     }
 
@@ -110,12 +112,39 @@ private final class SelectionParser {
     }
 }
 
-private func isIdentifierStart(_ byte: UInt8) -> Bool {
-    byte == 95 || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+private func selectionIdentifierWidth(_ input: [UInt8], at offset: Int, first: Bool) -> Int {
+    let byte = input[offset]
+    if byte < 128 {
+        return byte == 95 || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+            || (!first && byte >= 48 && byte <= 57) ? 1 : 0
+    }
+    // Input is a Swift String's valid UTF-8; offsets only advance by full scalars.
+    let width = byte < 224 ? 2 : byte < 240 ? 3 : 4
+    var value = UInt32(byte & (width == 2 ? 31 : width == 3 ? 15 : 7))
+    for index in 1..<width { value = (value << 6) | UInt32(input[offset + index] & 63) }
+    guard let scalar = Unicode.Scalar(value), isLuxoDSLLetter(scalar) else { return 0 }
+    return width
 }
 
-private func isIdentifierPart(_ byte: UInt8) -> Bool {
-    isIdentifierStart(byte) || (byte >= 48 && byte <= 57)
+private func isLuxoDSLLetter(_ scalar: Unicode.Scalar) -> Bool {
+    switch scalar.properties.generalCategory {
+    case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter, .otherLetter: true
+    default: false
+    }
+}
+
+func isLuxoDSLIdentifier(_ name: String) -> Bool {
+    var first = true
+    for scalar in name.unicodeScalars {
+        let value = scalar.value
+        if value != 95 && !(value >= 65 && value <= 90) && !(value >= 97 && value <= 122)
+            && !(!first && value >= 48 && value <= 57) && !(value >= 128 && isLuxoDSLLetter(scalar))
+        {
+            return false
+        }
+        first = false
+    }
+    return !first
 }
 
 extension LuxoBinaryProtocol {

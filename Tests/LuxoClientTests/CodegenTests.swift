@@ -6,6 +6,340 @@ import XCTest
 #endif
 
 final class CodegenTests: XCTestCase {
+    #if os(macOS) || os(Linux)
+        func testNullableJSONGeneratedWireNormalizesLegacyNull() throws {
+            let raw = #"""
+                {"models":{},"types":{"Packet":{"name":"Packet","usage":"inputOutput","fields":[
+                {"id":1,"name":"required","type":"JSON"},{"id":2,"name":"optional","type":"JSON","nullable":true},
+                {"id":3,"name":"items","type":"JSON","isList":true}]}},"apis":{"read":{"id":1,"name":"read","module":"test",
+                "returnType":"JSON","returnNullable":true,"params":[{"id":1,"name":"value","type":"JSON","nullable":true},
+                {"id":2,"name":"fallback","type":"JSON","nullable":true,"hasDefault":true}]}}}
+                """#
+            let schema = try JSONDecoder().decode(LuxoSchema.self, from: Data(raw.utf8))
+            let generator = try makeCodegen()
+            let client =
+                generator.generateClient(schema) + """
+
+                    extension LuxoGeneratedClient {
+                        static func testNullableRoot(_ data: Data) throws -> JSONValue? {
+                            try decode_read(TransportPayload(data: data, mode: .binary))
+                        }
+                        static func testNullableParameters() throws -> Data {
+                            let request = _readRequest(values: .init(value: JSONValue.null, fallback: .present(JSONValue.null)))
+                            var encoder = Encoder(); try request.writeParameters(to: &encoder); return encoder.data
+                        }
+                    }
+                    """
+            try runNullableJSONConsumer([
+                "Models.swift": generator.generateModels(schema), "Decoders.swift": generator.generateDecoders(schema),
+                "Schema.swift": generator.generateSchema(schema), "Client.swift": client,
+                "Main.swift": """
+                import Foundation
+                import LuxoClient
+                func check(_ condition: Bool) { precondition(condition) }
+                @main struct Main {
+                    static func main() throws {
+                        let null = Data("null".utf8)
+                        var encoded = Encoder()
+                        try PacketInput(required: .null, optional: .null, items: [.null]).writeLuxo(to: &encoded)
+                        var expected = Encoder(); expected.writeVarint(0); expected.writeVarint(1); expected.writeBytes(null)
+                        expected.writeVarint(2); expected.writeBool(false); expected.writeVarint(3)
+                        try expected.writeArrayHeader(1); expected.writeBytes(null); expected.writeEnd()
+                        precondition(encoded.data == expected.data)
+                        check(try LuxoGeneratedClient.testNullableParameters() == Data([1,0,2,0]))
+                        for text in ["null", " \\t\\r\\nnull "] {
+                            var row = Encoder(); row.writeVarint(0); row.writeVarint(2); row.writeBool(true)
+                            row.writeBytes(Data(text.utf8)); row.writeEnd()
+                            let value = try decodeLuxoResponse(row.data) { try decodePacket(&$0) }
+                            check(try value.optional.requireValue() == nil)
+                            var column = Encoder(); column.writeVarint(1); column.writeVarint(0); column.writeVarint(2)
+                            column.writeBool(true); column.writeBytes(Data(text.utf8)); column.writeEnd()
+                            let values = try decodeColumnarPacket(column.data)
+                            precondition(values.count == 1)
+                            check(try values[0].optional.requireValue() == nil)
+                            var root = Encoder(); root.writeBool(true); root.writeBytes(Data(text.utf8))
+                            check(try LuxoGeneratedClient.testNullableRoot(root.data) == nil)
+                        }
+                        let value = try decodeLuxoResponse(encoded.data) { try decodePacket(&$0) }
+                        check(try value.required.requireValue() == .null)
+                        check(try value.items.requireValue() == [.null])
+                        check(try LuxoGeneratedClient.testNullableRoot(Data([0])) == nil)
+                        do { _ = try LuxoGeneratedClient.testNullableRoot(Data()); fatalError("missing body accepted") }
+                        catch let error as LuxoError { precondition(error.name == "ParseError" || error.name == "DecodeError") }
+                        var invalid = Encoder(); invalid.writeBool(true); invalid.writeBytes(Data("null false".utf8))
+                        do { _ = try LuxoGeneratedClient.testNullableRoot(invalid.data); fatalError("invalid JSON accepted") }
+                        catch let error as LuxoError { precondition(error.name == "DecodeError") }
+                    }
+                }
+                """,
+            ])
+        }
+
+        private func runNullableJSONConsumer(_ sources: [String: String]) throws {
+            let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".tmp")
+            let directory = root.appendingPathComponent("nullable-json-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer {
+                if directory.deletingLastPathComponent() == root { try? FileManager.default.removeItem(at: directory) }
+            }
+            for (name, source) in sources {
+                try source.write(to: directory.appendingPathComponent(name), atomically: true, encoding: .utf8)
+            }
+            let build = Bundle(for: CodegenTests.self).bundleURL.deletingLastPathComponent()
+            let objects = try FileManager.default.contentsOfDirectory(
+                at: build.appendingPathComponent("LuxoClient.build"), includingPropertiesForKeys: nil
+            )
+            .filter { $0.lastPathComponent.hasSuffix(".swift.o") }.map(\.path)
+            let executable = directory.appendingPathComponent("consumer")
+            let log = directory.appendingPathComponent("consumer.log")
+            XCTAssertTrue(FileManager.default.createFile(atPath: log.path, contents: nil))
+            let output = try FileHandle(forWritingTo: log)
+            defer { try? output.close() }
+            let command = Process(); command.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            command.arguments =
+                [
+                    "swiftc", "-profile-generate", "-parse-as-library", "-swift-version", "6", "-warnings-as-errors",
+                    "-I", build.appendingPathComponent("Modules").path,
+                ]
+                + sources.keys.sorted().map { directory.appendingPathComponent($0).path } + objects + [
+                    "-o", executable.path,
+                ]
+            command.standardOutput = output; command.standardError = output
+            try command.run(); command.waitUntilExit()
+            guard command.terminationStatus == 0 else {
+                return XCTFail(try String(contentsOf: log, encoding: .utf8))
+            }
+            let consumer = Process(); consumer.executableURL = executable
+            consumer.standardOutput = output; consumer.standardError = output
+            consumer.environment = ProcessInfo.processInfo.environment.merging([
+                "LLVM_PROFILE_FILE": directory.appendingPathComponent("consumer.profraw").path
+            ]) { _, value in value }
+            try consumer.run(); consumer.waitUntilExit()
+            let diagnostics = try String(contentsOf: log, encoding: .utf8)
+            XCTAssertEqual(consumer.terminationStatus, 0, diagnostics)
+        }
+    #endif
+
+    #if os(macOS) || os(Linux)
+        func testUnicodeSchemaNamesCompileWithStaticWireTypes() throws {
+            let data = Data(
+                #"{"models":{"Café":{"name":"Café","usage":"inputOutput","fields":[{"id":1,"name":"café","type":"String"},{"id":2,"name":"状态","type":"Enum","typeName":"État"}]}},"enums":{"État":{"name":"État","values":["PRÊT"]}},"apis":{"café":{"id":1,"name":"café","module":"test","returnType":"Café","params":[{"id":1,"name":"entrée","type":"Model","typeName":"Café"}]},"listé":{"id":2,"name":"listé","module":"test","returnType":"Café","paginated":true,"query":{"filters":[{"field":"𐐀_name","type":"String","operators":["eq"]}],"sorters":["中文2"]}}}}"#
+                    .utf8)
+            let schema = try JSONDecoder().decode(LuxoSchema.self, from: data)
+            let generator = try makeCodegen()
+            let sources = [
+                "Models.swift": generator.generateModels(schema), "Decoders.swift": generator.generateDecoders(schema),
+                "Schema.swift": generator.generateSchema(schema), "Client.swift": generator.generateClient(schema),
+                "Queries.swift": try SwiftQueryCodegen.generate(schema),
+                "Consumer.swift": """
+                import LuxoClient
+                func consumeUnicode(_ client: LuxoGeneratedClient) async throws {
+                    let input = CaféInput(café: "coffee", 状态: État(rawValue: "PRÊT"))
+                    let row = try await client.café(entrée: input, select: "café,状态")
+                    let coffee = try row.café.requireValue()
+                    precondition(coffee == "coffee")
+                    precondition(LuxoQuery_listé.𐐀_name_eq("letter").field == "𐐀_name")
+                    precondition(LuxoQuery_listé.中文2_desc().field == "中文2")
+                }
+                """,
+            ]
+            let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".tmp")
+            let directory = root.appendingPathComponent("unicode-names-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            for (name, source) in sources {
+                try source.write(to: directory.appendingPathComponent(name), atomically: true, encoding: .utf8)
+            }
+            let modules = Bundle(for: CodegenTests.self).bundleURL.deletingLastPathComponent().appendingPathComponent(
+                "Modules")
+            let log = directory.appendingPathComponent("typecheck.log")
+            XCTAssertTrue(FileManager.default.createFile(atPath: log.path, contents: nil))
+            let output = try FileHandle(forWritingTo: log)
+            defer { try? output.close() }
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments =
+                ["swiftc", "-typecheck", "-swift-version", "6", "-warnings-as-errors", "-I", modules.path]
+                + sources.keys.sorted().map { directory.appendingPathComponent($0).path }
+            process.standardOutput = output
+            process.standardError = output
+            try process.run()
+            process.waitUntilExit()
+            let diagnostics = try String(contentsOf: log, encoding: .utf8)
+            XCTAssertEqual(process.terminationStatus, 0, diagnostics)
+        }
+    #endif
+
+    #if os(macOS) || os(Linux)
+        func testColumnarBusinessFieldsCannotShadowDecoderLocals() throws {
+            let names = [
+                "items", "i", "_items", "decoder", "initial", "total", "page", "pageSize", "depth", "depth_", "_i",
+            ]
+            let fields = names.enumerated().map { index, name in
+                LuxoField(
+                    id: index + 1, name: name, type: "Int", typeName: nil,
+                    nullable: true, isList: name == "items", relation: nil)
+            }
+            let schema = LuxoSchema(
+                models: [
+                    "ColumnarCollision": LuxoModel(
+                        name: "ColumnarCollision", usage: .output, fields: fields)
+                ], apis: [:], enums: nil, types: nil)
+            let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".tmp")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let directory = root.appendingPathComponent("columnar-fields-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer {
+                if directory.deletingLastPathComponent() == root { try? FileManager.default.removeItem(at: directory) }
+            }
+            let generator = try makeCodegen()
+            let sources = [
+                "Models.swift": generator.generateModels(schema),
+                "Decoders.swift": generator.generateDecoders(schema),
+                "Schema.swift": generator.generateSchema(schema),
+            ]
+            for (name, source) in sources {
+                try source.write(to: directory.appendingPathComponent(name), atomically: true, encoding: .utf8)
+            }
+            let modules = Bundle(for: CodegenTests.self).bundleURL.deletingLastPathComponent().appendingPathComponent(
+                "Modules")
+            let log = directory.appendingPathComponent("typecheck.log")
+            XCTAssertTrue(FileManager.default.createFile(atPath: log.path, contents: nil))
+            let output = try FileHandle(forWritingTo: log)
+            defer { try? output.close() }
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments =
+                ["swiftc", "-typecheck", "-swift-version", "6", "-warnings-as-errors", "-I", modules.path]
+                + sources.keys.sorted().map { directory.appendingPathComponent($0).path }
+            process.standardOutput = output
+            process.standardError = output
+            try process.run()
+            process.waitUntilExit()
+            let diagnostics = try String(contentsOf: log, encoding: .utf8)
+            XCTAssertEqual(process.terminationStatus, 0, diagnostics)
+        }
+    #endif
+
+    func testBinaryModelDepthPreservesBusinessFieldNamesAndEmptyLists() throws {
+        for (names, depth) in [
+            ([String](), "depth"), (["depth"], "depth_"),
+            (["depth", "_depth", "depth_", "_depth_"], "depth__"),
+        ] {
+            var fields = names.enumerated().map { index, name in
+                LuxoField(
+                    id: index + 1, name: name, type: "String", typeName: nil, nullable: true, isList: false,
+                    relation: nil)
+            }
+            fields.append(
+                LuxoField(
+                    id: 9, name: "child", type: "Model", typeName: "DepthModel", nullable: true, isList: false,
+                    relation: nil))
+            let schema = LuxoSchema(
+                models: ["DepthModel": LuxoModel(name: "DepthModel", usage: .output, fields: fields)],
+                apis: [:], enums: nil, types: nil)
+            let source = try makeCodegen().generateDecoders(schema)
+            XCTAssertTrue(source.contains("guard \(depth) < 64 else"))
+            XCTAssertTrue(source.contains("guard decoder.count == 0 || \(depth) < 64 else"))
+            XCTAssertTrue(source.contains("try decodeDepthModel(&decoder, depth: \(depth) + 1)"))
+            XCTAssertTrue(source.contains("model nesting exceeds 64 levels"))
+            for name in names { XCTAssertTrue(source.contains("            \(name): _\(name)")) }
+        }
+    }
+
+    func testInputHelperAliasesPreserveBusinessTypes() throws {
+        let schema = try JSONDecoder().decode(
+            LuxoSchema.self,
+            from: Data(
+                #"{"models":{"User":{"name":"User","usage":"inputOutput","fields":[{"id":1,"name":"id","type":"Int"},{"id":2,"name":"parent","type":"Model","typeName":"User","nullable":true}]},"LuxoUser":{"name":"LuxoUser","usage":"inputOutput","fields":[{"id":1,"name":"id","type":"Int"}]}},"types":{"UserInput":{"name":"UserInput","usage":"output","fields":[{"id":1,"name":"label","type":"String"}]},"LuxoUserInput2":{"name":"LuxoUserInput2","usage":"output","fields":[{"id":1,"name":"label","type":"String"}]}},"apis":{"readUser":{"id":1,"name":"readUser","module":"test","returnType":"User"},"writeUser":{"id":2,"name":"writeUser","module":"test","returnType":"Int","params":[{"id":1,"name":"input","type":"Model","typeName":"User"}]}}}"#
+                    .utf8))
+        let generator = try makeCodegen()
+        let source = generator.generateModels(schema)
+        if let directory = ProcessInfo.processInfo.environment["LUXO_INPUT_ALIAS_EVIDENCE"] {
+            try source.write(toFile: directory + "/Models.swift", atomically: true, encoding: .utf8)
+            try generator.generateClient(schema).write(
+                toFile: directory + "/Client.swift", atomically: true, encoding: .utf8)
+            try generator.generateDecoders(schema).write(
+                toFile: directory + "/Decoders.swift", atomically: true, encoding: .utf8)
+            try generator.generateSchema(schema).write(
+                toFile: directory + "/Schema.swift", atomically: true, encoding: .utf8)
+        }
+        XCTAssertTrue(source.contains("public final class LuxoUserInput3:"))
+        XCTAssertTrue(source.contains("public struct UserInput:"))
+        XCTAssertTrue(source.contains("public struct LuxoUserInput:"))
+        XCTAssertTrue(source.contains("public struct LuxoUserInput2:"))
+        XCTAssertTrue(source.contains("public let parent: LuxoUserInput3?"))
+        XCTAssertTrue(generator.generateClient(schema).contains("input: LuxoUserInput3"))
+    }
+
+    func testIntrospectionRedirectPolicyRejectsAllLocations() throws {
+        let origin = try XCTUnwrap(URL(string: "https://example.com/schema"))
+        let task = URLSession.shared.dataTask(with: origin)
+        defer { task.cancel() }
+        for status in [301, 302, 303, 307, 308] {
+            for location in ["https://example.com/other", "https://other.example/schema"] {
+                let request = URLRequest(url: try XCTUnwrap(URL(string: location)))
+                let response = try XCTUnwrap(
+                    HTTPURLResponse(
+                        url: origin, statusCode: status, httpVersion: nil, headerFields: ["Location": location]))
+                let completed = expectation(description: "redirect rejected")
+                IntrospectionRedirectPolicy.shared.urlSession(
+                    .shared, task: task, willPerformHTTPRedirection: response, newRequest: request
+                ) { next in
+                    XCTAssertNil(next)
+                    completed.fulfill()
+                }
+                wait(for: [completed], timeout: 1)
+            }
+        }
+    }
+
+    func testRealIntrospectionRejectsRedirect() async throws {
+        guard let base = ProcessInfo.processInfo.environment["LUXO_CODEGEN_REDIRECT_URL"] else {
+            throw XCTSkip("requires isolated introspection redirect fixture")
+        }
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".tmp/codegen-redirect-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let generator = try LuxoCodegen(endpoint: base + "/redirect", introspectionKey: "test-secret")
+        var failure: Error?
+        do { try await generator.generate(outputDir: root.path) } catch { failure = error }
+        let (captured, _) = try await URLSession.shared.data(from: XCTUnwrap(URL(string: base + "/captured")))
+        XCTAssertEqual(String(decoding: captured, as: UTF8.self), "[]", "key reached redirect target")
+        XCTAssertEqual((failure as? LuxoError)?.code, 302)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [])
+        let direct = try LuxoCodegen(endpoint: base + "/schema", introspectionKey: "test-secret")
+        try await direct.generate(outputDir: root.path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Models.swift").path))
+    }
+
+    func testInputEncoderFieldUsesExplicitReceiver() throws {
+        let names = ["ScalarInput", "OptionalInput", "SequenceInput"]
+        let models = Dictionary(
+            uniqueKeysWithValues: names.map { name in
+                (
+                    name,
+                    LuxoModel(
+                        name: name, usage: .input,
+                        fields: [
+                            LuxoField(
+                                id: 1, name: "encoder", type: "String", typeName: nil,
+                                nullable: name == "OptionalInput", isList: name == "SequenceInput", relation: nil)
+                        ])
+                )
+            })
+        let schema = LuxoSchema(models: models, apis: [:], enums: nil, types: nil)
+        let source = try makeCodegen().generateModels(schema)
+        if let directory = ProcessInfo.processInfo.environment["LUXO_CODEGEN_ENCODER_EVIDENCE"] {
+            try source.write(toFile: directory + "/Models.swift", atomically: true, encoding: .utf8)
+        }
+        XCTAssertTrue(source.contains("self.encoder.utf8.count"))
+        XCTAssertTrue(source.contains("self.encoder.map"))
+        XCTAssertTrue(source.contains("encoder.writeString(self.encoder)"))
+        XCTAssertTrue(source.contains("if let value = self.encoder"))
+        XCTAssertTrue(source.contains("for item in self.encoder"))
+    }
 
     func testGeneratedSelectionPlanPreservesTextAndManualOverride() throws {
         let schema = try JSONDecoder().decode(
@@ -22,6 +356,37 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(source.contains("var selectionPlan: PreparedSelection? { values.selectionPlan }"))
         XCTAssertTrue(source.contains("let select = selection"))
         XCTAssertFalse(source.contains("callParams[\"selectionPlan\"]"))
+    }
+
+    func testOnlyInlineRecursiveComponentsUseReferenceStorage() throws {
+        let payload = Data(
+            #"""
+            {"models":{},"apis":{},"types":{
+              "Leaf":{"name":"Leaf","usage":"inputOutput","fields":[{"id":1,"name":"id","type":"Int"}]},
+              "Tree":{"name":"Tree","usage":"inputOutput","fields":[{"id":1,"name":"children","type":"Model","typeName":"Tree","isList":true}]},
+              "Node":{"name":"Node","usage":"inputOutput","fields":[{"id":1,"name":"next","type":"Model","typeName":"Node","nullable":true}]},
+              "Left":{"name":"Left","usage":"inputOutput","fields":[{"id":1,"name":"right","type":"Model","typeName":"Right","nullable":true}]},
+              "Right":{"name":"Right","usage":"inputOutput","fields":[{"id":1,"name":"left","type":"Model","typeName":"Left","nullable":true}]},
+              "Owner":{"name":"Owner","usage":"inputOutput","fields":[{"id":1,"name":"node","type":"Model","typeName":"Node"}]},
+              "Branch":{"name":"Branch","usage":"inputOutput","fields":[{"id":1,"name":"twig","type":"Model","typeName":"Twig","nullable":true}]},
+              "Twig":{"name":"Twig","usage":"inputOutput","fields":[{"id":1,"name":"branches","type":"Model","typeName":"Branch","isList":true}]}
+            }}
+            """#.utf8)
+        let schema = try JSONDecoder().decode(LuxoSchema.self, from: payload)
+        let source = try makeCodegen().generateModels(schema)
+        for name in ["Node", "Left", "Right"] {
+            for suffix in ["", "Input"] {
+                XCTAssertTrue(source.contains("public final class \(name)\(suffix):"), name + suffix)
+            }
+        }
+        for name in ["Leaf", "Tree", "Owner", "Branch", "Twig"] {
+            for suffix in ["", "Input"] {
+                XCTAssertTrue(source.contains("public struct \(name)\(suffix):"), name + suffix)
+            }
+        }
+        if let directory = ProcessInfo.processInfo.environment["LUXO_CODEGEN_RECURSIVE_EVIDENCE"] {
+            try source.write(toFile: directory + "/GraphModels.swift", atomically: true, encoding: .utf8)
+        }
     }
 
     func testNullableRootResponsesPreserveSchemaAndGeneratedTypes() throws {
@@ -45,7 +410,7 @@ final class CodegenTests: XCTestCase {
                     XCTAssertTrue(source.contains("if try isNullRoot(result.data) { return nil }"))
                     XCTAssertTrue(source.contains("offset: 1"))
                     XCTAssertFalse(source.contains("dropFirst"))
-                    if stream { XCTAssertTrue(source.contains("@Sendable (\(result)) -> Void")) }
+                    if stream { XCTAssertTrue(source.contains("LuxoClient.SubscriptionHandler<\(result)>")) }
                 }
             }
         }
@@ -221,7 +586,7 @@ final class CodegenTests: XCTestCase {
         let schema = LuxoSchema(models: ["Parent": parent], apis: [:], enums: nil, types: ["Child": child])
         let source = try makeCodegen().generateDecoders(schema)
         XCTAssertTrue(source.contains("decodeLuxoResponse(decoder.readBytes())"))
-        XCTAssertTrue(source.contains("decodeColumnarChild(decoder.readBytes())"))
+        XCTAssertTrue(source.contains("decodeColumnarChild(decoder.readBytes(), depth: depth + 1)"))
         XCTAssertTrue(source.contains("decodeLuxoResponse(d.readBytes())"))
         XCTAssertTrue(source.contains("decodeLuxoResponse(data[i])"))
         XCTAssertTrue(source.contains("guard decoder.isAtEnd else"))
@@ -234,7 +599,7 @@ final class CodegenTests: XCTestCase {
             ("String", "LuxoValue(value)"), ("Boolean", "LuxoValue(value)"),
             ("DateTime", "LuxoValue(value)"), ("UUID", "LuxoValue(value)"),
             ("Decimal", "LuxoValue(value)"), ("Bytes", "LuxoValue(value)"),
-            ("JSON", "LuxoValue(value)"), ("Float", "try LuxoValue(finiteFloat: value)"),
+            ("JSON", "try LuxoValue.checkedJSON(value)"), ("Float", "try LuxoValue(finiteFloat: value)"),
             ("Enum", ".string(value.rawValue)"),
         ]
         for (type, expression) in cases {
@@ -243,7 +608,7 @@ final class CodegenTests: XCTestCase {
                     id: 1, name: "value", type: type, typeName: type == "Enum" ? "Status" : nil,
                     nullable: false, hasDefault: false, isList: list)
                 let api = LuxoAPI(
-                    id: 1, name: "echo", module: "test", returnType: "Void", returnList: false,
+                    id: 1, name: "echo", module: "test", returnType: "Int", returnList: false,
                     paginated: false, stream: false, params: [param])
                 let schema = LuxoSchema(
                     models: [:], apis: ["echo": api],
@@ -396,7 +761,14 @@ final class CodegenTests: XCTestCase {
             stream: false, params: nil)
         let page = LuxoAPI(
             id: 3, name: "listPayloadPage", module: "file", returnType: "Payload", returnList: true, paginated: true,
-            stream: false, params: nil)
+            stream: false,
+            params: [
+                LuxoParam(
+                    id: 7, name: "page", type: "Int", typeName: nil, nullable: false, hasDefault: true, isList: false),
+                LuxoParam(
+                    id: 9, name: "pageSize", type: "Int", typeName: nil, nullable: false, hasDefault: true,
+                    isList: false),
+            ])
         let schema = LuxoSchema(
             models: ["Payload": payload], apis: ["listPayloads": list, "listPayloadPage": page], enums: nil, types: nil)
         let codegen = try makeCodegen()
@@ -493,8 +865,8 @@ final class CodegenTests: XCTestCase {
         for expected in [
             "encoder.writeVarint(UInt64(name.utf8.count + role.rawValue.utf8.count + (note.map { $0.utf8.count } ?? 0)))",
             "encoder.writeString(role.rawValue)",
-            "try child.writeLuxo(to: &encoder)",
-            "encoder.writeArrayHeader(tags.count)",
+            "try child.writeLuxo(to: &encoder, depth: depth + 1)",
+            "try encoder.writeArrayHeader(tags.count)",
             "for item in tags",
             "encoder.writeBool(false)",
             "encoder.writeBool(true)",
@@ -613,7 +985,7 @@ final class CodegenTests: XCTestCase {
 
         XCTAssertTrue(
             source.contains(
-                "public func subscribeWatchOrders(status: String, select: String? = nil, selectionPlan: PreparedSelection? = nil, observer: StreamObserver? = nil, handler: @escaping @Sendable (OrderEvent) -> Void) async throws -> (@Sendable () -> Void)"
+                "public func subscribeWatchOrders(status: String, select: String? = nil, selectionPlan: PreparedSelection? = nil, observer: StreamObserver? = nil, handler: @escaping LuxoClient.SubscriptionHandler<OrderEvent>) async throws -> (@Sendable () -> Swift.Void)"
             ))
         XCTAssertTrue(
             source.contains(
@@ -831,7 +1203,7 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(
             source.contains("values[i].map { data in try decodeLuxoResponse(data) { decoder in decoder.readArray"))
         XCTAssertFalse(source.contains("decodeLuxoResponse(data) { decoder in decoder.readBool()"))
-        XCTAssertTrue(source.contains("values[i].map { try decodeColumnarArrayRecord($0) }"))
+        XCTAssertTrue(source.contains("values[i].map { try decodeColumnarArrayRecord($0, depth: depth + 1) }"))
     }
 
     private func makeCodegen() throws -> LuxoCodegen {

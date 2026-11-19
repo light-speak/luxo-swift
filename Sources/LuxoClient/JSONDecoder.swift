@@ -1,16 +1,30 @@
 import Foundation
 
-/// Decodes a Luxo JSON response once, without converting generic numeric tokens.
+/// Decodes typed JSON without converting generic numeric tokens.
 public struct LuxoJSONDecoder: Sendable {
     public init() {}
 
     public func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
-        try JSONTreeDecoder(value: JSONReader.decode(data)).decode(type)
+        let schema = (type as? any LuxoJSONSchemaProviding.Type)?.luxoJSONSchema
+        if let schema { return try JSONTreeDecoder(value: JSONReader.decode(data, schema: schema)).decode(type) }
+        if type is any JSONCodableLeaf.Type { return try JSONTreeDecoder(value: JSONReader.decode(data)).decode(type) }
+        let value: LuxoValue
+        // Every source occurrence is checked, including values later replaced by duplicate keys.
+        do { value = try JSONReader.decodeCodable(data) } catch is JSONCodableContextRequired {
+            let document = try JSONCodableDocument(data)
+            return try JSONCodableDecoder(document: document, range: document.root).decode(type)
+        }
+        return try JSONTreeDecoder(value: value).decode(type)
     }
 
     /// Generated outputs call this only after decoding an empty projection.
     /// Other Codable formats do not inherit Luxo's JSON wire constraints.
     public static func validateEmptyModelProjection(from decoder: Swift.Decoder) throws {
+        if let decoder = decoder as? JSONCodableDecoder {
+            guard let key = decoder.key as? JSONCodingKey, key.intValue != nil else { return }
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath, debugDescription: "model list item has no selected schema field"))
+        }
         guard let tree = decoder as? JSONTreeDecoder,
             let key = tree.key as? JSONCodingKey, key.intValue != nil
         else { return }

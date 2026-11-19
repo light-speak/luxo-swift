@@ -28,9 +28,6 @@ enum SwiftRequestCodegen {
         }
         if selection { result += [("select", "String?"), ("selectionPlan", "PreparedSelection?")] }
         if api.paginated == true {
-            for name in pagination where !(api.params ?? []).contains(where: { $0.name == name }) {
-                result.append((name, "Int?"))
-            }
             result += [("filters", "[LuxoFilter]?"), ("sorters", "[LuxoSorter]?")]
         }
         return result
@@ -59,19 +56,25 @@ enum SwiftRequestCodegen {
                 "    var filters: [LuxoFilter]? { values.filters }\n    var sorters: [LuxoSorter]? { values.sorters }\n"
         }
         out += "    func toJSONParameters() throws -> [String: LuxoValue] {\n"
-        for (name, _) in stored where name != "selectionPlan" {
+        for (name, type) in stored where name != "selectionPlan" {
             let value = selection && name == "select" ? "selection" : "values.\(name)"
-            out += "        let \(name) = \(value)\n"
+            let annotation =
+                api.params?.contains(where: { $0.name == name && $0.type == "Sealed" }) == true
+                ? ": " + type : ""
+            out += "        let \(name)\(annotation) = \(value)\n"
         }
         out += jsonSetup
         out += "        return \(jsonSetup.isEmpty ? "[:]" : "callParams")\n    }\n"
         out += "    func writeParameters(to encoder: inout Encoder) throws {\n"
-        for param in api.params ?? [] { out += writeParameter(api, param, scalar: scalar) }
+        for param in api.params ?? [] {
+            let explicitType = param.type == "Sealed" ? stored.first(where: { $0.0 == param.name })?.1 : nil
+            out += writeParameter(api, param, explicitType: explicitType, scalar: scalar)
+        }
         return out + "    }\n}\n"
     }
 
     private static func writeParameter(
-        _ api: LuxoAPI, _ param: LuxoParam,
+        _ api: LuxoAPI, _ param: LuxoParam, explicitType: String?,
         scalar: (LuxoField, String) -> String
     ) -> String {
         let tri = param.nullable == true && param.hasDefault == true
@@ -81,17 +84,20 @@ enum SwiftRequestCodegen {
         } else if optional(api, param) {
             out += "        if let value = values.\(param.name) {\n"
         } else {
-            out += "        let value = values.\(param.name)\n"
+            out += "        let value\(explicitType.map { ": " + $0 } ?? "") = values.\(param.name)\n"
         }
         out += "        encoder.writeVarint(\(param.id))\n"
         let unwrap = param.nullable == true && (tri || !optional(api, param))
-        if unwrap { out += "        if let value {\n" }
+        if unwrap {
+            let nonNull = param.type == "JSON" && param.isList != true ? ", value != .null" : ""
+            out += "        if let value\(nonNull) {\n"
+        }
         if param.nullable == true { out += "        encoder.writeBool(true)\n" }
         let field = LuxoField(
             id: param.id, name: param.name, type: param.type, typeName: param.typeName,
             nullable: false, isList: false, relation: false)
         if param.isList == true {
-            out += "        encoder.writeVarint(UInt64(value.count))\n        for item in value {\n"
+            out += "        try encoder.writeArrayHeader(value.count)\n        for item in value {\n"
         }
         let value = param.isList == true ? "item" : "value"
         out +=

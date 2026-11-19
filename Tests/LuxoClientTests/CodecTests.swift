@@ -2,6 +2,117 @@ import XCTest
 @testable import LuxoClient
 
 final class CodecTests: XCTestCase {
+    func testFieldStringsPreserveLeadingFEFFAndSliceBounds() throws {
+        for text in ["\u{feff}", "\u{feff}text", "\u{feff}\u{feff}東京", "\u{feff}\u{fffd}", "plain", "e\u{301}"] {
+            var encoder = Encoder()
+            encoder.writeString(text)
+            encoder.writeString("next")
+            var nullable = Encoder()
+            nullable.writeBool(true)
+            nullable.writeString(text)
+            nullable.writeBool(false)
+            for prefix in [0, 1, 8, 33] {
+                var reader = Decoder(shiftedTextPayload(encoder.data, prefix: prefix))
+                XCTAssertEqual(Array(reader.readString().utf8), Array(text.utf8))
+                XCTAssertEqual(reader.readString(), "next")
+                XCTAssertNil(reader.error)
+                XCTAssertTrue(reader.isAtEnd)
+                var pointer = Decoder(shiftedTextPayload(nullable.data, prefix: prefix))
+                XCTAssertEqual(Array(try XCTUnwrap(pointer.readStringPtr()).utf8), Array(text.utf8))
+                XCTAssertNil(pointer.readStringPtr())
+                XCTAssertNil(pointer.error)
+                XCTAssertTrue(pointer.isAtEnd)
+            }
+        }
+    }
+
+    func testColumnStringsPreserveLeadingFEFFAndSliceBounds() throws {
+        for text in ["\u{feff}", "\u{feff}text", "\u{feff}\u{feff}東京", "\u{feff}\u{fffd}", "plain", "e\u{301}"] {
+            var encoder = Encoder()
+            encoder.writeVarint(3)
+            encoder.writeVarint(0)
+            encoder.writeVarint(1)
+            for value in [text, "next", ""] { encoder.writeString(value) }
+            encoder.writeVarint(2)
+            encoder.writeBool(true)
+            encoder.writeString(text)
+            encoder.writeBool(false)
+            encoder.writeBool(true)
+            encoder.writeString("")
+            encoder.writeEnd()
+            for prefix in [0, 1, 8, 33] {
+                var reader = ColumnarDecoder(data: shiftedTextPayload(encoder.data, prefix: prefix))
+                XCTAssertTrue(reader.nextColumn())
+                let values = reader.readColumnString()
+                XCTAssertEqual(values.map { Array($0.utf8) }, [text, "next", ""].map { Array($0.utf8) })
+                XCTAssertTrue(reader.nextColumn())
+                let optional = reader.readColumnStringPtr()
+                XCTAssertEqual(optional.count, 3)
+                XCTAssertEqual(Array(try XCTUnwrap(optional.first ?? nil).utf8), Array(text.utf8))
+                if optional.count == 3 {
+                    XCTAssertNil(optional[1])
+                    XCTAssertEqual(optional[2], "")
+                }
+                XCTAssertFalse(reader.nextColumn())
+                XCTAssertNil(reader.error)
+                XCTAssertTrue(reader.isAtEnd)
+            }
+        }
+    }
+
+    func testMalformedTextAfterFEFFIsRejected() {
+        for bytes: [UInt8] in [[0xef, 0xbb], [0xef, 0xbb, 0xbf, 0xff], [0xc0, 0x80], [0xed, 0xa0, 0x80]] {
+            var field = Encoder()
+            field.writeBytes(Data(bytes))
+            var row = Decoder(field.data)
+            XCTAssertEqual(row.readString(), "")
+            XCTAssertNotNil(row.error)
+            var column = Encoder()
+            column.writeVarint(1)
+            column.writeVarint(0)
+            column.writeVarint(1)
+            column.writeRawBytes(field.data)
+            column.writeEnd()
+            var reader = ColumnarDecoder(data: column.data)
+            XCTAssertTrue(reader.nextColumn())
+            XCTAssertTrue(reader.readColumnString().isEmpty)
+            XCTAssertNotNil(reader.error)
+        }
+    }
+
+    func testFoundationFieldTextPreservesFEFFAndRejectsInvalidBytes() throws {
+        for text in ["", "\u{feff}", "\u{feff}\u{feff}東京", "\u{fefd}", "\u{fffd}", "plain"] {
+            for prefix in [0, 1, 8, 33] {
+                let bytes = shiftedTextPayload(Data(text.utf8), prefix: prefix)
+                let value = try XCTUnwrap(strictUTF8String(bytes))
+                XCTAssertEqual(Array(value.utf8), Array(text.utf8))
+            }
+        }
+        for bytes: [UInt8] in [[0xff], [0xef, 0xbb], [0xef, 0xbb, 0xbf, 0xff], [0xed, 0xa0, 0x80]] {
+            XCTAssertNil(strictUTF8String(Data(bytes)))
+        }
+        let retained = "\u{feff}value"
+        XCTAssertEqual(preservingUTF8Content(retained, hasMarker: true, byteCount: retained.utf8.count), retained)
+    }
+
+    private func shiftedTextPayload(_ data: Data, prefix: Int) -> Data {
+        var parent = Data(repeating: 0xff, count: prefix)
+        parent.append(data)
+        parent.append(0xff)
+        return parent[prefix..<prefix + data.count]
+    }
+
+    func testCompactDecimalTextPreservesPrecisionWithoutNumericConversion() throws {
+        for text in ["1e2147483647", "-1e-2147483648", "1.23"] {
+            let payload = Data([UInt8(text.utf8.count)]) + Data(text.utf8)
+            var decoder = Decoder(payload)
+            XCTAssertEqual(decoder.readString(), text)
+            XCTAssertNil(decoder.error)
+            XCTAssertTrue(decoder.isAtEnd)
+            XCTAssertEqual(try JSONReader.decode(Data("\"\(text)\"".utf8)), .string(text))
+        }
+    }
+
     func testFixedWidthReadsUseUnalignedSliceOffsets() throws {
         let expected = UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!
         var encoder = Encoder()
@@ -133,7 +244,8 @@ final class CodecTests: XCTestCase {
 
     func testNativeDateFloorsBeforeEpoch() throws {
         var encoder = Encoder()
-        try encoder.writeField(1, value: Date(timeIntervalSince1970: -0.001), type: "DateTime")
+        encoder.writeVarint(1)
+        try encoder.writeDateTime(Date(timeIntervalSince1970: -0.001))
         var decoder = Decoder(encoder.data)
         XCTAssertEqual(decoder.readVarint(), 1)
         XCTAssertEqual(decoder.readSvarint(), -1)
@@ -144,7 +256,7 @@ final class CodecTests: XCTestCase {
             var encoder = Encoder()
             encoder.writeBool(true)
             XCTAssertThrowsError(
-                try encoder.writeField(1, value: Date(timeIntervalSince1970: interval), type: "DateTime"))
+                try encoder.writeDateTime(Date(timeIntervalSince1970: interval)))
             XCTAssertEqual(encoder.data, Data([1]))
         }
     }
@@ -384,7 +496,8 @@ final class CodecTests: XCTestCase {
 
     func testWriteFieldInt() throws {
         var encoder = Encoder()
-        try encoder.writeField(1, value: 99 as Int, type: "Int")
+        encoder.writeVarint(1)
+        encoder.writeSvarint(Int64(99))
         var decoder = Decoder(encoder.data)
         XCTAssertEqual(decoder.readVarint(), 1)  // field ID
         XCTAssertEqual(decoder.readSvarint(), 99)
@@ -392,7 +505,8 @@ final class CodecTests: XCTestCase {
 
     func testWriteFieldString() throws {
         var encoder = Encoder()
-        try encoder.writeField(2, value: "test", type: "String")
+        encoder.writeVarint(2)
+        encoder.writeString("test")
         var decoder = Decoder(encoder.data)
         XCTAssertEqual(decoder.readVarint(), 2)  // field ID
         XCTAssertEqual(decoder.readString(), "test")
@@ -400,7 +514,8 @@ final class CodecTests: XCTestCase {
 
     func testWriteFieldBool() throws {
         var encoder = Encoder()
-        try encoder.writeField(3, value: true, type: "Boolean")
+        encoder.writeVarint(3)
+        encoder.writeBool(true)
         var decoder = Decoder(encoder.data)
         XCTAssertEqual(decoder.readVarint(), 3)  // field ID
         XCTAssertTrue(decoder.readBool())
@@ -408,7 +523,8 @@ final class CodecTests: XCTestCase {
 
     func testWriteFieldFloat() throws {
         var encoder = Encoder()
-        try encoder.writeField(4, value: 2.718, type: "Float")
+        encoder.writeVarint(4)
+        try encoder.writeFixed64(2.718)
         var decoder = Decoder(encoder.data)
         XCTAssertEqual(decoder.readVarint(), 4)  // field ID
         XCTAssertEqual(decoder.readFixed64(), 2.718, accuracy: 0.0001)
@@ -618,7 +734,8 @@ final class CodecTests: XCTestCase {
     func testWriteFieldUUID() throws {
         let uuid = UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!
         var encoder = Encoder()
-        try encoder.writeField(7, value: uuid, type: "UUID")
+        encoder.writeVarint(7)
+        encoder.writeUUID(uuid)
         var decoder = Decoder(encoder.data)
         XCTAssertEqual(decoder.readVarint(), 7)  // field ID
         XCTAssertEqual(decoder.readUUID(), uuid)
@@ -627,7 +744,8 @@ final class CodecTests: XCTestCase {
     func testWriteFieldUUIDFromString() throws {
         let str = "01234567-89AB-CDEF-0123-456789ABCDEF"
         var encoder = Encoder()
-        try encoder.writeField(1, value: str, type: "UUID")
+        encoder.writeVarint(1)
+        encoder.writeUUID(try XCTUnwrap(UUID(uuidString: str)))
         var decoder = Decoder(encoder.data)
         _ = decoder.readVarint()
         XCTAssertEqual(decoder.readUUID(), UUID(uuidString: str)!)
@@ -635,11 +753,11 @@ final class CodecTests: XCTestCase {
 
     // MARK: - Scalar Arrays (row form)
 
-    func testUUIDArrayRowForm() {
+    func testUUIDArrayRowForm() throws {
         let u1 = UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!
         let u2 = UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!
         var encoder = Encoder()
-        encoder.writeArrayHeader(2)
+        try encoder.writeArrayHeader(2)
         encoder.writeUUID(u1)
         encoder.writeUUID(u2)
         var decoder = Decoder(encoder.data)
@@ -647,9 +765,9 @@ final class CodecTests: XCTestCase {
         XCTAssertEqual(got, [u1, u2])
     }
 
-    func testStringArrayRowForm() {
+    func testStringArrayRowForm() throws {
         var encoder = Encoder()
-        encoder.writeArrayHeader(3)
+        try encoder.writeArrayHeader(3)
         encoder.writeString("a")
         encoder.writeString("b")
         encoder.writeString("c")
@@ -658,9 +776,9 @@ final class CodecTests: XCTestCase {
         XCTAssertEqual(got, ["a", "b", "c"])
     }
 
-    func testIntArrayRowForm() {
+    func testIntArrayRowForm() throws {
         var encoder = Encoder()
-        encoder.writeArrayHeader(3)
+        try encoder.writeArrayHeader(3)
         encoder.writeSvarint(-1)
         encoder.writeSvarint(0)
         encoder.writeSvarint(42)
@@ -673,7 +791,9 @@ final class CodecTests: XCTestCase {
         let u1 = UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!
         let u2 = UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!
         var encoder = Encoder()
-        try encoder.writeFieldList(3, values: [u1, u2], type: "UUID")
+        encoder.writeVarint(3)
+        try encoder.writeArrayHeader(2)
+        for value in [u1, u2] { encoder.writeUUID(value) }
         var decoder = Decoder(encoder.data)
         XCTAssertEqual(decoder.readVarint(), 3)  // field ID
         let got = decoder.readArray { d in d.readUUID() }
@@ -682,47 +802,49 @@ final class CodecTests: XCTestCase {
 
     func testFieldListInt() throws {
         var encoder = Encoder()
-        try encoder.writeFieldList(2, values: [Int64(1), Int64(-2), Int64(3)], type: "Int")
+        encoder.writeVarint(2)
+        try encoder.writeArrayHeader(3)
+        for value in [Int64(1), Int64(-2), Int64(3)] { encoder.writeSvarint(value) }
         var decoder = Decoder(encoder.data)
         XCTAssertEqual(decoder.readVarint(), 2)
         let got = decoder.readArray { d in d.readSvarint() }
         XCTAssertEqual(got, [1, -2, 3])
     }
 
-    func testWriteFieldRejectsInvalidValuesWithoutPartialOutput() {
-        let invalid: [(Any, String)] = [
-            ("not-an-int", "Int"),
-            ("not-a-float", "Float"),
-            (0, "Boolean"),
-            ("not-a-uuid", "UUID"),
-            (0, "String"),
-            ("not-a-date", "DateTime"),
-            ("not-data", "Bytes"),
-            (Date(), "JSON"),
-            ("value", "Unknown"),
+    func testTypedWritersRejectInvalidValuesWithoutPartialOutput() {
+        let invalid: [(String, (inout Encoder) throws -> Void)] = [
+            ("nonfinite Float", { try $0.writeFixed64(.nan) }),
+            ("invalid DateTime", { try $0.writeDateTime("not-a-date") }),
+            ("nonfinite JSON", { try $0.writeJSON(.number(.infinity)) }),
         ]
-        for (value, type) in invalid {
+        for (name, write) in invalid {
             var encoder = Encoder()
-            XCTAssertThrowsError(try encoder.writeField(1, value: value, type: type))
-            XCTAssertTrue(encoder.data.isEmpty)
+            encoder.writeRawBytes(Data([0xaa]))
+            XCTAssertThrowsError(try write(&encoder), name)
+            XCTAssertEqual(encoder.data, Data([0xaa]), name)
         }
-
-        var listEncoder = Encoder()
-        XCTAssertThrowsError(try listEncoder.writeFieldList(1, values: [1, "bad"], type: "Int"))
-        XCTAssertTrue(listEncoder.data.isEmpty)
     }
 
-    func testWriteFieldSupportsEveryCanonicalValueRepresentation() throws {
+    func testTypedFieldsSupportEveryCanonicalValueRepresentation() throws {
         var encoder = Encoder()
-        try encoder.writeField(1, value: Int64(-9), type: "Duration")
-        try encoder.writeField(2, value: Float(1.25), type: "Float")
-        try encoder.writeField(3, value: "OPEN", type: "Enum")
-        try encoder.writeField(4, value: "12.50", type: "Decimal")
-        try encoder.writeField(5, value: Date(timeIntervalSince1970: 60), type: "DateTime")
-        try encoder.writeField(6, value: Data([1, 2]), type: "Bytes")
-        try encoder.writeField(7, value: JSONValue.bool(true), type: "JSON")
-        try encoder.writeField(8, value: ["ok": true], type: "JSON")
-        try encoder.writeField(9, value: "fragment", type: "JSON")
+        encoder.writeVarint(1)
+        encoder.writeSvarint(-9)
+        encoder.writeVarint(2)
+        try encoder.writeFixed64(1.25)
+        encoder.writeVarint(3)
+        encoder.writeString("OPEN")
+        encoder.writeVarint(4)
+        encoder.writeString("12.50")
+        encoder.writeVarint(5)
+        try encoder.writeDateTime(Date(timeIntervalSince1970: 60))
+        encoder.writeVarint(6)
+        encoder.writeBytes(Data([1, 2]))
+        encoder.writeVarint(7)
+        try encoder.writeJSON(.bool(true))
+        encoder.writeVarint(8)
+        try encoder.writeJSON(.object(["ok": .bool(true)]))
+        encoder.writeVarint(9)
+        try encoder.writeJSON(.string("fragment"))
 
         var decoder = Decoder(encoder.data)
         XCTAssertEqual(decoder.nextField(), 1)
@@ -746,19 +868,21 @@ final class CodecTests: XCTestCase {
         XCTAssertNil(decoder.error)
     }
 
-    func testWriteFieldListUsesScalarCodecForEveryElement() throws {
+    func testTypedListsUseScalarCodecForEveryElement() throws {
         var dates = Encoder()
-        try dates.writeFieldList(
-            1,
-            values: ["1970-01-01T00:01:00Z", Int64(120)],
-            type: "DateTime"
-        )
+        dates.writeVarint(1)
+        try dates.writeArrayHeader(2)
+        for date in ["1970-01-01T00:01:00Z", "1970-01-01T00:02:00Z"] {
+            try dates.writeDateTime(date)
+        }
         var dateDecoder = Decoder(dates.data)
         XCTAssertEqual(dateDecoder.nextField(), 1)
         XCTAssertEqual(dateDecoder.readDateTimeArray(), ["1970-01-01T00:01:00Z", "1970-01-01T00:02:00Z"])
 
         var values = Encoder()
-        try values.writeFieldList(2, values: [true, false], type: "Boolean")
+        values.writeVarint(2)
+        try values.writeArrayHeader(2)
+        for value in [true, false] { values.writeBool(value) }
         var valueDecoder = Decoder(values.data)
         XCTAssertEqual(valueDecoder.nextField(), 2)
         XCTAssertEqual(valueDecoder.readArray { $0.readBool() }, [true, false])
@@ -833,15 +957,15 @@ final class CodecTests: XCTestCase {
         XCTAssertNil(got[2])
     }
 
-    func testColumnarScalarArrayCells() {
+    func testColumnarScalarArrayCells() throws {
         // A [String] field becomes a Bytes column: each cell is a length-prefixed
         // blob containing an inline [count][items...] array.
         var cell0 = Encoder()
-        cell0.writeArrayHeader(2)
+        try cell0.writeArrayHeader(2)
         cell0.writeString("x")
         cell0.writeString("y")
         var cell1 = Encoder()
-        cell1.writeArrayHeader(1)
+        try cell1.writeArrayHeader(1)
         cell1.writeString("z")
 
         var enc = Encoder()
@@ -863,11 +987,11 @@ final class CodecTests: XCTestCase {
         XCTAssertEqual(d1.readArray { d in d.readString() }, ["z"])
     }
 
-    func testColumnarUUIDArrayCells() {
+    func testColumnarUUIDArrayCells() throws {
         let u1 = UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!
         let u2 = UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!
         var cell0 = Encoder()
-        cell0.writeArrayHeader(2)
+        try cell0.writeArrayHeader(2)
         cell0.writeUUID(u1)
         cell0.writeUUID(u2)
 
@@ -957,9 +1081,9 @@ final class CodecTests: XCTestCase {
 
     // MARK: - Columnar DateTime / Duration
 
-    func testColumnarDateTimeColumn() {
+    func testColumnarDateTimeColumn() throws {
         var enc = Encoder()
-        enc.writeArrayHeader(2)  // row count
+        try enc.writeArrayHeader(2)  // row count
         enc.writeVarint(0)  // arena size
         enc.writeVarint(7)  // field ID
         enc.writeSvarint(0)
@@ -975,9 +1099,9 @@ final class CodecTests: XCTestCase {
         XCTAssertEqual(dec.readColumnDateTime(), ["1970-01-01T00:00:00Z", "2021-07-14T02:40:00Z"])
     }
 
-    func testColumnarDateTimePtrColumn() {
+    func testColumnarDateTimePtrColumn() throws {
         var enc = Encoder()
-        enc.writeArrayHeader(2)
+        try enc.writeArrayHeader(2)
         enc.writeVarint(0)  // arena size
         enc.writeVarint(7)
         enc.writeBool(false)  // null
@@ -994,10 +1118,10 @@ final class CodecTests: XCTestCase {
         XCTAssertEqual(got[1], "2021-07-14T02:40:00Z")
     }
 
-    func testColumnarDurationColumn() {
+    func testColumnarDurationColumn() throws {
         // Duration columns are plain Int columns (raw nanoseconds).
         var enc = Encoder()
-        enc.writeArrayHeader(2)
+        try enc.writeArrayHeader(2)
         enc.writeVarint(0)  // arena size
         enc.writeVarint(8)
         enc.writeSvarint(1_500_000_000)

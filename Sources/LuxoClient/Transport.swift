@@ -17,6 +17,9 @@ public struct TransportPayload: Sendable {
     }
 }
 
+/// A statically typed subscription callback, including payloads named Void.
+public typealias SubscriptionHandler<Value> = @Sendable (Value) -> Swift.Void
+
 /// Optional terminal notifications; an explicit cancellation is silent.
 public final class StreamObserver: Sendable {
     public let onComplete: (@Sendable () -> Void)?
@@ -184,6 +187,7 @@ public struct APISchema: Sendable {
     public let params: [ParamSchema]?
     public let fields: [String: SelectionFieldSchema]
     public let types: [String: [String: SelectionFieldSchema]]
+    public let response: LuxoJSONReadSchema?
     let jsonParameters: JSONParameterPlan?
     let selectionIdentity: SelectionSchemaIdentity?
 
@@ -238,18 +242,24 @@ public struct APISchema: Sendable {
         id: Int,
         params: [ParamSchema]? = nil,
         fields: [String: SelectionFieldSchema] = [:],
-        types: [String: [String: SelectionFieldSchema]] = [:]
+        types: [String: [String: SelectionFieldSchema]] = [:],
+        response: LuxoJSONReadSchema? = nil
     ) {
         self.id = id
         self.params = params
         self.fields = fields
         self.types = types
+        self.response = response
         self.selectionIdentity = fields.isEmpty ? nil : SelectionSchemaIdentity()
         self.jsonParameters = JSONParameterPlan(params: params, types: types)
     }
 }
 
 enum LuxoBinaryProtocol {
+    static func missingResponse(statusCode: Int = 0) -> LuxoError {
+        LuxoError(code: statusCode, message: "missing binary response data", name: "ParseError")
+    }
+
     static let filtersFieldID: UInt64 = 0x7ffffffe
     static let sortersFieldID: UInt64 = 0x7fffffff
     static let filterOperatorIDs = [
@@ -453,7 +463,7 @@ enum LuxoBinaryProtocol {
         param: APISchema.ParamSchema,
         values: [LuxoValue]
     ) throws {
-        encoder.writeVarint(UInt64(values.count))
+        try encoder.writeArrayHeader(values.count)
         for value in values {
             try encodeValue(&encoder, type: param.type, value: value)
         }
@@ -494,8 +504,8 @@ enum LuxoBinaryProtocol {
             default: throw invalidValue(type)
             }
         case "JSON":
-            encoder.writeBytes(try value.jsonData())
-        case "Model":
+            encoder.writeBytes(try JSONWriter.encode(value, genericJSON: true))
+        case "Model", "Sealed":
             guard case .structured(let value) = value else { throw invalidValue(type) }
             try encoder.writeDelimited { try value.writeLuxo(to: &$0) }
         default:

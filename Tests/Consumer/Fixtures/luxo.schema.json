@@ -4,128 +4,788 @@
       "name": "Record",
       "usage": "output",
       "fields": [
-        {"id": 1, "name": "id", "type": "Int"},
-        {"id": 2, "name": "status", "type": "Enum", "typeName": "Status"},
-        {"id": 3, "name": "profile", "type": "Model", "typeName": "Profile", "nullable": true, "relation": true},
-        {"id": 4, "name": "numbers", "type": "Int", "isList": true},
-        {"id": 5, "name": "profiles", "type": "Model", "typeName": "Profile", "isList": true, "relation": true}
+        {
+          "id": 1,
+          "name": "id",
+          "type": "Int"
+        },
+        {
+          "id": 2,
+          "name": "status",
+          "type": "Enum",
+          "typeName": "Status"
+        },
+        {
+          "id": 3,
+          "name": "profile",
+          "type": "Model",
+          "typeName": "Profile",
+          "nullable": true,
+          "relation": true
+        },
+        {
+          "id": 4,
+          "name": "numbers",
+          "type": "Int",
+          "isList": true
+        },
+        {
+          "id": 5,
+          "name": "profiles",
+          "type": "Model",
+          "typeName": "Profile",
+          "isList": true,
+          "relation": true
+        }
       ]
     }
   },
   "types": {
-    "EnumRecord": {"name":"EnumRecord","usage":"inputOutput","fields":[
-      {"id":1,"name":"state","type":"Enum","typeName":"Status"},
-      {"id":2,"name":"optional","type":"Enum","typeName":"Status","nullable":true},
-      {"id":3,"name":"states","type":"Enum","typeName":"Status","isList":true},
-      {"id":4,"name":"optionalStates","type":"Enum","typeName":"Status","isList":true,"nullable":true}
-    ]},
-    "ProjectionEmpty": {"name":"ProjectionEmpty","usage":"output","fields":[]},
-    "ProjectionNames": {"name":"ProjectionNames","usage":"output","fields":[
-      {"id":1,"name":"decoder","type":"Int"},
-      {"id":2,"name":"container","type":"String","nullable":true},
-      {"id":3,"name":"isSelected","type":"Boolean"}
-    ]},
+    "DepthNode": {
+      "name": "DepthNode",
+      "usage": "inputOutput",
+      "fields": [
+        {
+          "id": 1,
+          "name": "metadata",
+          "type": "JSON",
+          "nullable": true
+        },
+        {
+          "id": 2,
+          "name": "documents",
+          "type": "JSON",
+          "isList": true,
+          "nullable": true
+        },
+        {
+          "id": 3,
+          "name": "child",
+          "type": "Model",
+          "typeName": "DepthNode",
+          "nullable": true
+        },
+        {
+          "id": 4,
+          "name": "children",
+          "type": "Model",
+          "typeName": "DepthNode",
+          "isList": true,
+          "nullable": true
+        },
+        {
+          "id": 5,
+          "name": "depth",
+          "type": "String",
+          "nullable": true
+        }
+      ]
+    },
+    "EnumRecord": {
+      "name": "EnumRecord",
+      "usage": "inputOutput",
+      "fields": [
+        {
+          "id": 1,
+          "name": "state",
+          "type": "Enum",
+          "typeName": "Status"
+        },
+        {
+          "id": 2,
+          "name": "optional",
+          "type": "Enum",
+          "typeName": "Status",
+          "nullable": true
+        },
+        {
+          "id": 3,
+          "name": "states",
+          "type": "Enum",
+          "typeName": "Status",
+          "isList": true
+        },
+        {
+          "id": 4,
+          "name": "optionalStates",
+          "type": "Enum",
+          "typeName": "Status",
+          "isList": true,
+          "nullable": true
+        }
+      ]
+    },
+    "ProjectionEmpty": {
+      "name": "ProjectionEmpty",
+      "usage": "output",
+      "fields": []
+    },
+    "ProjectionNames": {
+      "name": "ProjectionNames",
+      "usage": "output",
+      "fields": [
+        {
+          "id": 1,
+          "name": "decoder",
+          "type": "Int"
+        },
+        {
+          "id": 2,
+          "name": "container",
+          "type": "String",
+          "nullable": true
+        },
+        {
+          "id": 3,
+          "name": "isSelected",
+          "type": "Boolean"
+        }
+      ]
+    },
     "PrecisionInput": {
       "name": "PrecisionInput",
       "usage": "input",
       "fields": [
-        {"id": 1, "name": "count", "type": "Int"},
-        {"id": 2, "name": "duration", "type": "Duration"},
-        {"id": 3, "name": "ratio", "type": "Float"},
-        {"id": 4, "name": "values", "type": "Int", "isList": true},
-        {"id": 5, "name": "ratios", "type": "Float", "isList": true},
-        {"id": 6, "name": "status", "type": "Enum", "typeName": "Status"},
-        {"id": 7, "name": "blob", "type": "Bytes"},
-        {"id": 8, "name": "uuid", "type": "UUID"},
-        {"id": 9, "name": "date", "type": "DateTime"},
-        {"id": 10, "name": "decimal", "type": "Decimal"},
-        {"id": 11, "name": "enabled", "type": "Boolean"},
-        {"id": 12, "name": "metadata", "type": "JSON"},
-        {"id": 13, "name": "profiles", "type": "Model", "typeName": "Profile", "isList": true},
-        {"id": 14, "name": "note", "type": "String", "nullable": true}
+        {
+          "id": 1,
+          "name": "count",
+          "type": "Int"
+        },
+        {
+          "id": 2,
+          "name": "duration",
+          "type": "Duration"
+        },
+        {
+          "id": 3,
+          "name": "ratio",
+          "type": "Float"
+        },
+        {
+          "id": 4,
+          "name": "values",
+          "type": "Int",
+          "isList": true
+        },
+        {
+          "id": 5,
+          "name": "ratios",
+          "type": "Float",
+          "isList": true
+        },
+        {
+          "id": 6,
+          "name": "status",
+          "type": "Enum",
+          "typeName": "Status"
+        },
+        {
+          "id": 7,
+          "name": "blob",
+          "type": "Bytes"
+        },
+        {
+          "id": 8,
+          "name": "uuid",
+          "type": "UUID"
+        },
+        {
+          "id": 9,
+          "name": "date",
+          "type": "DateTime"
+        },
+        {
+          "id": 10,
+          "name": "decimal",
+          "type": "Decimal"
+        },
+        {
+          "id": 11,
+          "name": "enabled",
+          "type": "Boolean"
+        },
+        {
+          "id": 12,
+          "name": "metadata",
+          "type": "JSON"
+        },
+        {
+          "id": 13,
+          "name": "profiles",
+          "type": "Model",
+          "typeName": "Profile",
+          "isList": true
+        },
+        {
+          "id": 14,
+          "name": "note",
+          "type": "String",
+          "nullable": true
+        }
       ]
     },
     "Profile": {
       "name": "Profile",
       "usage": "inputOutput",
       "fields": [
-        {"id": 1, "name": "name", "type": "String"},
-        {"id": 2, "name": "bio", "type": "String", "nullable": true}
+        {
+          "id": 1,
+          "name": "name",
+          "type": "String"
+        },
+        {
+          "id": 2,
+          "name": "bio",
+          "type": "String",
+          "nullable": true
+        }
+      ]
+    },
+    "DepthEnvelope": {
+      "name": "DepthEnvelope",
+      "usage": "output",
+      "fields": [
+        {
+          "id": 1,
+          "name": "node",
+          "type": "Model",
+          "typeName": "DepthNode"
+        },
+        {
+          "id": 2,
+          "name": "nodes",
+          "type": "Model",
+          "typeName": "DepthNode",
+          "isList": true
+        }
       ]
     }
   },
   "enums": {
-    "Status": {"name": "Status", "values": ["OPEN", "CLOSED", "K"]},
-    "EscapedStatus": {"name":"EscapedStatus","values":["OPEN","open","UNKNOWN","unknown","case","init","self","quote\"","slash\\","line\n","é","é"]}
+    "Status": {
+      "name": "Status",
+      "values": [
+        "OPEN",
+        "CLOSED",
+        "K"
+      ]
+    },
+    "EscapedStatus": {
+      "name": "EscapedStatus",
+      "values": [
+        "OPEN",
+        "Open",
+        "open",
+        "UNKNOWN",
+        "unknown",
+        "case",
+        "init",
+        "self",
+        "quote\"",
+        "slash\\",
+        "line\n",
+        "\u00e9",
+        "e\u0301"
+      ]
+    }
   },
   "apis": {
-    "enumOptions": {"id":144,"name":"enumOptions","module":"enum","returnType":"Boolean","params":[
-      {"id":1,"name":"state","type":"Enum","typeName":"Status"},
-      {"id":2,"name":"optional","type":"Enum","typeName":"Status","nullable":true,"hasDefault":true},
-      {"id":3,"name":"states","type":"Enum","typeName":"Status","isList":true,"hasDefault":true}
-    ]},
-    "readInt": {"id": 100, "name": "readInt", "module": "scalars", "returnType": "Int", "returnList": false, "stream": false, "params": []},
-    "watchInt": {"id": 101, "name": "watchInt", "module": "scalars", "returnType": "Int", "returnList": false, "stream": true},
-    "readIntList": {"id": 102, "name": "readIntList", "module": "scalars", "returnType": "Int", "returnList": true, "stream": false},
-    "watchIntList": {"id": 103, "name": "watchIntList", "module": "scalars", "returnType": "Int", "returnList": true, "stream": true},
-    "readDuration": {"id": 104, "name": "readDuration", "module": "scalars", "returnType": "Duration", "returnList": false, "stream": false},
-    "watchDuration": {"id": 105, "name": "watchDuration", "module": "scalars", "returnType": "Duration", "returnList": false, "stream": true},
-    "readDurationList": {"id": 106, "name": "readDurationList", "module": "scalars", "returnType": "Duration", "returnList": true, "stream": false},
-    "watchDurationList": {"id": 107, "name": "watchDurationList", "module": "scalars", "returnType": "Duration", "returnList": true, "stream": true},
-    "readFloat": {"id": 108, "name": "readFloat", "module": "scalars", "returnType": "Float", "returnList": false, "stream": false},
-    "watchFloat": {"id": 109, "name": "watchFloat", "module": "scalars", "returnType": "Float", "returnList": false, "stream": true},
-    "readFloatList": {"id": 110, "name": "readFloatList", "module": "scalars", "returnType": "Float", "returnList": true, "stream": false},
-    "watchFloatList": {"id": 111, "name": "watchFloatList", "module": "scalars", "returnType": "Float", "returnList": true, "stream": true},
-    "readString": {"id": 112, "name": "readString", "module": "scalars", "returnType": "String", "returnList": false, "stream": false},
-    "watchString": {"id": 113, "name": "watchString", "module": "scalars", "returnType": "String", "returnList": false, "stream": true},
-    "readStringList": {"id": 114, "name": "readStringList", "module": "scalars", "returnType": "String", "returnList": true, "stream": false},
-    "watchStringList": {"id": 115, "name": "watchStringList", "module": "scalars", "returnType": "String", "returnList": true, "stream": true},
-    "readBoolean": {"id": 116, "name": "readBoolean", "module": "scalars", "returnType": "Boolean", "returnList": false, "stream": false},
-    "watchBoolean": {"id": 117, "name": "watchBoolean", "module": "scalars", "returnType": "Boolean", "returnList": false, "stream": true},
-    "readBooleanList": {"id": 118, "name": "readBooleanList", "module": "scalars", "returnType": "Boolean", "returnList": true, "stream": false},
-    "watchBooleanList": {"id": 119, "name": "watchBooleanList", "module": "scalars", "returnType": "Boolean", "returnList": true, "stream": true},
-    "readDateTime": {"id": 120, "name": "readDateTime", "module": "scalars", "returnType": "DateTime", "returnList": false, "stream": false},
-    "watchDateTime": {"id": 121, "name": "watchDateTime", "module": "scalars", "returnType": "DateTime", "returnList": false, "stream": true},
-    "readDateTimeList": {"id": 122, "name": "readDateTimeList", "module": "scalars", "returnType": "DateTime", "returnList": true, "stream": false},
-    "watchDateTimeList": {"id": 123, "name": "watchDateTimeList", "module": "scalars", "returnType": "DateTime", "returnList": true, "stream": true},
-    "readUUID": {"id": 124, "name": "readUUID", "module": "scalars", "returnType": "UUID", "returnList": false, "stream": false},
-    "watchUUID": {"id": 125, "name": "watchUUID", "module": "scalars", "returnType": "UUID", "returnList": false, "stream": true},
-    "readUUIDList": {"id": 126, "name": "readUUIDList", "module": "scalars", "returnType": "UUID", "returnList": true, "stream": false},
-    "watchUUIDList": {"id": 127, "name": "watchUUIDList", "module": "scalars", "returnType": "UUID", "returnList": true, "stream": true},
-    "readDecimal": {"id": 128, "name": "readDecimal", "module": "scalars", "returnType": "Decimal", "returnList": false, "stream": false},
-    "watchDecimal": {"id": 129, "name": "watchDecimal", "module": "scalars", "returnType": "Decimal", "returnList": false, "stream": true},
-    "readDecimalList": {"id": 130, "name": "readDecimalList", "module": "scalars", "returnType": "Decimal", "returnList": true, "stream": false},
-    "watchDecimalList": {"id": 131, "name": "watchDecimalList", "module": "scalars", "returnType": "Decimal", "returnList": true, "stream": true},
-    "readBytes": {"id": 132, "name": "readBytes", "module": "scalars", "returnType": "Bytes", "returnList": false, "stream": false},
-    "watchBytes": {"id": 133, "name": "watchBytes", "module": "scalars", "returnType": "Bytes", "returnList": false, "stream": true},
-    "readBytesList": {"id": 134, "name": "readBytesList", "module": "scalars", "returnType": "Bytes", "returnList": true, "stream": false},
-    "watchBytesList": {"id": 135, "name": "watchBytesList", "module": "scalars", "returnType": "Bytes", "returnList": true, "stream": true},
-    "readJSON": {"id": 136, "name": "readJSON", "module": "scalars", "returnType": "JSON", "returnList": false, "stream": false},
-    "watchJSON": {"id": 137, "name": "watchJSON", "module": "scalars", "returnType": "JSON", "returnList": false, "stream": true},
-    "readJSONList": {"id": 138, "name": "readJSONList", "module": "scalars", "returnType": "JSON", "returnList": true, "stream": false},
-    "watchJSONList": {"id": 139, "name": "watchJSONList", "module": "scalars", "returnType": "JSON", "returnList": true, "stream": true},
-    "readStatus": {"id": 140, "name": "readStatus", "module": "scalars", "returnType": "Status", "returnList": false, "stream": false},
-    "watchStatus": {"id": 141, "name": "watchStatus", "module": "scalars", "returnType": "Status", "returnList": false, "stream": true},
-    "readStatusList": {"id": 142, "name": "readStatusList", "module": "scalars", "returnType": "Status", "returnList": true, "stream": false},
-    "watchStatusList": {"id": 143, "name": "watchStatusList", "module": "scalars", "returnType": "Status", "returnList": true, "stream": true},
+    "getDepthNode": {
+      "id": 145,
+      "name": "getDepthNode",
+      "module": "depth",
+      "returnType": "DepthNode"
+    },
+    "watchDepthNode": {
+      "id": 146,
+      "name": "watchDepthNode",
+      "module": "depth",
+      "returnType": "DepthNode",
+      "stream": true
+    },
+    "echoDepthNode": {
+      "id": 147,
+      "name": "echoDepthNode",
+      "module": "depth",
+      "returnType": "Boolean",
+      "params": [
+        {
+          "id": 1,
+          "name": "value",
+          "type": "Model",
+          "typeName": "DepthNode"
+        },
+        {
+          "id": 2,
+          "name": "values",
+          "type": "Model",
+          "typeName": "DepthNode",
+          "isList": true
+        }
+      ]
+    },
+    "enumOptions": {
+      "id": 144,
+      "name": "enumOptions",
+      "module": "enum",
+      "returnType": "Boolean",
+      "params": [
+        {
+          "id": 1,
+          "name": "state",
+          "type": "Enum",
+          "typeName": "Status"
+        },
+        {
+          "id": 2,
+          "name": "optional",
+          "type": "Enum",
+          "typeName": "Status",
+          "nullable": true,
+          "hasDefault": true
+        },
+        {
+          "id": 3,
+          "name": "states",
+          "type": "Enum",
+          "typeName": "Status",
+          "isList": true,
+          "hasDefault": true
+        }
+      ]
+    },
+    "readInt": {
+      "id": 100,
+      "name": "readInt",
+      "module": "scalars",
+      "returnType": "Int",
+      "returnList": false,
+      "stream": false,
+      "params": []
+    },
+    "watchInt": {
+      "id": 101,
+      "name": "watchInt",
+      "module": "scalars",
+      "returnType": "Int",
+      "returnList": false,
+      "stream": true
+    },
+    "readIntList": {
+      "id": 102,
+      "name": "readIntList",
+      "module": "scalars",
+      "returnType": "Int",
+      "returnList": true,
+      "stream": false
+    },
+    "watchIntList": {
+      "id": 103,
+      "name": "watchIntList",
+      "module": "scalars",
+      "returnType": "Int",
+      "returnList": true,
+      "stream": true
+    },
+    "readDuration": {
+      "id": 104,
+      "name": "readDuration",
+      "module": "scalars",
+      "returnType": "Duration",
+      "returnList": false,
+      "stream": false
+    },
+    "watchDuration": {
+      "id": 105,
+      "name": "watchDuration",
+      "module": "scalars",
+      "returnType": "Duration",
+      "returnList": false,
+      "stream": true
+    },
+    "readDurationList": {
+      "id": 106,
+      "name": "readDurationList",
+      "module": "scalars",
+      "returnType": "Duration",
+      "returnList": true,
+      "stream": false
+    },
+    "watchDurationList": {
+      "id": 107,
+      "name": "watchDurationList",
+      "module": "scalars",
+      "returnType": "Duration",
+      "returnList": true,
+      "stream": true
+    },
+    "readFloat": {
+      "id": 108,
+      "name": "readFloat",
+      "module": "scalars",
+      "returnType": "Float",
+      "returnList": false,
+      "stream": false
+    },
+    "watchFloat": {
+      "id": 109,
+      "name": "watchFloat",
+      "module": "scalars",
+      "returnType": "Float",
+      "returnList": false,
+      "stream": true
+    },
+    "readFloatList": {
+      "id": 110,
+      "name": "readFloatList",
+      "module": "scalars",
+      "returnType": "Float",
+      "returnList": true,
+      "stream": false
+    },
+    "watchFloatList": {
+      "id": 111,
+      "name": "watchFloatList",
+      "module": "scalars",
+      "returnType": "Float",
+      "returnList": true,
+      "stream": true
+    },
+    "readString": {
+      "id": 112,
+      "name": "readString",
+      "module": "scalars",
+      "returnType": "String",
+      "returnList": false,
+      "stream": false
+    },
+    "watchString": {
+      "id": 113,
+      "name": "watchString",
+      "module": "scalars",
+      "returnType": "String",
+      "returnList": false,
+      "stream": true
+    },
+    "readStringList": {
+      "id": 114,
+      "name": "readStringList",
+      "module": "scalars",
+      "returnType": "String",
+      "returnList": true,
+      "stream": false
+    },
+    "watchStringList": {
+      "id": 115,
+      "name": "watchStringList",
+      "module": "scalars",
+      "returnType": "String",
+      "returnList": true,
+      "stream": true
+    },
+    "readBoolean": {
+      "id": 116,
+      "name": "readBoolean",
+      "module": "scalars",
+      "returnType": "Boolean",
+      "returnList": false,
+      "stream": false
+    },
+    "watchBoolean": {
+      "id": 117,
+      "name": "watchBoolean",
+      "module": "scalars",
+      "returnType": "Boolean",
+      "returnList": false,
+      "stream": true
+    },
+    "readBooleanList": {
+      "id": 118,
+      "name": "readBooleanList",
+      "module": "scalars",
+      "returnType": "Boolean",
+      "returnList": true,
+      "stream": false
+    },
+    "watchBooleanList": {
+      "id": 119,
+      "name": "watchBooleanList",
+      "module": "scalars",
+      "returnType": "Boolean",
+      "returnList": true,
+      "stream": true
+    },
+    "readDateTime": {
+      "id": 120,
+      "name": "readDateTime",
+      "module": "scalars",
+      "returnType": "DateTime",
+      "returnList": false,
+      "stream": false
+    },
+    "watchDateTime": {
+      "id": 121,
+      "name": "watchDateTime",
+      "module": "scalars",
+      "returnType": "DateTime",
+      "returnList": false,
+      "stream": true
+    },
+    "readDateTimeList": {
+      "id": 122,
+      "name": "readDateTimeList",
+      "module": "scalars",
+      "returnType": "DateTime",
+      "returnList": true,
+      "stream": false
+    },
+    "watchDateTimeList": {
+      "id": 123,
+      "name": "watchDateTimeList",
+      "module": "scalars",
+      "returnType": "DateTime",
+      "returnList": true,
+      "stream": true
+    },
+    "readUUID": {
+      "id": 124,
+      "name": "readUUID",
+      "module": "scalars",
+      "returnType": "UUID",
+      "returnList": false,
+      "stream": false
+    },
+    "watchUUID": {
+      "id": 125,
+      "name": "watchUUID",
+      "module": "scalars",
+      "returnType": "UUID",
+      "returnList": false,
+      "stream": true
+    },
+    "readUUIDList": {
+      "id": 126,
+      "name": "readUUIDList",
+      "module": "scalars",
+      "returnType": "UUID",
+      "returnList": true,
+      "stream": false
+    },
+    "watchUUIDList": {
+      "id": 127,
+      "name": "watchUUIDList",
+      "module": "scalars",
+      "returnType": "UUID",
+      "returnList": true,
+      "stream": true
+    },
+    "readDecimal": {
+      "id": 128,
+      "name": "readDecimal",
+      "module": "scalars",
+      "returnType": "Decimal",
+      "returnList": false,
+      "stream": false
+    },
+    "watchDecimal": {
+      "id": 129,
+      "name": "watchDecimal",
+      "module": "scalars",
+      "returnType": "Decimal",
+      "returnList": false,
+      "stream": true
+    },
+    "readDecimalList": {
+      "id": 130,
+      "name": "readDecimalList",
+      "module": "scalars",
+      "returnType": "Decimal",
+      "returnList": true,
+      "stream": false
+    },
+    "watchDecimalList": {
+      "id": 131,
+      "name": "watchDecimalList",
+      "module": "scalars",
+      "returnType": "Decimal",
+      "returnList": true,
+      "stream": true
+    },
+    "readBytes": {
+      "id": 132,
+      "name": "readBytes",
+      "module": "scalars",
+      "returnType": "Bytes",
+      "returnList": false,
+      "stream": false
+    },
+    "watchBytes": {
+      "id": 133,
+      "name": "watchBytes",
+      "module": "scalars",
+      "returnType": "Bytes",
+      "returnList": false,
+      "stream": true
+    },
+    "readBytesList": {
+      "id": 134,
+      "name": "readBytesList",
+      "module": "scalars",
+      "returnType": "Bytes",
+      "returnList": true,
+      "stream": false
+    },
+    "watchBytesList": {
+      "id": 135,
+      "name": "watchBytesList",
+      "module": "scalars",
+      "returnType": "Bytes",
+      "returnList": true,
+      "stream": true
+    },
+    "readJSON": {
+      "id": 136,
+      "name": "readJSON",
+      "module": "scalars",
+      "returnType": "JSON",
+      "returnList": false,
+      "stream": false
+    },
+    "watchJSON": {
+      "id": 137,
+      "name": "watchJSON",
+      "module": "scalars",
+      "returnType": "JSON",
+      "returnList": false,
+      "stream": true
+    },
+    "readJSONList": {
+      "id": 138,
+      "name": "readJSONList",
+      "module": "scalars",
+      "returnType": "JSON",
+      "returnList": true,
+      "stream": false
+    },
+    "watchJSONList": {
+      "id": 139,
+      "name": "watchJSONList",
+      "module": "scalars",
+      "returnType": "JSON",
+      "returnList": true,
+      "stream": true
+    },
+    "readStatus": {
+      "id": 140,
+      "name": "readStatus",
+      "module": "scalars",
+      "returnType": "Status",
+      "returnList": false,
+      "stream": false
+    },
+    "watchStatus": {
+      "id": 141,
+      "name": "watchStatus",
+      "module": "scalars",
+      "returnType": "Status",
+      "returnList": false,
+      "stream": true
+    },
+    "readStatusList": {
+      "id": 142,
+      "name": "readStatusList",
+      "module": "scalars",
+      "returnType": "Status",
+      "returnList": true,
+      "stream": false
+    },
+    "watchStatusList": {
+      "id": 143,
+      "name": "watchStatusList",
+      "module": "scalars",
+      "returnType": "Status",
+      "returnList": true,
+      "stream": true
+    },
     "checkPrecision": {
       "id": 4,
       "name": "checkPrecision",
       "module": "precision",
       "returnType": "Boolean",
       "params": [
-        {"id": 1, "name": "count", "type": "Int"},
-        {"id": 2, "name": "durations", "type": "Duration", "isList": true},
-        {"id": 3, "name": "ratios", "type": "Float", "isList": true},
-        {"id": 4, "name": "statuses", "type": "Enum", "typeName": "Status", "isList": true},
-        {"id": 5, "name": "blobs", "type": "Bytes", "isList": true},
-        {"id": 6, "name": "uuids", "type": "UUID", "isList": true},
-        {"id": 7, "name": "dates", "type": "DateTime", "isList": true},
-        {"id": 8, "name": "decimals", "type": "Decimal", "isList": true},
-        {"id": 9, "name": "flags", "type": "Boolean", "isList": true},
-        {"id": 10, "name": "metadata", "type": "JSON", "isList": true},
-        {"id": 11, "name": "input", "type": "Model", "typeName": "PrecisionInput"},
-        {"id": 12, "name": "note", "type": "String", "nullable": true, "hasDefault": true}
+        {
+          "id": 1,
+          "name": "count",
+          "type": "Int"
+        },
+        {
+          "id": 2,
+          "name": "durations",
+          "type": "Duration",
+          "isList": true
+        },
+        {
+          "id": 3,
+          "name": "ratios",
+          "type": "Float",
+          "isList": true
+        },
+        {
+          "id": 4,
+          "name": "statuses",
+          "type": "Enum",
+          "typeName": "Status",
+          "isList": true
+        },
+        {
+          "id": 5,
+          "name": "blobs",
+          "type": "Bytes",
+          "isList": true
+        },
+        {
+          "id": 6,
+          "name": "uuids",
+          "type": "UUID",
+          "isList": true
+        },
+        {
+          "id": 7,
+          "name": "dates",
+          "type": "DateTime",
+          "isList": true
+        },
+        {
+          "id": 8,
+          "name": "decimals",
+          "type": "Decimal",
+          "isList": true
+        },
+        {
+          "id": 9,
+          "name": "flags",
+          "type": "Boolean",
+          "isList": true
+        },
+        {
+          "id": 10,
+          "name": "metadata",
+          "type": "JSON",
+          "isList": true
+        },
+        {
+          "id": 11,
+          "name": "input",
+          "type": "Model",
+          "typeName": "PrecisionInput"
+        },
+        {
+          "id": 12,
+          "name": "note",
+          "type": "String",
+          "nullable": true,
+          "hasDefault": true
+        }
       ]
     },
     "updateProfile": {
@@ -134,7 +794,12 @@
       "module": "profile",
       "returnType": "Profile",
       "params": [
-        {"id": 1, "name": "profile", "type": "Model", "typeName": "Profile"}
+        {
+          "id": 1,
+          "name": "profile",
+          "type": "Model",
+          "typeName": "Profile"
+        }
       ]
     },
     "listRecords": {
@@ -154,6 +819,20 @@
       "id": 5,
       "name": "listRecordPage",
       "module": "record",
+      "params": [
+        {
+          "id": 7,
+          "name": "page",
+          "type": "Int",
+          "hasDefault": true
+        },
+        {
+          "id": 9,
+          "name": "pageSize",
+          "type": "Int",
+          "hasDefault": true
+        }
+      ],
       "returnType": "Record",
       "returnList": true,
       "paginated": true
@@ -170,6 +849,43 @@
       "name": "watchRecords",
       "module": "record",
       "returnType": "Record",
+      "returnList": true,
+      "stream": true
+    },
+    "listDepthNodes": {
+      "id": 148,
+      "name": "listDepthNodes",
+      "module": "depth",
+      "returnType": "DepthNode",
+      "returnList": true
+    },
+    "listDepthNodePage": {
+      "id": 149,
+      "name": "listDepthNodePage",
+      "module": "depth",
+      "returnType": "DepthNode",
+      "returnList": true,
+      "paginated": true,
+      "params": [
+        {
+          "id": 7,
+          "name": "page",
+          "type": "Int",
+          "hasDefault": true
+        },
+        {
+          "id": 9,
+          "name": "pageSize",
+          "type": "Int",
+          "hasDefault": true
+        }
+      ]
+    },
+    "watchDepthNodes": {
+      "id": 150,
+      "name": "watchDepthNodes",
+      "module": "depth",
+      "returnType": "DepthNode",
       "returnList": true,
       "stream": true
     }

@@ -4,6 +4,166 @@ import XCTest
 @testable import LuxoCompiler
 
 final class GeneratedSelectionBuildTests: XCTestCase {
+    func testBuiltinNumericNamesCompileAndRun() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let directory = root.appendingPathComponent(".tmp/host-numeric-\(UUID().uuidString)")
+        let fm = FileManager.default
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: directory) }
+        let process = SelectionCompilerProcess(workspace: root, scratch: directory)
+        let schema = try JSONDecoder().decode(LuxoSchema.self, from: Data(Self.hostNumericSchema.utf8))
+        let generator = try LuxoCodegen(endpoint: "https://example.com/luvia", introspectionKey: "test")
+        let sources = [
+            "Models.swift": generator.generateModels(schema), "Decoders.swift": generator.generateDecoders(schema),
+            "Schema.swift": generator.generateSchema(schema), "Client.swift": generator.generateClient(schema),
+            "Queries.swift": try SwiftQueryCodegen.generate(schema), "main.swift": Self.hostNumericApplication,
+        ]
+        for (name, source) in sources {
+            try source.write(to: directory.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        let objects = try fm.contentsOfDirectory(
+            at: root.appendingPathComponent(".build/debug/LuxoClient.build"), includingPropertiesForKeys: nil
+        ).filter { $0.lastPathComponent.hasSuffix(".swift.o") }.map(\.path)
+        XCTAssertFalse(objects.isEmpty)
+        let executable = directory.appendingPathComponent("check")
+        _ = try process.run(
+            "swiftc",
+            [
+                "-swift-version", "6", "-strict-concurrency=complete", "-warnings-as-errors", "-profile-generate",
+                "-I", root.appendingPathComponent(".build/debug/Modules").path, "-o", executable.path,
+            ]
+                + sources.keys.sorted().map { directory.appendingPathComponent($0).path } + objects)
+        _ = try process.run(executable.path, [])
+    }
+
+    private static let hostNumericSchema = #"""
+        {"models":{},"enums":{"Double":{"name":"Double","values":["OPEN"]},
+        "Int64":{"name":"Int64","values":["OPEN"]}},"types":{"Record":{"name":"Record","usage":"inputOutput","fields":[
+        {"id":1,"name":"score","type":"Float"},{"id":2,"name":"nanos","type":"Duration"},
+        {"id":3,"name":"values","type":"Float","isList":true,"nullable":true},
+        {"id":4,"name":"state","type":"Enum","typeName":"Double"},{"id":5,"name":"code","type":"Enum","typeName":"Int64"}]}},
+        "apis":{"echo":{"id":1,"name":"echo","module":"test","returnType":"Record","params":[{"id":1,"name":"input","type":"Model","typeName":"Record"}]},
+        "score":{"id":2,"name":"score","module":"test","returnType":"Float","params":[{"id":1,"name":"value","type":"Float"}]},
+        "nanos":{"id":3,"name":"nanos","module":"test","returnType":"Duration","params":[{"id":1,"name":"value","type":"Duration"}]},
+        "state":{"id":4,"name":"state","module":"test","returnType":"Double"},
+        "watch":{"id":6,"name":"watch","module":"test","returnType":"Float","stream":true},
+        "rows":{"id":5,"name":"rows","module":"test","returnType":"Record","returnList":true,"paginated":true,
+        "query":{"filters":[{"field":"score","type":"Float","operators":["eq"]},{"field":"id","type":"Int","operators":["eq"]},{"field":"state","type":"Double","operators":["eq"]}]}}}}
+        """#
+
+    private static let hostNumericApplication = ##"""
+        import Foundation
+        import LuxoClient
+        for nanos in [Swift.Int64.min, Swift.Int64.max] {
+            let input = RecordInput(score: 1.25, nanos: nanos, values: [1.25],
+                                    state: Double(rawValue: "OPEN"), code: Int64(rawValue: "FUTURE"))
+            var encoder = Encoder()
+            try input.writeLuxo(to: &encoder)
+            let json = Data(#"{"score":1.25,"nanos":\#(nanos),"values":[1.25],"state":"OPEN","code":"FUTURE"}"#.utf8)
+            for value in [try decodeLuxoResponse(encoder.data, read: decodeRecord),
+                          try decodeLuxoJSONResponse(Record.self, from: json)] {
+                let score = try value.score.requireValue()
+                let duration = try value.nanos.requireValue()
+                let values = try value.values.requireValue()
+                let state = try value.state.requireValue()
+                let code = try value.code.requireValue()
+                precondition(score == 1.25 && duration == nanos && values == [1.25])
+                precondition(state.rawValue == "OPEN" && code.rawValue == "FUTURE")
+            }
+        }
+        _ = LuxoQuery_rows.id_eq(9007199254740993)
+        _ = LuxoQuery_rows.score_eq(1.25)
+        _ = LuxoQuery_rows.state_eq(Double(rawValue: "OPEN"))
+        """##
+
+    func testGeneratedRecursiveResponsesCompileAndRun() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let directory = root.appendingPathComponent(".tmp/recursive-response-\(UUID().uuidString)")
+        let fm = FileManager.default
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: directory) }
+        let process = SelectionCompilerProcess(workspace: root, scratch: directory)
+        let schema = try JSONDecoder().decode(LuxoSchema.self, from: Data(Self.recursiveSchema.utf8))
+        let generator = try LuxoCodegen(endpoint: "https://example.com/luvia", introspectionKey: "test")
+        let sources = [
+            "Models.swift": generator.generateModels(schema),
+            "Decoders.swift": generator.generateDecoders(schema),
+            "Schema.swift": generator.generateSchema(schema),
+            "main.swift": Self.recursiveApplication,
+        ]
+        for (name, source) in sources {
+            try source.write(to: directory.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        let objects = try fm.contentsOfDirectory(
+            at: root.appendingPathComponent(".build/debug/LuxoClient.build"), includingPropertiesForKeys: nil
+        ).filter { $0.lastPathComponent.hasSuffix(".swift.o") }.map(\.path)
+        XCTAssertFalse(objects.isEmpty)
+        let executable = directory.appendingPathComponent("check")
+        _ = try process.run(
+            "swiftc",
+            [
+                "-swift-version", "6", "-strict-concurrency=complete", "-warnings-as-errors", "-profile-generate",
+                "-I", root.appendingPathComponent(".build/debug/Modules").path, "-o", executable.path,
+            ] + sources.keys.sorted().map { directory.appendingPathComponent($0).path } + objects)
+        let result = try process.run(executable.path, [])
+        XCTAssertEqual(String(decoding: result, as: UTF8.self), "recursive responses passed\n")
+    }
+
+    private static let recursiveSchema = #"""
+        {"models":{"Container":{"name":"Container","fields":[
+          {"id":1,"name":"node","type":"Model","typeName":"Node"}]}},
+         "types":{"Node":{"name":"Node","usage":"inputOutput","fields":[
+          {"id":1,"name":"child","type":"Model","typeName":"Node","nullable":true},
+          {"id":2,"name":"parent","type":"Model","typeName":"Container","nullable":true}]}},
+         "apis":{"read":{"id":1,"name":"read","module":"test","returnType":"Container"}}}
+        """#
+
+    private static let recursiveApplication = #"""
+        import Foundation
+        import LuxoClient
+
+        func rootPayload(_ child: Data) -> Data {
+            var node = Encoder()
+            node.writeVarint(0)
+            node.writeVarint(1)
+            node.writeBool(true)
+            node.writeBytes(child)
+            node.writeEnd()
+            var root = Encoder()
+            root.writeVarint(0)
+            root.writeVarint(1)
+            root.writeBytes(node.data)
+            root.writeEnd()
+            return root.data
+        }
+        let leaf = Data([0, 1, 0, 0])
+        let response = try decodeLuxoResponse(rootPayload(leaf), read: decodeContainer)
+        let node = try response.node.requireValue()
+        guard let child = try node.child.requireValue() else { fatalError("missing child") }
+        guard case .value(nil) = child.child, case .unselected = child.parent,
+              case .unselected = node.parent else { fatalError("selection/null lost") }
+        let json = try decodeLuxoJSONResponse(Container.self, from:
+            Data(#"{"node":{"child":{"child":null}}}"#.utf8))
+        let jsonNode = try json.node.requireValue()
+        guard let jsonChild = try jsonNode.child.requireValue(),
+              case .value(nil) = jsonChild.child else { fatalError("JSON mismatch") }
+        for invalid in [Data(leaf.dropLast()), leaf + Data([1]), Data([0, 1, 2, 0])] {
+            do {
+                _ = try decodeLuxoResponse(rootPayload(invalid), read: decodeContainer)
+                fatalError("malformed recursive child accepted")
+            } catch let error as LuxoError {
+                precondition(error.name == "DecodeError")
+            }
+        }
+        let input = NodeInput(child: NodeInput())
+        var encoder = Encoder()
+        try input.writeLuxo(to: &encoder)
+        precondition(!encoder.data.isEmpty)
+        print("recursive responses passed")
+        """#
+
     func testGeneratedEmptySchemaDirectoriesCompile() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()

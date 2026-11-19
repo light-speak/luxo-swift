@@ -3,6 +3,23 @@ import XCTest
 @testable import LuxoClient
 
 final class CodecMetadataTests: XCTestCase {
+    func testArrayHeaderPreservesLegalCounts() throws {
+        for count in [0, 1, 127, 128, 1_000_000] {
+            var encoder = Encoder()
+            try encoder.writeArrayHeader(count)
+            XCTAssertEqual(encoder.data, unsigned(UInt64(count)))
+        }
+    }
+
+    func testArrayHeaderRejectsOversizedCountWithoutChangingOutput() throws {
+        for count in [-1, Int.min, 1_000_001, Int.max] {
+            var encoder = Encoder()
+            encoder.writeBool(true)
+            XCTAssertThrowsError(try encoder.writeArrayHeader(count))
+            XCTAssertEqual(encoder.data, Data([1]))
+        }
+    }
+
     func testNonemptyListsRequireColumnPayloadBeforeAllocation() {
         for count: UInt64 in [1, 128, 10_000_000] {
             for payload in [

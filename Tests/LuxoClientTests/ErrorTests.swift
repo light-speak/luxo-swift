@@ -2,6 +2,19 @@ import XCTest
 @testable import LuxoClient
 
 final class ErrorTests: XCTestCase {
+    func testWireErrorsRejectNonErrorStatuses() throws {
+        for code in [Int.min, -1, 0, 200, 399, 600, 1000, Int.max] {
+            let json: [String: Any] = ["error": "Rejected", "message": "invalid", "code": code]
+            XCTAssertEqual(LuxoError.fromResponse(json: json, statusCode: 502).name, "ParseError")
+            var enc = Encoder()
+            enc.writeVarint(1); enc.writeSvarint(Int64(code))
+            enc.writeVarint(2); enc.writeString("Rejected")
+            enc.writeVarint(3); enc.writeString("invalid")
+            enc.writeEnd()
+            XCTAssertEqual(LuxoBinaryProtocol.decodeError(enc.data, statusCode: 502).name, "ParseError")
+        }
+    }
+
     func testConstructorFields() {
         let err = LuxoError(code: 404, message: "Not found")
         XCTAssertEqual(err.code, 404)
@@ -123,7 +136,7 @@ final class ErrorTests: XCTestCase {
     }
 
     func testResponsePreservesExactCodesAndOptionalFieldsInBothEncodings() throws {
-        for code in [Int.min, -1, 0, 400, 9_007_199_254_740_993, Int.max] {
+        for code in [400, 401, 500, 599] {
             let json = try errorJSON(
                 #""code":\#(code),"error":"RemoteError","message":"failed","traceId":"trace","cause":"cause","data":{"id":9223372036854775807}"#
             )
@@ -158,6 +171,26 @@ final class ErrorTests: XCTestCase {
             let data = Data([UInt8(field), 1, 0xff]) + required + Data([0])
             XCTAssertEqual(LuxoBinaryProtocol.decodeError(data, statusCode: 502).name, "ParseError")
         }
+    }
+
+    func testBinaryErrorKeepsLeadingFEFFInTextFields() {
+        let text = "\u{feff}value"
+        var encoder = Encoder()
+        encoder.writeVarint(1)
+        encoder.writeSvarint(500)
+        for field in [2, 3, 4, 6] {
+            encoder.writeVarint(UInt64(field))
+            encoder.writeString(text)
+        }
+        encoder.writeVarint(5)
+        encoder.writeBytes(Data("{\"detail\":\"\\uFEFFvalue\"}".utf8))
+        encoder.writeEnd()
+        let error = LuxoBinaryProtocol.decodeError(encoder.data, statusCode: 500)
+        XCTAssertEqual(error.name, text)
+        XCTAssertEqual(error.message, text)
+        XCTAssertEqual(error.traceId, text)
+        XCTAssertEqual(error.cause, text)
+        XCTAssertEqual((error.data as? [String: String])?["detail"], text)
     }
 
     func testBinaryErrorOwnsHeapBackedFieldsAfterDecoderFinishes() {

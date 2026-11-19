@@ -47,21 +47,27 @@ def fixture_environment(server, credentials):
 
 
 def run_tests(root, output, environment, args):
-    command = ["swift", "test", "--disable-sandbox", "--package-path", str(root),
+    options = ["--disable-sandbox", "--package-path", str(root),
                "--scratch-path", str(root / ".build"), "--disable-automatic-resolution",
                "-j", "2", "-Xswiftc", "-warnings-as-errors"]
+    if args.coverage:
+        options += ["--enable-code-coverage"]
+    if args.sanitize_thread:
+        options += ["--sanitize", "thread"]
+    # Always compile current sources before using the no-build test invocation.
+    # Cold dependency builds must not consume the network-test deadline.
+    with (output / "swift-build.log").open("w") as log:
+        subprocess.run(["swift", "build", "--build-tests", *options], cwd=root,
+                       env=environment, check=True, timeout=600, stdout=log, stderr=log)
+    command = ["swift", "test", "--skip-build", *options]
     if not args.all:
         command += ["--filter", "LuxoNIOTests"]
-    if args.coverage:
-        command += ["--enable-code-coverage"]
-    if args.sanitize_thread:
-        command += ["--sanitize", "thread"]
     with (output / "test.log").open("w") as log:
         subprocess.run(command, cwd=root, env=environment, check=True,
                        timeout=600 if args.all else 180, stdout=log, stderr=log)
     text = (output / "test.log").read_text()
     counts = re.findall(r"Executed (\d+) tests, with 0 failures", text)
-    if "skipped" in text or not counts or (not args.all and int(counts[-1]) != 33):
+    if "skipped" in text or not counts or (not args.all and int(counts[-1]) != 39):
         raise RuntimeError("Expected all selected tests with zero failures and skips")
     return int(counts[-1])
 

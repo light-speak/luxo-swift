@@ -7,6 +7,7 @@ import Foundation
 // MARK: - WebSocket Transport
 
 protocol LuxoWebSocketTask: AnyObject, Sendable {
+    var closeCode: URLSessionWebSocketTask.CloseCode { get }
     func resume()
     func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
     func send(_ message: URLSessionWebSocketTask.Message, completionHandler: @escaping @Sendable (Error?) -> Void)
@@ -30,6 +31,7 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
     private final class ConnectionIdentity: Sendable {}
 
     private struct Subscription {
+        let responseSchema: LuxoJSONReadSchema?
         let mode: TransportMode
         let handler: @Sendable (TransportPayload) -> Void
         let observer: StreamObserver?
@@ -39,6 +41,7 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
     private struct Pending<Value> {
         let continuation: CheckedContinuation<Value, Error>
         let timeoutTask: DispatchWorkItem
+        var responseSchema: LuxoJSONReadSchema? = nil
 
         func fail(_ error: Error) {
             timeoutTask.cancel()
@@ -53,15 +56,21 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
     }
 
     // Both fields are accessed only under the owning transport's state lock.
-    private final class SubscriptionAttempt: @unchecked Sendable {
+    private final class RequestAttempt: @unchecked Sendable {
         var id: UInt64?
         var cancelled = false
     }
 
-    private struct Request {
+    private struct RequestContext {
         let id: UInt64
         let socket: LuxoWebSocketTask
+        let identity: ConnectionIdentity
         let mode: TransportMode
+        let schema: APISchema?
+    }
+
+    private struct Request {
+        let context: RequestContext
         let message: URLSessionWebSocketTask.Message
     }
 
@@ -79,6 +88,16 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
     private var schema: [String: APISchema] = [:]
     private var mode: TransportMode = .json
     private var token: String?
+    private var authenticationError: LuxoError?
+    private var tokenExpiredHandler: (@Sendable () async -> String?)?
+    private var renewal: WebSocketRenewal?
+    private var renewalTask: Task<Void, Never>?
+    private var renewalTimer: DispatchWorkItem?
+
+    public var onTokenExpired: (@Sendable () async -> String?)? {
+        get { lock.withLock { tokenExpiredHandler } }
+        set { lock.withLock { tokenExpiredHandler = newValue } }
+    }
     private var sequence: UInt64 = 0
     private var shouldReconnect = true
     private var reconnectAttempt = 0
@@ -110,7 +129,19 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
         sequence = initialSequence
     }
 
-    public func setToken(_ token: String) { lock.withLock { self.token = token } }
+    public func setToken(_ token: String) {
+        sendOrder.withLock {
+            let previous = lock.withLock {
+                self.token = token; authenticationError = nil
+                return removeRenewalLocked()
+            }
+            previous.1?.cancel()
+            if let waiting = previous.0 {
+                openConnection()
+                waiting.finish(.success(()))
+            }
+        }
+    }
     public func setMode(_ mode: TransportMode) { lock.withLock { self.mode = mode } }
     public func setSchema(_ schema: [String: APISchema]) throws {
         try validateRuntimeSchemaIDs(schema)
@@ -147,25 +178,54 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
     }
 
     private func callRequest(_ api: String, params: RequestParameters) async throws -> TransportPayload {
-        try await withCheckedThrowingContinuation { continuation in
-            do {
-                try sendOrder.withLock {
-                    let state = try lock.withLock { () throws -> (Request, DispatchWorkItem) in
-                        let request = try prepareRequestLocked(api, params: params, subscription: false)
-                        let timer = callTimeout(request.id, api: api)
-                        pending[request.id] = Pending(continuation: continuation, timeoutTask: timer)
-                        return (request, timer)
-                    }
-                    DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: state.1)
-                    let id = state.0.id
-                    state.0.socket.send(state.0.message) { [weak self] error in
-                        if let error { self?.failPending(id, error: Self.networkError(error)) }
-                    }
+        let waiting = lock.withLock { renewal }
+        if let waiting { try await waiting.wait() }
+        let attempt = RequestAttempt()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                startCall(api, params: params, attempt: attempt, continuation: continuation)
+            }
+        } onCancel: {
+            self.cancelCallAttempt(attempt)
+        }
+    }
+
+    private func startCall(
+        _ api: String, params: RequestParameters, attempt: RequestAttempt,
+        continuation: CheckedContinuation<TransportPayload, Error>
+    ) {
+        do {
+            try sendOrder.withLock {
+                let request = try prepareRequest(api, params: params, subscription: false, attempt: attempt)
+                let timer = try lock.withLock {
+                    try validateRequestLocked(request.context, attempt: attempt)
+                    attempt.id = request.context.id
+                    let timer = callTimeout(request.context.id, api: api)
+                    pending[request.context.id] = Pending(
+                        continuation: continuation, timeoutTask: timer, responseSchema: request.context.schema?.response
+                    )
+                    return timer
                 }
-            } catch {
-                continuation.resume(throwing: error)
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timer)
+                let id = request.context.id
+                request.context.socket.send(request.message) { [weak self] error in
+                    if let error { self?.failPending(id, error: Self.networkError(error)) }
+                }
+            }
+        } catch {
+            continuation.resume(throwing: error)
+        }
+    }
+
+    private func cancelCallAttempt(_ attempt: RequestAttempt) {
+        let waiting = sendOrder.withLock {
+            lock.withLock { () -> Pending<TransportPayload>? in
+                attempt.cancelled = true
+                guard let id = attempt.id else { return nil }
+                return pending.removeValue(forKey: id)
             }
         }
+        waiting?.fail(CancellationError())
     }
 
     public func subscribe<Value: Sendable>(
@@ -192,7 +252,9 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
         params: RequestParameters, observer: StreamObserver?,
         handler: @escaping @Sendable (Value) -> Void
     ) async throws -> (@Sendable () -> Void) {
-        let attempt = SubscriptionAttempt()
+        let waiting = lock.withLock { renewal }
+        if let waiting { try await waiting.wait() }
+        let attempt = RequestAttempt()
         let id = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 startSubscription(
@@ -213,25 +275,26 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
         _ api: String, decoder: @escaping @Sendable (TransportPayload) throws -> Value,
         params: RequestParameters, observer: StreamObserver?,
         handler: @escaping @Sendable (Value) -> Void,
-        attempt: SubscriptionAttempt, continuation: CheckedContinuation<UInt64, Error>
+        attempt: RequestAttempt, continuation: CheckedContinuation<UInt64, Error>
     ) {
         do {
             try sendOrder.withLock {
-                let state = try lock.withLock { () throws -> (Request, DispatchWorkItem) in
-                    if attempt.cancelled { throw CancellationError() }
-                    let request = try prepareRequestLocked(api, params: params, subscription: true)
-                    attempt.id = request.id
-                    let timer = subscriptionTimeout(request.id, api: api)
-                    subscriptions[request.id] = Subscription(
-                        mode: request.mode,
-                        handler: subscriptionHandler(request.id, decoder: decoder, handler: handler), observer: observer
+                let request = try prepareRequest(api, params: params, subscription: true, attempt: attempt)
+                let timer = try lock.withLock {
+                    try validateRequestLocked(request.context, attempt: attempt)
+                    let id = request.context.id
+                    attempt.id = id
+                    let timer = subscriptionTimeout(id, api: api)
+                    subscriptions[id] = Subscription(
+                        responseSchema: request.context.schema?.response, mode: request.context.mode,
+                        handler: subscriptionHandler(id, decoder: decoder, handler: handler), observer: observer
                     )
-                    pendingSubscriptions[request.id] = Pending(continuation: continuation, timeoutTask: timer)
-                    return (request, timer)
+                    pendingSubscriptions[id] = Pending(continuation: continuation, timeoutTask: timer)
+                    return timer
                 }
-                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: state.1)
-                let id = state.0.id
-                state.0.socket.send(state.0.message) { [weak self] error in
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timer)
+                let id = request.context.id
+                request.context.socket.send(request.message) { [weak self] error in
                     if let error {
                         self?.failSubscription(
                             id, error: Self.networkError(error), cancelRemote: false, pendingOnly: true)
@@ -274,7 +337,10 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
         DispatchQueue.global().async { notify(error) }
     }
 
-    private func prepareRequestLocked(_ api: String, params: RequestParameters, subscription: Bool) throws -> Request {
+    private func requestContextLocked(_ api: String, attempt: RequestAttempt) throws -> RequestContext {
+        if attempt.cancelled || Task.isCancelled { throw CancellationError() }
+        if !shouldReconnect { throw LuxoError(code: 0, message: "WebSocket closed by client", name: "ConnectionError") }
+        if let authenticationError { throw authenticationError }
         guard let socket = task else {
             throw LuxoError(code: 0, message: "WebSocket not connected", name: "ConnectionError")
         }
@@ -282,27 +348,44 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
             throw LuxoError(code: 0, message: "WebSocket request IDs exhausted", name: "RequestIDExhausted")
         }
         sequence += 1
+        return RequestContext(
+            id: sequence, socket: socket, identity: connectionIdentity, mode: mode, schema: schema[api])
+    }
+
+    private func validateRequestLocked(_ context: RequestContext, attempt: RequestAttempt) throws {
+        if attempt.cancelled || Task.isCancelled { throw CancellationError() }
+        guard shouldReconnect, task === context.socket, connectionIdentity === context.identity else {
+            throw LuxoError(code: 0, message: "WebSocket connection changed while encoding", name: "ConnectionError")
+        }
+        if let authenticationError { throw authenticationError }
+    }
+
+    private func prepareRequest(_ api: String, params: RequestParameters, subscription: Bool, attempt: RequestAttempt)
+        throws -> Request
+    {
+        let context = try lock.withLock { try requestContextLocked(api, attempt: attempt) }
+        // Generated encoders can cancel or reconfigure the transport; never call them under its state lock.
         let message: URLSessionWebSocketTask.Message
-        if mode == .binary {
-            guard let apiSchema = schema[api] else {
+        if context.mode == .binary {
+            guard let apiSchema = context.schema else {
                 throw LuxoError(
                     code: 0, message: "no schema for API \"\(api)\" — binary mode requires schema", name: "ConfigError")
             }
             let body = try params.binary(schema: apiSchema)
             message = .data(
                 subscription
-                    ? LuxoBinaryProtocol.subscribeFrame(sequence: sequence, body: body)
-                    : LuxoBinaryProtocol.callFrame(sequence: sequence, body: body))
+                    ? LuxoBinaryProtocol.subscribeFrame(sequence: context.id, body: body)
+                    : LuxoBinaryProtocol.callFrame(sequence: context.id, body: body))
         } else {
             let body = try LuxoJSONRequest.encode(
-                api: api, params: params.json(), plan: schema[api]?.jsonParameters, sequence: sequence,
+                api: api, params: params.json(), plan: context.schema?.jsonParameters, sequence: context.id,
                 subscription: subscription)
             message = .string(String(decoding: body, as: UTF8.self))
         }
-        return Request(id: sequence, socket: socket, mode: mode, message: message)
+        return Request(context: context, message: message)
     }
 
-    private func cancelAttempt(_ attempt: SubscriptionAttempt) {
+    private func cancelAttempt(_ attempt: RequestAttempt) {
         let id = lock.withLock { () -> UInt64? in
             attempt.cancelled = true
             return attempt.id
@@ -337,6 +420,10 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
 
     public func close() {
         sendOrder.withLock {
+            let previous = lock.withLock { removeRenewalLocked() }
+            previous.1?.cancel()
+            previous.0?.finish(
+                .failure(LuxoError(code: 0, message: "WebSocket closed by client", name: "ConnectionError")))
             let state = lock.withLock {
                 shouldReconnect = false
                 reconnectWork?.cancel()
@@ -355,7 +442,7 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
     // Caller holds sendOrder; no request from a previous connection is replayed.
     private func openConnection() {
         let request = lock.withLock { () -> URLRequest? in
-            guard shouldReconnect, task == nil else { return nil }
+            guard shouldReconnect, task == nil, authenticationError == nil else { return nil }
             var request = URLRequest(url: url)
             if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
             return request
@@ -364,7 +451,7 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
         let socket = session.makeWebSocketTask(with: request)
         let identity = ConnectionIdentity()
         let installed = lock.withLock { () -> Bool in
-            guard shouldReconnect, task == nil else { return false }
+            guard shouldReconnect, task == nil, authenticationError == nil else { return false }
             task = socket
             connectionIdentity = identity
             return true
@@ -402,11 +489,18 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
     }
 
     private func handleJSONData(_ data: Data, socket: LuxoWebSocketTask) {
-        guard let envelope = try? JSONEnvelope.decode(data) else {
+        let envelope: JSONEnvelope
+        do {
+            envelope = try JSONEnvelope.decode(data, resolvePayload: { self.jsonPayloadPolicy($0, socket: socket) })
+        } catch let failure as JSONEnvelopePayloadFailure {
+            failJSONModelPayload(failure, socket: socket)
+            return
+        } catch {
             let failure = LuxoError(code: 0, message: "invalid WebSocket JSON message", name: "ParseError")
             retireConnection(socket, error: failure, subscriptionError: failure)
             return
         }
+        guard !envelope.discardedPayload else { return }
         let json = envelope.fields
         if envelope.hasTerminalMetadata {
             if let terminal = LuxoWebSocketProtocol.jsonTerminal(envelope) {
@@ -433,6 +527,35 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
         }
     }
 
+    private func failJSONModelPayload(_ failure: JSONEnvelopePayloadFailure, socket: LuxoWebSocketTask) {
+        let error = LuxoError(code: 0, message: "model nesting exceeds 64 objects", name: "DecodeError")
+        if failure.fields["$stream"] != nil {
+            guard let id = LuxoWebSocketProtocol.jsonRequestID(value: failure.fields["$stream"]),
+                streamHandler(id, mode: .json, socket: socket) != nil
+            else { return }
+            failSubscriptionPayload(id, error: error)
+        } else if let id = LuxoWebSocketProtocol.jsonRequestID(value: failure.fields["$id"]) {
+            takePending(id, socket: socket)?.fail(error)
+        }
+    }
+
+    private func jsonPayloadPolicy(_ fields: [String: LuxoValue], socket: LuxoWebSocketTask) -> JSONPayloadValidation {
+        if fields["$end"] != nil || fields["$sub"] != nil { return .generic }
+        return lock.withLock {
+            guard task === socket else { return .discarded }
+            if fields["$stream"] != nil {
+                guard let id = LuxoWebSocketProtocol.jsonRequestID(value: fields["$stream"]),
+                    let subscription = subscriptions[id], subscription.mode == .json, subscription.acknowledged
+                else { return .discarded }
+                return subscription.responseSchema.map(JSONPayloadValidation.schema) ?? .untyped
+            }
+            guard let id = LuxoWebSocketProtocol.jsonRequestID(value: fields["$id"]), let call = pending[id] else {
+                return .discarded
+            }
+            return call.responseSchema.map(JSONPayloadValidation.schema) ?? .untyped
+        }
+    }
+
     private func handleJSONCall(_ envelope: JSONEnvelope, socket: LuxoWebSocketTask) {
         let json = envelope.fields
         guard let id = LuxoWebSocketProtocol.jsonRequestID(value: json["$id"]),
@@ -450,7 +573,11 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
     }
 
     private func handleBinaryMessage(_ data: Data, socket: LuxoWebSocketTask) {
-        guard let frame = LuxoWebSocketProtocol.decodeBinaryFrame(data) else { return }
+        guard let frame = LuxoWebSocketProtocol.decodeBinaryFrame(data) else {
+            let failure = LuxoError(code: 0, message: "invalid WebSocket Binary message", name: "ParseError")
+            retireConnection(socket, error: failure, subscriptionError: failure)
+            return
+        }
         if let acknowledgement = LuxoWebSocketProtocol.subscriptionAcknowledgement(frame) {
             acknowledgeSubscription(acknowledgement, mode: .binary, socket: socket)
             return
@@ -458,12 +585,20 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
         switch frame.type {
         case LuxoBinaryProtocol.callSuccess:
             if let state = takePending(frame.id, socket: socket) {
-                state.timeoutTask.cancel()
-                state.continuation.resume(returning: TransportPayload(data: frame.payload, mode: .binary))
+                if frame.payload.isEmpty {
+                    state.fail(LuxoBinaryProtocol.missingResponse())
+                } else {
+                    state.timeoutTask.cancel()
+                    state.continuation.resume(returning: TransportPayload(data: frame.payload, mode: .binary))
+                }
             }
         case LuxoBinaryProtocol.callError:
             takePending(frame.id, socket: socket)?.fail(LuxoBinaryProtocol.decodeError(frame.payload, statusCode: 0))
         case LuxoBinaryProtocol.stream:
+            if frame.payload.isEmpty {
+                failMissingBinaryData(frame.id, socket: socket)
+                return
+            }
             streamHandler(frame.id, mode: .binary, socket: socket)?(
                 TransportPayload(data: frame.payload, mode: .binary))
         case LuxoBinaryProtocol.streamComplete:
@@ -478,6 +613,16 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
                 mode: .binary, socket: socket)
         default: break
         }
+    }
+
+    private func failMissingBinaryData(_ id: UInt64, socket: LuxoWebSocketTask) {
+        let active = lock.withLock {
+            guard task === socket, let subscription = subscriptions[id],
+                subscription.mode == .binary, subscription.acknowledged
+            else { return false }
+            return true
+        }
+        if active { failSubscriptionPayload(id, error: LuxoBinaryProtocol.missingResponse()) }
     }
 
     private func streamHandler(_ id: UInt64, mode: TransportMode, socket: LuxoWebSocketTask) -> (
@@ -595,6 +740,11 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
     }
 
     private func connectionLost(_ socket: LuxoWebSocketTask, error: Error) {
+        if socket.closeCode.rawValue == 4001 {
+            let expired = LuxoError(code: 401, message: "access token expired", name: "Unauthorized")
+            retireConnection(socket, error: expired, subscriptionError: expired, expired: true)
+            return
+        }
         let message = "WebSocket connection lost: \(error.localizedDescription)"
         retireConnection(
             socket,
@@ -602,24 +752,82 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
             subscriptionError: LuxoError(code: 0, message: message, name: "NetworkError"))
     }
 
-    private func retireConnection(_ socket: LuxoWebSocketTask, error: LuxoError, subscriptionError: LuxoError) {
+    private func retireConnection(
+        _ socket: LuxoWebSocketTask, error: LuxoError, subscriptionError: LuxoError, expired: Bool = false
+    ) {
         sendOrder.withLock {
             let waiting = lock.withLock { () -> RetiredConnection? in
                 guard task === socket else { return nil }
+                if expired { authenticationError = error }
                 task = nil
                 return removePendingLocked()
             }
             guard let waiting else { return }
             socket.cancel(with: .goingAway, reason: nil)
             finishPending(waiting, error: error, subscriptionError: subscriptionError)
-            scheduleReconnect()
+            if expired { beginRenewal() } else { scheduleReconnect() }
             notifyDisconnected(waiting.observers, error: subscriptionError)
+        }
+    }
+
+    // Caller holds sendOrder. Only expiry allocates refresh state and its timeout.
+    private func beginRenewal() {
+        lock.withLock {
+            guard shouldReconnect, renewal == nil, let callback = tokenExpiredHandler else { return }
+            let waiting = WebSocketRenewal()
+            renewal = waiting
+            reconnectWork?.cancel()
+            let timer = DispatchWorkItem { [weak self] in self?.finishRenewal(waiting, token: nil) }
+            renewalTimer = timer
+            renewalTask = Task { [weak self] in
+                guard self?.isCurrentRenewal(waiting) == true else { return }
+                let token = await callback()
+                self?.finishRenewal(waiting, token: token)
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timer)
+        }
+    }
+
+    private func isCurrentRenewal(_ waiting: WebSocketRenewal) -> Bool {
+        lock.withLock { renewal === waiting }
+    }
+
+    private func removeRenewalLocked() -> (WebSocketRenewal?, Task<Void, Never>?) {
+        let previous = (renewal, renewalTask)
+        renewal = nil
+        renewalTask = nil
+        renewalTimer?.cancel()
+        renewalTimer = nil
+        return previous
+    }
+
+    private func finishRenewal(_ waiting: WebSocketRenewal, token: String?) {
+        sendOrder.withLock {
+            let state = lock.withLock { () -> (Task<Void, Never>?, LuxoError?)? in
+                guard renewal === waiting else { return nil }
+                let previous = removeRenewalLocked()
+                if shouldReconnect, let token, !token.isEmpty {
+                    self.token = token
+                    authenticationError = nil
+                    return (previous.1, nil)
+                }
+                let error = LuxoError(code: 401, message: "token renewal failed", name: "Unauthorized")
+                authenticationError = error
+                return (previous.1, error)
+            }
+            guard let state else { return }
+            state.0?.cancel()
+            if let error = state.1 {
+                waiting.finish(.failure(error))
+            } else {
+                openConnection(); waiting.finish(.success(()))
+            }
         }
     }
 
     private func scheduleReconnect() {
         let state = lock.withLock { () -> (TimeInterval, DispatchWorkItem)? in
-            guard shouldReconnect, task == nil else { return nil }
+            guard shouldReconnect, task == nil, authenticationError == nil else { return nil }
             reconnectWork?.cancel()
             let delay = min(baseBackoff * pow(2, Double(min(reconnectAttempt, 64))), maxBackoff)
             reconnectAttempt = min(reconnectAttempt + 1, 64)

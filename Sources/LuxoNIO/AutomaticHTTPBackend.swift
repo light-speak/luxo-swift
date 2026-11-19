@@ -126,7 +126,7 @@ public extension HTTPTransport where Backend == AutomaticHTTPBackend {
         let backend = try await AutomaticHTTPBackend.connect(
             endpoint: endpoint, timeout: timeout, maxResponseBytes: maxResponseBytes,
             maxRequestBytes: maxRequestBytes, maximumConcurrent: maximumConcurrent, trustRootsFile: trustRootsFile)
-        return AutomaticHTTPTransport(backend: backend, token: token)
+        return AutomaticHTTPTransport(backend: backend, token: token, timeout: timeout)
     }
 
     func close() async throws { try await backend.close() }

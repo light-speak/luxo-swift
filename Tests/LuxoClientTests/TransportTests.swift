@@ -6,8 +6,44 @@ import XCTest
 #endif
 
 final class TransportTests: XCTestCase {
+    func testHTTPNonObjectEnvelopesNeverRefreshAndPreserveNextNull() async throws {
+        for status in [200, 401, 500] {
+            for body in [
+                "[]", #"[{"data":true}]"#, "null", "true", "42", "9223372036854775807",
+                "1.234567890123456789", #""data""#, "{}",
+            ] {
+                let lock = NSLock()
+                var calls = 0
+                let transport = try makeURLSessionTransport { request in
+                    let attempt = lock.withLock {
+                        calls += 1; return calls
+                    }
+                    return try self.mockResponse(
+                        request, status: attempt == 1 ? status : 200,
+                        data: Data((attempt == 1 ? body : #"{"data":null}"#).utf8))
+                }
+                transport.onTokenExpired = {
+                    XCTFail("invalid envelope triggered refresh")
+                    return "must-not-refresh"
+                }
+                do {
+                    _ = try await transport.call("echo")
+                    XCTFail("invalid envelope accepted: \(body)")
+                } catch let error as LuxoError {
+                    XCTAssertEqual(error.name, "ParseError")
+                    XCTAssertEqual(error.code, status)
+                }
+                XCTAssertEqual(lock.withLock { calls }, 1)
+                let next = try await transport.call("echo")
+                XCTAssertEqual(next.mode, .json)
+                XCTAssertEqual(next.data, Data("null".utf8))
+                XCTAssertEqual(lock.withLock { calls }, 2)
+            }
+        }
+    }
+
     func testHTTPResponseLimitsRejectOversizeAndPreserveExactBodies() async throws {
-        for size in [0, 64, 65] {
+        for size in [0, 1, 64, 65] {
             let transport = try makeURLSessionTransport(maxResponseBytes: 64) { request in
                 try self.mockResponse(request, status: 200, data: Data(repeating: 1, count: size))
             }
@@ -15,10 +51,11 @@ final class TransportTests: XCTestCase {
             transport.setMode(.binary)
             do {
                 let result = try await transport.call("echo")
+                XCTAssertGreaterThan(size, 0)
                 XCTAssertLessThanOrEqual(size, 64)
                 XCTAssertEqual(result.data.count, size)
             } catch let error as LuxoError {
-                XCTAssertEqual(size, 65)
+                XCTAssertTrue(size == 0 || size == 65)
                 XCTAssertEqual(error.name, "ParseError")
             }
         }
@@ -97,6 +134,37 @@ final class TransportTests: XCTestCase {
             }
             let payload = try await transport.call("echo")
             XCTAssertEqual(payload.data, Data(value.utf8))
+        }
+    }
+
+    func testHTTPBinaryRequiresDataButAllowsNullMarker() async throws {
+        for generated in [false, true] {
+            let transport = try makeURLSessionTransport { request in
+                try self.mockResponse(request, status: 200, data: Data())
+            }
+            transport.setMode(.binary)
+            try transport.setSchema(["echo": APISchema(id: 1)])
+            transport.onTokenExpired = {
+                XCTFail("missing Binary body triggered refresh"); return nil
+            }
+            do {
+                if generated {
+                    _ = try await transport.call("echo", request: BinaryPresenceRequest(apiID: 1))
+                } else {
+                    _ = try await transport.call("echo")
+                }
+                XCTFail("missing Binary body accepted")
+            } catch let error as LuxoError {
+                XCTAssertEqual(error.name, "ParseError")
+                XCTAssertEqual(error.code, 200)
+            }
+            let valid = try makeURLSessionTransport { request in
+                try self.mockResponse(request, status: 200, data: Data([0]))
+            }
+            valid.setMode(.binary)
+            try valid.setSchema(["echo": APISchema(id: 1)])
+            let payload = try await valid.call("echo")
+            XCTAssertEqual(payload.data, Data([0]))
         }
     }
 
@@ -217,11 +285,14 @@ final class TransportTests: XCTestCase {
         }
     }
 
-    func testHTTPRefreshReturnsTheRetriedRequestsMode() async throws {
+    func testHTTPRefreshPreservesRequestModeAndNewCallsUseUpdatedMode() async throws {
         let transport = try makeURLSessionTransport { request in
-            if request.value(forHTTPHeaderField: "Content-Type") == "application/json" {
+            if request.value(forHTTPHeaderField: "Authorization") != "Bearer fresh" {
                 return try self.mockResponse(
                     request, status: 401, body: ["error": "Unauthorized", "code": 401, "message": "expired"])
+            }
+            if request.value(forHTTPHeaderField: "Content-Type") == "application/json" {
+                return try self.mockResponse(request, status: 200, body: ["data": 2])
             }
             return try self.mockResponse(request, status: 200, data: Data([4]))
         }
@@ -230,9 +301,12 @@ final class TransportTests: XCTestCase {
             transport?.setMode(.binary)
             return "fresh"
         }
-        let result = try await transport.call("echo")
-        XCTAssertEqual(result.mode, .binary)
-        XCTAssertEqual(result.data, Data([4]))
+        let original = try await transport.call("echo")
+        XCTAssertEqual(original.mode, .json)
+        XCTAssertEqual(original.data, Data("2".utf8))
+        let next = try await transport.call("echo")
+        XCTAssertEqual(next.mode, .binary)
+        XCTAssertEqual(next.data, Data([4]))
     }
 
     func testWebSocketConcurrentCallsCarryTheirActualFrameMode() async throws {
@@ -797,6 +871,24 @@ final class TransportTests: XCTestCase {
         XCTAssertEqual(try LuxoBinaryProtocol.encodeRequest(schema: schema, params: [:]), Data([9, 0, 0]))
     }
 
+    func testNullableJSONUsesOneNullRepresentation() throws {
+        let schema = APISchema(id: 9, params: [.init(fieldID: 1, name: "value", type: "JSON", nullable: true)])
+        for value: LuxoValue in [.null, .json(.null)] {
+            XCTAssertEqual(
+                try LuxoBinaryProtocol.encodeRequest(schema: schema, params: ["value": value]), Data([9, 0, 1, 0, 0]))
+        }
+        XCTAssertEqual(try LuxoBinaryProtocol.encodeRequest(schema: schema, params: [:]), Data([9, 0, 0]))
+        let list = APISchema(
+            id: 9, params: [.init(fieldID: 1, name: "value", type: "JSON", isList: true, nullable: true)])
+        XCTAssertEqual(
+            try LuxoBinaryProtocol.encodeRequest(schema: list, params: ["value": .array([.json(.null)])]),
+            Data([9, 0, 1, 1, 1, 4, 110, 117, 108, 108, 0]))
+        let required = APISchema(id: 9, params: [.init(fieldID: 1, name: "value", type: "JSON")])
+        for value: LuxoValue in [.null, .json(.null)] {
+            XCTAssertThrowsError(try LuxoBinaryProtocol.encodeRequest(schema: required, params: ["value": value]))
+        }
+    }
+
     func testCanonicalBinaryErrorEnvelope() {
         let body = Data([
             1, 0xa0, 0x06,
@@ -1119,14 +1211,15 @@ final class TransportTests: XCTestCase {
     }
 
     func testURLSessionTransportDoesNotReplaceValidErrorCodeOrRetryMalformed401() async throws {
-        let zero = try makeURLSessionTransport { request in
-            try self.mockResponse(request, status: 500, body: ["error": "RemoteError", "code": 0, "message": "failed"])
+        let valid = try makeURLSessionTransport { request in
+            try self.mockResponse(
+                request, status: 500, body: ["error": "RemoteError", "code": 409, "message": "failed"])
         }
         do {
-            _ = try await zero.call("fail")
+            _ = try await valid.call("fail")
             XCTFail("expected remote error")
         } catch let error as LuxoError {
-            XCTAssertEqual(error.code, 0)
+            XCTAssertEqual(error.code, 409)
             XCTAssertEqual(error.name, "RemoteError")
         }
         let malformed = try makeURLSessionTransport { request in
@@ -1198,8 +1291,8 @@ final class TransportTests: XCTestCase {
                     _ = try await transport.call("viewer")
                     XCTFail("expected the original error")
                 } catch let error as LuxoError {
-                    XCTAssertEqual(error.code, code)
-                    XCTAssertEqual(error.name, "Unauthorized")
+                    XCTAssertEqual(error.code, code == 0 ? status : code)
+                    XCTAssertEqual(error.name, code == 0 ? "ParseError" : "Unauthorized")
                 }
                 let eligible = status == 401 && code == 401
                 XCTAssertEqual(lock.withLock { refreshes }, eligible ? 1 : 0, "\(mode)/\(status)/\(code)")
@@ -1535,8 +1628,10 @@ final class TransportTests: XCTestCase {
             socket?.deliver(.success(.data(Data([2, 1, 42]))))
         }
         transport.connect()
-        let result = try await transport.call("getUser")
-        XCTAssertEqual(result.data, Data([42]))
+        do { _ = try await transport.call("getUser"); XCTFail("malformed header succeeded") } catch let error
+            as LuxoError
+        { XCTAssertEqual(error.name, "ParseError") }
+        XCTAssertEqual(socket.cancelCode, .goingAway)
     }
 
     func testBinarySubscriptionAcknowledgementRejectsMalformedHeaders() {
@@ -1978,6 +2073,12 @@ final class MockWebSocketTask: LuxoWebSocketTask, @unchecked Sendable {
     private var receiver: (@Sendable (Result<URLSessionWebSocketTask.Message, Error>) -> Void)?
     private var messages: [URLSessionWebSocketTask.Message] = []
     private var resumed = false
+    private var peerCloseCode: URLSessionWebSocketTask.CloseCode = .invalid
+    var closeCode: URLSessionWebSocketTask.CloseCode { lock.withLock { peerCloseCode } }
+    func expireAccess() {
+        lock.withLock { peerCloseCode = URLSessionWebSocketTask.CloseCode(rawValue: 4001)! }
+        deliver(.failure(URLError(.networkConnectionLost)))
+    }
     private var closedWith: URLSessionWebSocketTask.CloseCode?
     private var failure: Error?
     private var sendHandler: ((URLSessionWebSocketTask.Message) -> Void)?

@@ -13,9 +13,36 @@ extension LuxoSchema {
         for type in (types ?? [:]).values {
             try validateFieldIDs(type.fields, owner: "type \(type.name)")
         }
+        for sealed in (sealeds ?? [:]).values {
+            var tags = Set<Int>()
+            for variant in sealed.variants {
+                try validateID(
+                    variant.id, maximum: WireIDLimits.selectionField, seen: &tags,
+                    path: "sealed \(sealed.name).\(variant.name)")
+                var fields = Set<Int>()
+                for field in variant.fields {
+                    try validateID(
+                        field.id, maximum: WireIDLimits.selectionField, seen: &fields,
+                        path: "sealed \(sealed.name).\(variant.name).\(field.name)")
+                }
+            }
+        }
         var seen = Set<Int>()
         for api in apis.values {
             try validateID(api.id, maximum: WireIDLimits.api, seen: &seen, path: "API \(api.name)")
+            if api.paginated == true {
+                for name in ["page", "pageSize"] {
+                    let matches = (api.params ?? []).filter { $0.name == name }
+                    guard matches.count == 1, let param = matches.first,
+                        param.type == "Int", param.nullable != true, param.isList != true
+                    else {
+                        throw LuxoError(
+                            code: 0,
+                            message: "API \(api.name) pagination requires a numbered non-null Int parameter \(name)",
+                            name: "ConfigError")
+                    }
+                }
+            }
             var params = Set<Int>()
             for param in api.params ?? [] {
                 try validateID(
@@ -31,9 +58,15 @@ func validateRuntimeSchemaIDs(_ schema: [String: APISchema]) throws {
     for (name, api) in schema {
         try validateID(api.id, maximum: WireIDLimits.api, seen: &seen, path: "API \(name)")
         var params = Set<Int>()
-        for param in api.params ?? [] {
+        let parameters = api.params ?? []
+        var names = Set<String>()
+        if parameters.count > 1 { names.reserveCapacity(parameters.count) }
+        for param in parameters {
             try validateID(
                 param.fieldID, maximum: WireIDLimits.parameter, seen: &params, path: "API \(name).\(param.name)")
+            if parameters.count > 1, !names.insert(param.name).inserted {
+                throw LuxoError(code: 0, message: "API \(name): duplicate name \(param.name)", name: "ConfigError")
+            }
         }
         try validateFieldIDs(api.fields, owner: "API \(name)")
         for (type, fields) in api.types {

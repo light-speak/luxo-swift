@@ -5,7 +5,7 @@ import Foundation
 struct JSONParameterPlan: Sendable {
     private struct Field: Sendable {
         enum Kind: Sendable {
-            case integer, dateTime, object(Int), missing(String)
+            case integer, dateTime, json, passthrough, object(Int), payload(Int), sealed(Int), missing(String)
         }
         let kind: Kind
         let isList: Bool
@@ -27,60 +27,92 @@ struct JSONParameterPlan: Sendable {
         self.objects = compiler.objects()
     }
 
-    func jsonValue(_ value: LuxoValue, named name: String) throws -> LuxoValue {
+    func writeJSON(_ value: LuxoValue, named name: String, to writer: inout JSONWriter) throws {
         do {
-            return try entry(value, field: fields[name], name: name, depth: 0)
+            try entry(value, field: fields[name], name: name, depth: 0, to: &writer)
         } catch let error as Failure {
             throw LuxoError(
                 code: 0, message: "invalid JSON parameter \(error.path): \(error.reason)", name: "ConfigError")
         }
     }
 
-    private func entry(_ value: LuxoValue, field: Field?, name: String, depth: Int) throws -> LuxoValue {
+    private func entry(
+        _ value: LuxoValue, field: Field?, name: String, depth: Int, to writer: inout JSONWriter
+    ) throws {
         do {
-            guard let field else { return value }
-            if case .null = value, field.nullable { return .null }
+            guard let field else { try writer.value(value, depth: 0); return }
+            if case .null = value, field.nullable { try writer.value(.null, depth: 0); return }
             if field.isList {
                 guard case .array(let values) = value else { throw Failure(reason: "must be a list") }
-                return .array(
-                    try values.enumerated().map { index, item in
-                        do { return try scalar(item, kind: field.kind, depth: depth + 1) } catch var error as Failure {
-                            error.prepend("[\(index)]")
-                            throw error
-                        }
-                    })
+                try writer.array(values, depth: 0) { writer, index, item in
+                    do { try scalar(item, kind: field.kind, depth: depth, to: &writer) } catch var error as Failure {
+                        error.prepend("[\(index)]"); throw error
+                    }
+                }
+                return
             }
-            return try scalar(value, kind: field.kind, depth: depth)
+            try scalar(value, kind: field.kind, depth: depth, to: &writer)
         } catch var error as Failure {
             error.prepend(name)
             throw error
         }
     }
 
-    private func scalar(_ value: LuxoValue, kind: Field.Kind, depth: Int) throws -> LuxoValue {
-        guard depth <= 128 else { throw Failure(reason: "nesting exceeds 128 levels") }
+    private func scalar(
+        _ value: LuxoValue, kind: Field.Kind, depth: Int, to writer: inout JSONWriter
+    ) throws {
         switch kind {
+        case .passthrough:
+            try writer.value(value, depth: 0)
+        case .json:
+            try writer.value(value, depth: 0, genericJSON: true)
         case .dateTime:
             guard case .string(let text) = value else { throw Failure(reason: "must be a DateTime string") }
             do { _ = try dateTimeParts(text) } catch { throw Failure(reason: "invalid DateTime value") }
-            return value
+            try writer.value(value, depth: 0)
         case .integer:
-            guard case .int(let number) = value else { throw Failure(reason: "must be a signed Int64") }
-            return .int(number)
+            guard case .int = value else { throw Failure(reason: "must be a signed Int64") }
+            try writer.value(value, depth: 0)
         case .missing(let type):
             throw Failure(reason: "missing schema for \(type)")
-        case .object(let index):
-            if case .structured(let input) = value {
-                return try scalar(input.luxoJSONValue(), kind: kind, depth: depth + 1)
+        case .sealed(let index):
+            let values = try projectedObject(value, depth: depth)
+            guard values.count == 1, let (name, item) = values.first,
+                let fieldIndex = objects[index].index(forKey: name),
+                objects[index][fieldIndex].key.utf8.elementsEqual(name.utf8)
+            else { throw Failure(reason: "must contain exactly one known case") }
+            let field = objects[index][fieldIndex].value
+            try writer.object(values, depth: 0) { writer, _, _ in
+                try entry(item, field: field, name: name, depth: depth + 1, to: &writer)
             }
-            guard case .object(let values) = value else { throw Failure(reason: "must be an object") }
+        case .object(let index), .payload(let index):
+            let values = try projectedObject(value, depth: depth)
             let objectFields = objects[index]
-            var result = Dictionary<String, LuxoValue>(minimumCapacity: values.count)
-            for (name, item) in values {
-                result[name] = try entry(item, field: objectFields[name], name: name, depth: depth + 1)
+            if case .payload = kind,
+                let unknown = values.keys.first(where: { name in
+                    guard let index = objectFields.index(forKey: name) else { return true }
+                    return !objectFields[index].key.utf8.elementsEqual(name.utf8)
+                })
+            {
+                throw Failure(reason: "unknown sealed payload field \(unknown)")
             }
-            return .object(result)
+            try writer.object(values, depth: 0) { writer, name, item in
+                try entry(item, field: objectFields[name], name: name, depth: depth + 1, to: &writer)
+            }
         }
+    }
+
+    private func projectedObject(_ value: LuxoValue, depth: Int) throws -> [String: LuxoValue] {
+        guard depth < 64 else { throw Failure(reason: "model nesting exceeds 64 levels") }
+        var value = value
+        var projections = 0
+        while case .structured(let input) = value {
+            guard projections < 64 else { throw Failure(reason: "model projection nesting exceeds 64 levels") }
+            value = try input.luxoJSONValue()
+            projections += 1
+        }
+        guard case .object(let fields) = value else { throw Failure(reason: "must be an object") }
+        return fields
     }
 
     private struct Failure: Error {
@@ -96,13 +128,19 @@ struct JSONParameterPlan: Sendable {
         let types: [String: [String: APISchema.SelectionFieldSchema]]
         var definitions: [[String: APISchema.SelectionFieldSchema]] = []
         var indices: [String: Int] = [:]
+        var payloadIndices: Set<Int> = []
 
         mutating func field(type: String?, name: String?, list: Bool, nullable: Bool) -> Field? {
             let kind: Field.Kind
             if type == "Int" || type == "Duration" {
                 kind = .integer
+            } else if type == "JSON" {
+                kind = .json
             } else if type == "DateTime" {
                 kind = .dateTime
+            } else if type == "Sealed" {
+                let definition = object("@sealed:" + (name ?? "<unknown>"))
+                if case .object(let index) = definition { kind = .sealed(index) } else { kind = definition }
             } else if type == "Model" {
                 kind = object(name ?? "<unknown>")
             } else if let modelName = name ?? type, types[modelName] != nil || type == nil {
@@ -117,10 +155,11 @@ struct JSONParameterPlan: Sendable {
 
         mutating func object(_ name: String) -> Field.Kind {
             guard let definition = types[name] else { return .missing(name) }
-            if let index = indices[name] { return .object(index) }
+            if let index = indices[name] { return name.contains(".") ? .payload(index) : .object(index) }
             let index = definitions.count
             indices[name] = index
             definitions.append(definition)
+            if name.contains(".") { payloadIndices.insert(index); return .payload(index) }
             return .object(index)
         }
 
@@ -128,11 +167,15 @@ struct JSONParameterPlan: Sendable {
             var result: [[String: Field]] = []
             while result.count < definitions.count {
                 let definition = definitions[result.count]
+                let payload = payloadIndices.contains(result.count)
                 var fields: [String: Field] = [:]
                 for (name, metadata) in definition {
-                    fields[name] = field(
-                        type: metadata.type, name: metadata.typeName,
-                        list: metadata.isList, nullable: metadata.nullable)
+                    fields[name] =
+                        field(
+                            type: metadata.type, name: metadata.typeName,
+                            list: metadata.isList, nullable: metadata.nullable)
+                        ?? (payload
+                            ? Field(kind: .passthrough, isList: metadata.isList, nullable: metadata.nullable) : nil)
                 }
                 result.append(fields)
             }
@@ -150,8 +193,16 @@ enum LuxoJSONRequest {
         body[subscription ? "$sub" : "$api"] = .string(api)
         if let sequence { body["$id"] = .jsonNumber(JSONNumber(validated: String(sequence))) }
         for (name, value) in params ?? [:] where name != "$api" && name != "$id" && name != "$sub" {
-            body[name] = try plan?.jsonValue(value, named: name) ?? value
+            body[name] = value
         }
-        return try LuxoValue.object(body).jsonData()
+        var writer = JSONWriter()
+        try writer.object(body, depth: 0) { writer, name, value in
+            if let plan, name != "$api", name != "$id", name != "$sub" {
+                try plan.writeJSON(value, named: name, to: &writer)
+            } else {
+                try writer.value(value, depth: 0)
+            }
+        }
+        return Data(writer.bytes)
     }
 }

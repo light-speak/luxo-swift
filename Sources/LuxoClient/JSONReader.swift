@@ -5,12 +5,22 @@ struct JSONReader {
     let bytes: UnsafeBufferPointer<UInt8>
     var offset = 0
 
-    static func decode(_ data: Data) throws -> LuxoValue {
+    static func decode(
+        _ data: Data, allowDocumentBOM: Bool = true, schema: LuxoJSONReadSchema? = nil
+    ) throws -> LuxoValue {
+        try readDocument(data, allowDocumentBOM: allowDocumentBOM) { reader in
+            try schema.map { try reader.value(schema: $0, objectDepth: 0) } ?? reader.value(depth: 0)
+        }
+    }
+
+    static func readDocument<Value>(
+        _ data: Data, allowDocumentBOM: Bool = true, read: (inout JSONReader) throws -> Value
+    ) throws -> Value {
         try data.withUnsafeBytes { raw in
             var reader = JSONReader(bytes: raw.bindMemory(to: UInt8.self))
             // A document BOM is accepted; a BOM inside a string remains string content.
-            if reader.bytes.starts(with: [0xef, 0xbb, 0xbf]) { reader.offset = 3 }
-            let result = try reader.value(depth: 0)
+            if allowDocumentBOM && reader.bytes.starts(with: [0xef, 0xbb, 0xbf]) { reader.offset = 3 }
+            let result = try read(&reader)
             reader.whitespace()
             guard reader.offset == raw.count else { throw reader.invalid() }
             return result
@@ -39,7 +49,6 @@ struct JSONReader {
     }
 
     mutating func value(depth: Int) throws -> LuxoValue {
-        guard depth <= 128 else { throw invalid() }
         whitespace()
         switch current {
         case 34: return .string(try string())
@@ -98,6 +107,7 @@ struct JSONReader {
     }
 
     private mutating func array(depth: Int) throws -> LuxoValue {
+        guard depth < 128 else { throw invalid() }
         offset += 1
         whitespace()
         var values: [LuxoValue] = []
@@ -112,6 +122,7 @@ struct JSONReader {
     }
 
     private mutating func object(depth: Int) throws -> LuxoValue {
+        guard depth < 128 else { throw invalid() }
         offset += 1
         whitespace()
         var values: [String: LuxoValue] = [:]
@@ -178,8 +189,8 @@ struct JSONReader {
     // Foundation treats a leading BOM as an encoding marker even inside a JSON string.
     func legacyUTF8(_ range: Range<Int>) throws -> String {
         guard let value = String(bytes: bytes[range], encoding: .utf8) else { throw invalid() }
-        if bytes[range].starts(with: [0xef, 0xbb, 0xbf]) { return "\u{feff}" + value }
-        return value
+        let marker = hasLeadingUTF8Marker(UnsafeBufferPointer(rebasing: bytes[range]))
+        return preservingUTF8Content(value, hasMarker: marker, byteCount: range.count)
     }
 
     private mutating func escapedString(start: Int) throws -> String {
@@ -237,4 +248,26 @@ struct JSONReader {
         }
         return result
     }
+}
+
+// Keep Foundation's fast Data decoder; restore only content that it removed.
+@inline(__always)
+func strictUTF8String(_ bytes: Data) -> String? {
+    if bytes.isEmpty { return "" }
+    let marker = bytes.withUnsafeBytes { hasLeadingUTF8Marker($0.bindMemory(to: UInt8.self)) }
+    if !marker { return String(data: bytes, encoding: .utf8) }
+    guard let value = String(data: bytes, encoding: .utf8) else { return nil }
+    return preservingUTF8Content(value, hasMarker: marker, byteCount: bytes.count)
+}
+
+@inline(__always)
+func hasLeadingUTF8Marker(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+    bytes.count >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf
+}
+
+@inline(__always)
+func preservingUTF8Content(_ value: String, hasMarker: Bool, byteCount: Int) -> String {
+    // Some Foundation implementations may already retain the marker.
+    if hasMarker && value.utf8.count == byteCount - 3 { return "\u{feff}" + value }
+    return value
 }

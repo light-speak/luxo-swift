@@ -2,6 +2,17 @@ import XCTest
 @testable import LuxoClient
 
 final class QueryCodegenTests: XCTestCase {
+    func testUnicodeQueryNamesPreserveWireNames() throws {
+        let data = Data(
+            #"{"models":{},"apis":{"café":{"id":1,"name":"café","module":"test","returnType":"Int","paginated":true,"query":{"filters":[{"field":"𐐀_name","type":"String","operators":["eq"]}],"sorters":["中文2"]}}}}"#
+                .utf8)
+        let schema = try JSONDecoder().decode(LuxoSchema.self, from: data)
+        let source = try SwiftQueryCodegen.generate(schema)
+        XCTAssertTrue(source.contains("enum LuxoQuery_café"))
+        XCTAssertTrue(source.contains("func 𐐀_name_eq"))
+        XCTAssertTrue(source.contains("field: \"𐐀_name\""))
+        XCTAssertTrue(source.contains("func 中文2_desc"))
+    }
     func testRejectsMalformedQueryCapabilities() throws {
         for field in [
             LuxoQueryFilter(field: "raw", type: "JSON", operators: ["eq"]),

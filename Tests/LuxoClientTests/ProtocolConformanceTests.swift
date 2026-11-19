@@ -174,8 +174,8 @@ final class ProtocolConformanceTests: XCTestCase {
         assertEncoding(fixture.uuid) {
             $0.writeUUID(UUID(uuidString: "01234567-89ab-cdef-0123-456789abcdef")!)
         }
-        assertEncoding(fixture.intArray) {
-            $0.writeArrayHeader(3)
+        try assertEncoding(fixture.intArray) {
+            try $0.writeArrayHeader(3)
             $0.writeSvarint(-3)
             $0.writeSvarint(0)
             $0.writeSvarint(9)

@@ -36,6 +36,15 @@ final class HTTPResponseCollector: NSObject, URLSessionDataDelegate, @unchecked 
         }
     }
 
+    // Business requests must not replay credentials or bodies at a redirected URL.
+    func urlSession(
+        _ session: URLSession, task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         let oversized = lock.withLock { () -> Bool in
             guard !finished else { return false }

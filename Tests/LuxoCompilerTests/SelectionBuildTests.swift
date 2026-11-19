@@ -3,6 +3,66 @@ import XCTest
 @testable import LuxoCompiler
 
 final class SelectionBuildTests: XCTestCase {
+    func testUnderscoredPublicFieldsUseCompilerSymbolsWithoutAdmittingPrivateFields() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let directory = root.appendingPathComponent(".tmp/selection-public-fields-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let names = [
+            "items", "i", "_items", "decoder", "initial", "total", "page", "pageSize", "depth", "depth_", "_i",
+            "normal",
+        ]
+        let fields = names.map { "public let \($0): Int" }.joined(separator: "\n")
+        let reads = names.map { "print(row.\($0))" }.joined(separator: "\n")
+        let source = """
+            public struct Record {
+                \(fields)
+                var internalSecret: Int { 0 }
+                private var secret: Int { 0 }
+            }
+            public struct Client { public func rows(select: String? = nil) -> [Record] { fatalError() } }
+            public func read(_ client: Client) {
+                let rows = client.rows()
+                for row in rows { \(reads) }
+            }
+            """
+        let file = directory.appendingPathComponent("Read.swift")
+        try source.write(to: file, atomically: true, encoding: .utf8)
+        let manifest = directory.appendingPathComponent("LuxoSelection.json")
+        func declaration(_ fields: [String]) throws -> Data {
+            try JSONSerialization.data(withJSONObject: [
+                "version": 1, "module": "Probe", "client": "Client", "apis": ["rows": [:]],
+                "fields": ["Record": Dictionary(uniqueKeysWithValues: fields.map { ($0, false) })],
+            ])
+        }
+        try declaration(names).write(to: manifest)
+        let scratch = directory.appendingPathComponent(".tmp/public")
+        let arguments = [
+            "-module-name", "Probe", "-parse-as-library", "-module-cache-path",
+            directory.appendingPathComponent("cache").path, file.path,
+        ]
+        _ = try SelectionBuild.prepareOverlay(
+            workspace: directory, manifest: manifest, scratch: scratch, arguments: arguments)
+        let rewritten = try String(contentsOf: scratch.appendingPathComponent("source-0/Read.swift"), encoding: .utf8)
+        XCTAssertTrue(rewritten.contains("select: \"\(names.sorted().joined(separator: ","))\""), rewritten)
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), source)
+        for field in ["internalSecret", "secret"] {
+            try declaration(names + [field]).write(to: manifest)
+            XCTAssertThrowsError(
+                try SelectionBuild.prepareOverlay(
+                    workspace: directory, manifest: manifest,
+                    scratch: directory.appendingPathComponent(".tmp/" + field),
+                    arguments: arguments)
+            ) { error in
+                guard case SelectionCatalog.Failure.missingSymbol(let name) = error else {
+                    return XCTFail("Expected a missing non-public field, got \(error)")
+                }
+                XCTAssertEqual(name, "Record." + field)
+            }
+        }
+    }
+
     func testPreparedOverlaySurvivesUntilExternalCompilerFinishes() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()

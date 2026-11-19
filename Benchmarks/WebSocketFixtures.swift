@@ -7,6 +7,7 @@ final class BenchmarkSession: LuxoWebSocketSession {
 }
 
 final class BenchmarkSocket: LuxoWebSocketTask, @unchecked Sendable {
+    var closeCode: URLSessionWebSocketTask.CloseCode { .invalid }
     private let lock = NSLock()
     private var receiver: (@Sendable (Result<URLSessionWebSocketTask.Message, Error>) -> Void)?
     private var count = 0

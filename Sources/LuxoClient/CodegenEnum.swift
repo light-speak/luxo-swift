@@ -4,23 +4,108 @@ import Foundation
 enum SwiftEnumCodegen {
     static func validate(_ schema: LuxoSchema) throws {
         for (key, value) in schema.enums ?? [:] {
-            guard key.utf8.elementsEqual(value.name.utf8), !value.values.isEmpty,
-                Set(value.values.map { Data($0.utf8) }).count == value.values.count
+            try validateName(key, value.name)
+            guard Set(value.values.map { Data($0.utf8) }).count == value.values.count
             else { throw invalid("enum \(key) requires a matching name and distinct members") }
         }
-        let fields = schema.models.values.flatMap(\.fields) + (schema.types?.values.flatMap(\.fields) ?? [])
-        for field in fields { try validateReference(field.type, name: field.typeName, schema: schema) }
-        for api in schema.apis.values {
+        for (key, model) in schema.models {
+            try validateName(key, model.name)
+            guard schema.types?[key] == nil && schema.enums?[key] == nil else {
+                throw invalid("duplicate type \(key)")
+            }
+            try validateFields(model.fields, schema: schema)
+        }
+        for (key, type) in schema.types ?? [:] {
+            try validateName(key, type.name)
+            guard schema.enums?[key] == nil else { throw invalid("duplicate type \(key)") }
+            try validateFields(type.fields, schema: schema)
+        }
+        for (key, sealed) in schema.sealeds ?? [:] {
+            try validateName(key, sealed.name)
+            guard isLuxoDSLIdentifier(key),
+                schema.models[key] == nil, schema.types?[key] == nil, schema.enums?[key] == nil
+            else {
+                throw invalid("invalid or duplicate sealed type \(key)")
+            }
+            var cases = Set<String>()
+            for variant in sealed.variants {
+                try validateMemberName(variant.name, names: &cases)
+                guard isLuxoDSLIdentifier(variant.name) else { throw invalid("invalid case \(variant.name)") }
+                var fields = Set<String>()
+                for field in variant.fields {
+                    guard isLuxoDSLIdentifier(field.name) else { throw invalid("invalid sealed field \(field.name)") }
+                    try validateMemberName(field.name, names: &fields)
+                    try validateReference(field.type, name: field.typeName, schema: schema)
+                }
+            }
+        }
+        for (key, api) in schema.apis {
+            try validateName(key, api.name)
             guard api.returnType != "Enum" else { throw invalid("API \(api.name) requires a named enum return") }
+            try validateReturnType(api, schema: schema)
+            var names = Set<String>()
             for param in api.params ?? [] {
+                try validateMemberName(param.name, names: &names)
                 try validateReference(param.type, name: param.typeName, schema: schema)
             }
         }
     }
 
+    private static func validateName(_ key: String, _ name: String) throws {
+        guard !name.isEmpty else { throw invalid("Declaration name must not be empty") }
+        guard key.utf8.elementsEqual(name.utf8) else {
+            throw invalid("Declaration name \(name) does not match key \(key)")
+        }
+    }
+
+    private static func validateMemberName(_ name: String, names: inout Set<String>) throws {
+        guard !name.isEmpty else { throw invalid("Member name must not be empty") }
+        // Generated Swift members and selection dictionaries use canonical String equality.
+        guard names.insert(name).inserted else { throw invalid("duplicate name \(name)") }
+    }
+
+    private static func validateFields(_ fields: [LuxoField], schema: LuxoSchema) throws {
+        var names = Set<String>()
+        for field in fields {
+            try validateMemberName(field.name, names: &names)
+            try validateReference(field.type, name: field.typeName, schema: schema)
+        }
+    }
+
+    private static func validateReturnType(_ api: LuxoAPI, schema: LuxoSchema) throws {
+        guard let type = api.returnType else {
+            throw invalid("API \(api.name) must declare a return type")
+        }
+        guard isDeclaredType(type, schema: schema) else {
+            throw invalid("API \(api.name) has an undeclared return type \(type)")
+        }
+    }
+
+    private static func isDeclaredType(_ type: String, schema: LuxoSchema) -> Bool {
+        switch type {
+        case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes", "JSON":
+            return true
+        default:
+            return schema.models[type] != nil || schema.types?[type] != nil || schema.enums?[type] != nil
+                || schema.sealeds?[type] != nil
+        }
+    }
+
     private static func validateReference(_ type: String, name: String?, schema: LuxoSchema) throws {
-        guard type == "Enum" else { return }
-        guard let name, schema.enums?[name] != nil else { throw invalid("Enum requires a declared typeName") }
+        switch type {
+        case "Enum":
+            guard let name, schema.enums?[name] != nil else { throw invalid("Enum requires a declared typeName") }
+        case "Sealed":
+            guard let name, schema.sealeds?[name] != nil else {
+                throw invalid("Sealed requires a declared typeName")
+            }
+        case "Model":
+            guard let name, schema.models[name] != nil || schema.types?[name] != nil else {
+                throw invalid("Model requires a declared typeName")
+            }
+        default:
+            guard isDeclaredType(type, schema: schema) else { throw invalid("undeclared type \(type)") }
+        }
     }
 
     private static func invalid(_ message: String) -> LuxoError {
@@ -71,6 +156,14 @@ enum SwiftEnumCodegen {
     }
 
     private static func equality(_ entries: [(raw: String, name: String)]) -> String {
+        if entries.isEmpty {
+            return """
+                    public static func == (lhs: Self, rhs: Self) -> Bool {
+                        lhs.rawValue.utf8.elementsEqual(rhs.rawValue.utf8)
+                    }
+
+                """
+        }
         let known = entries.map { "(.\($0.name), .\($0.name))" }.joined(separator: ", ")
         return """
                 public static func == (lhs: Self, rhs: Self) -> Bool {
@@ -93,7 +186,7 @@ enum SwiftEnumCodegen {
         return out + "            for byte in raw.utf8 { hasher.combine(byte) }\n        }\n    }\n"
     }
 
-    private static func caseNames(_ values: [String]) -> [String] {
+    static func caseNames(_ values: [String]) -> [String] {
         let preferred = values.map { $0.lowercased() }
         let counts = Dictionary(grouping: preferred, by: { $0 }).mapValues(\.count)
         let reserved: Set<String> = ["unknown", "init", "self"]
@@ -114,7 +207,7 @@ enum SwiftEnumCodegen {
         return value.utf8.allSatisfy { $0 == 95 || (97...122).contains($0) || (48...57).contains($0) }
     }
 
-    private static func literal(_ value: String) -> String {
+    static func literal(_ value: String) -> String {
         var out = "\""
         for scalar in value.unicodeScalars {
             switch scalar.value {

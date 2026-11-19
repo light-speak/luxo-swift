@@ -70,6 +70,31 @@ One file. Zero boilerplate. This generates everything — including the Swift cl
                      Binary (prod, 3x smaller)
 ```
 
+## Typed Binary encoding
+
+Generated clients write Binary values directly with typed methods. The old
+`writeField(_:value:type:)` and `writeFieldList(_:values:type:)` entry points have
+been removed before beta.1; handwritten encoders use the same typed primitives:
+
+```swift
+import LuxoClient
+
+var encoder = Encoder()
+encoder.writeVarint(1)
+encoder.writeSvarint(42)
+encoder.writeVarint(2)
+try encoder.writeJSON(.object(["enabled": .bool(true)]))
+encoder.writeEnd()
+```
+
+Int/Duration use `Int64`, Float uses `Double`, Boolean uses `Bool`, UUID uses
+`UUID`, and JSON uses `JSONValue`. Construct UUIDs explicitly and handle invalid
+text before encoding. `writeDateTime` accepts either a validated RFC3339 string
+or a native `Date`; use the string form for exact nanosecond input. Lists write
+their count followed by typed elements. Handle encoding errors before sending
+the buffer; the transport does this for generated requests. Foundation
+`NSNumber` values do not implicitly become typed scalars through these methods.
+
 ## Typed query controls
 
 For an API `listUsers` advertising an Int `count` filter and sorter, generated `Queries.swift` provides:
@@ -194,7 +219,7 @@ also preserves request/response limits and the active-request limit on fallback.
 existing WebSocket transport for subscriptions. Connection/TLS establishment
 has independent 10-second deadlines; `timeout` applies to each HTTP attempt.
 
-Run `python3 Scripts/test-nio.py` for all 33 TLS, backend-selection and lifecycle tests.
+Run `python3 Scripts/test-nio.py` for TLS, backend-selection and lifecycle tests.
 The harness requires Go 1.27.1 and keeps disposable servers, certificates and
 reports under `.tmp/`. CI uses `--all --coverage` to include the same network
 contract in the full source coverage gate.
@@ -204,6 +229,19 @@ resolve/download them for the package. Benchmark prototype results do not
 constitute performance acceptance of this production integration.
 
 ### WebSocket — Real-time Subscriptions
+
+Run `python3 Scripts/test-ws-depth.py --core /path/to/luxo` with a matching core
+checkout to test native Codable JSON depth, response metadata order, and subscription
+failure isolation over real sockets. The bounded adversarial peer uses the core's
+existing Go WebSocket dependency. Its source-checked reports stay under `.tmp/`;
+the harness closes its owned process and removes its executable after each run.
+
+`WebSocketTransport.onTokenExpired` can return a new access token after the server
+closes an expired connection with code `4001`. New calls wait for that renewal;
+old calls and subscriptions terminate and are never replayed. Renewal timeout or
+failure stops reconnecting with expired credentials. Closing the transport or
+calling `setToken` invalidates late renewal results.
+
 
 Connections reconnect with exponential backoff (1s → 2s → 4s → ... → 30s max).
 Interrupted subscriptions terminate; callers decide whether to subscribe again:
@@ -235,8 +273,12 @@ subscription setup throws `NetworkError` without also notifying its observer.
 Ordinary pending calls retain their existing `ConnectionError` behavior.
 An unparseable JSON message, invalid root or malformed Unicode instead closes
 the connection with `ParseError` for all pending calls/setup and established
-streams. No ID is guessed from a damaged document. A valid envelope with bad
-business data still fails only its subscription with `DecodeError`.
+streams. No ID is guessed from a damaged document. Invalid Binary frame tags,
+missing/truncated IDs or UInt64 overflow use the same connection cleanup.
+A successful Binary ACK with trailing bytes and a valid ID fails only that
+subscription with `ParseError`; valid late or retired IDs remain ignored.
+A valid envelope with bad business data still fails only its subscription with
+`DecodeError`.
 Reconnection restores only the connection, never replays subscriptions, and does
 not recover missed events. Create a new subscription explicitly after recovery;
 old cancellation closures cannot cancel it. This pre-release wire requires
@@ -535,6 +577,16 @@ let exact = try JSONNumber("9223372036854775807").toInt64()
 
 Use `LuxoJSONDecoder` / `LuxoJSONEncoder` for Codable values containing generic JSON.
 Generated clients use these boundaries automatically; regenerate older clients.
+Handwritten Codable types do not need an additional `LuxoJSONSchemaProviding`
+conformance. Models allow 64 object layers; generic JSON allows 128 containers
+from its own root, independently of surrounding models and typed collections.
+Duplicate keys decode their final value without running overwritten business
+initializers. Discarded values without observable type metadata use the 128-container
+JSON limit; materialized models retain the 64-object limit.
+When no response schema is registered, HTTP/WS preserve syntax-checked raw
+`TransportPayload.data`; use `LuxoJSONDecoder` or `JSONValue.parse` to apply the
+appropriate typed limits. Declared response schemas and error data are still
+validated at the transport boundary.
 Foundation's generic Decoder interface cannot expose original numeric tokens;
 `JSONValue` refuses numeric decoding through that interface instead of silently
 rounding. Foundation JSONEncoder also refuses raw-number cases. Hand-created
@@ -544,6 +596,14 @@ rounding. Foundation JSONEncoder also refuses raw-number cases. Hand-created
 需重新生成。Foundation Decoder 不能暴露数字 token，相关入口对数字报错，不悄悄
 舍入；Foundation JSONEncoder 也拒绝原文数字。调用方自己构造的 `.number(Double)`
 已是浮点数，无法恢复更早丢失的精度。
+
+手写 Codable 不需要额外声明 `LuxoJSONSchemaProviding`。普通模型最多64层对象，
+通用JSON从自身根独立允许128层容器。未登记响应Schema时，HTTP／WS保留经过语法检查的
+原始 `TransportPayload.data`，由 `LuxoJSONDecoder` 或 `JSONValue.parse` 按实际类型
+检查层数；已声明的响应Schema与错误data仍在传输边界验证。
+
+重复键仅解码末值，不执行已覆盖旧值的业务初始化。没有可观察类型信息的旧值按完整
+JSON根检查128层；实际初始化的模型仍限制64层。
 
 Explicit `toInt64()` requires integer syntax and signed 64-bit range. `toDouble()`
 allows normal rounding but rejects infinity and nonzero underflow to zero.

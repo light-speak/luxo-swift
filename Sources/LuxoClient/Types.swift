@@ -92,9 +92,14 @@ public enum JSONValue: Codable, Sendable, Equatable {
         try JSONValue(JSONReader.decode(data))
     }
 
-    public func jsonData() throws -> Data { try LuxoValue(self).jsonData() }
+    /// Binary JSON fields do not permit a document encoding marker.
+    public static func parseBinary(_ data: Data) throws -> JSONValue {
+        try JSONValue(JSONReader.decode(data, allowDocumentBOM: false))
+    }
 
-    init(_ value: LuxoValue) throws {
+    public func jsonData() throws -> Data { try LuxoValue.checkedJSON(self).jsonData() }
+
+    init(_ value: LuxoValue, depth: Int = 0) throws {
         switch value {
         case .null: self = .null
         case .bool(let value): self = .bool(value)
@@ -102,10 +107,62 @@ public enum JSONValue: Codable, Sendable, Equatable {
         case .float(let value): self = .number(value)
         case .jsonNumber(let value): self = .rawNumber(value)
         case .string(let value): self = .string(value)
-        case .array(let values): self = .array(try values.map(JSONValue.init))
-        case .object(let values): self = .object(try values.mapValues(JSONValue.init))
+        case .array(let values):
+            try requireJSONContainerDepth(depth, name: "DecodingError")
+            self = .array(try values.map { try JSONValue($0, depth: depth + 1) })
+        case .object(let values):
+            try requireJSONContainerDepth(depth, name: "DecodingError")
+            self = .object(try values.mapValues { try JSONValue($0, depth: depth + 1) })
+        case .json(let value):
+            try value.validateDepth(depth, name: "DecodingError")
+            self = value
         case .bytes, .structured:
             throw LuxoError(code: 0, message: "not a JSON value", name: "DecodingError")
+        }
+    }
+
+    fileprivate func validateDepth(_ depth: Int, name: String) throws {
+        switch self {
+        case .array(let values):
+            try requireJSONContainerDepth(depth, name: name)
+            for value in values { try value.validateDepth(depth + 1, name: name) }
+        case .object(let values):
+            try requireJSONContainerDepth(depth, name: name)
+            for value in values.values { try value.validateDepth(depth + 1, name: name) }
+        default: break
+        }
+    }
+
+    fileprivate func transportEquals(_ other: LuxoValue) -> Bool {
+        switch (self, other) {
+        case (.null, .null), (.null, .json(.null)): return true
+        case (.bool(let a), .bool(let b)), (.bool(let a), .json(.bool(let b))): return a == b
+        case (.integer(let a), .int(let b)), (.integer(let a), .json(.integer(let b))): return a == b
+        case (.number(let a), .float(let b)), (.number(let a), .json(.number(let b))): return a == b
+        case (.rawNumber(let a), .jsonNumber(let b)), (.rawNumber(let a), .json(.rawNumber(let b))): return a == b
+        case (.string(let a), .string(let b)), (.string(let a), .json(.string(let b))): return a == b
+        case (.array(let a), .array(let b)):
+            return a.count == b.count && zip(a, b).allSatisfy { $0.transportEquals($1) }
+        case (.array(let a), .json(.array(let b))):
+            return a.count == b.count && zip(a, b).allSatisfy { $0.transportEquals(.json($1)) }
+        case (.object(let a), .object(let b)):
+            return a.count == b.count && a.allSatisfy { key, value in b[key].map(value.transportEquals) ?? false }
+        case (.object(let a), .json(.object(let b))):
+            return a.count == b.count
+                && a.allSatisfy { key, value in b[key].map { value.transportEquals(.json($0)) } ?? false }
+        default: return false
+        }
+    }
+
+    fileprivate func foundationValue(depth: Int = 0) throws -> Any {
+        switch self {
+        case .array(let values):
+            try requireJSONContainerDepth(depth, name: "EncodingError")
+            return try values.map { try $0.foundationValue(depth: depth + 1) }
+        case .object(let values):
+            try requireJSONContainerDepth(depth, name: "EncodingError")
+            return try values.mapValues { try $0.foundationValue(depth: depth + 1) }
+        default: return try LuxoValue(self).foundationValue()
         }
     }
 
@@ -114,25 +171,48 @@ public enum JSONValue: Codable, Sendable, Equatable {
             self = try JSONValue(decoder.value)
             return
         }
+        if let decoder = decoder as? JSONCodableDecoder {
+            self = try decoder.jsonValue()
+            return
+        }
+        self = try JSONValue.decodeFoundation(from: decoder, depth: 0)
+    }
+
+    private static func decodeFoundation(from decoder: Swift.Decoder, depth: Int) throws -> JSONValue {
         let container = try decoder.singleValueContainer()
         if container.decodeNil() {
-            self = .null
+            return .null
         } else if let value = try? container.decode(Bool.self) {
-            self = .bool(value)
+            return .bool(value)
         } else if let value = try? container.decode(String.self) {
-            self = .string(value)
-        } else if let value = try? container.decode([JSONValue].self) {
-            self = .array(value)
-        } else {
-            self = .object(try container.decode([String: JSONValue].self))
+            return .string(value)
         }
+        if var array = try? decoder.unkeyedContainer() {
+            try requireJSONContainerDepth(depth, name: "DecodingError")
+            var values: [JSONValue] = []
+            while !array.isAtEnd {
+                values.append(try decodeFoundation(from: array.superDecoder(), depth: depth + 1))
+            }
+            return .array(values)
+        }
+        let object = try decoder.container(keyedBy: JSONCodingKey.self)
+        try requireJSONContainerDepth(depth, name: "DecodingError")
+        var values: [String: JSONValue] = [:]
+        for key in object.allKeys {
+            values[key.stringValue] = try decodeFoundation(from: object.superDecoder(forKey: key), depth: depth + 1)
+        }
+        return .object(values)
     }
 
     public func encode(to encoder: Swift.Encoder) throws {
         if let encoder = encoder as? JSONTreeEncoder {
-            encoder.node.storage = .value(LuxoValue(self))
+            encoder.node.storage = .value(try LuxoValue.checkedJSON(self))
             return
         }
+        try encodeFoundation(to: encoder, depth: 0)
+    }
+
+    private func encodeFoundation(to encoder: Swift.Encoder, depth: Int) throws {
         var container = encoder.singleValueContainer()
         switch self {
         case .null: try container.encodeNil()
@@ -146,8 +226,17 @@ public enum JSONValue: Codable, Sendable, Equatable {
                     codingPath: encoder.codingPath,
                     debugDescription: "use Luxo JSON encoding to preserve raw number tokens"))
         case .string(let value): try container.encode(value)
-        case .array(let value): try container.encode(value)
-        case .object(let value): try container.encode(value)
+        case .array(let values):
+            try requireJSONContainerDepth(depth, name: "EncodingError")
+            var array = encoder.unkeyedContainer()
+            for value in values { try value.encodeFoundation(to: array.superEncoder(), depth: depth + 1) }
+        case .object(let values):
+            try requireJSONContainerDepth(depth, name: "EncodingError")
+            var object = encoder.container(keyedBy: JSONCodingKey.self)
+            for (key, value) in values {
+                try value.encodeFoundation(
+                    to: object.superEncoder(forKey: JSONCodingKey(stringValue: key)), depth: depth + 1)
+            }
         }
     }
 
@@ -196,6 +285,8 @@ public enum LuxoValue: Sendable, Equatable {
     case array([LuxoValue])
     case object([String: LuxoValue])
     case structured(any LuxoBinaryEncodable)
+    /// A generic JSON root whose container budget is independent of its enclosing model.
+    case json(JSONValue)
 
     public init(_ value: Int) { self = .int(Int64(value)) }
     public init(_ value: Int64) { self = .int(value) }
@@ -231,12 +322,18 @@ public enum LuxoValue: Sendable, Equatable {
         }
     }
 
+    /// Validate and retain a generic JSON root without copying its value tree.
+    public static func checkedJSON(_ value: JSONValue) throws -> LuxoValue {
+        try value.validateDepth(0, name: "EncodingError")
+        return .json(value)
+    }
+
     public static func encode<Value: Encodable & Sendable>(_ value: Value) throws -> LuxoValue {
         try JSONTreeEncoder.project(value)
     }
 
-    static func decodeJSONData(_ data: Data) throws -> LuxoValue {
-        try JSONReader.decode(data)
+    static func decodeJSONData(_ data: Data, allowDocumentBOM: Bool = true) throws -> LuxoValue {
+        try JSONReader.decode(data, allowDocumentBOM: allowDocumentBOM)
     }
 
     func jsonData() throws -> Data {
@@ -255,11 +352,14 @@ public enum LuxoValue: Sendable, Equatable {
         case .array(let values): return try values.map { try $0.foundationValue() }
         case .object(let values): return try values.mapValues { try $0.foundationValue() }
         case .structured(let value): return try value.luxoJSONValue().foundationValue()
+        case .json(let value): return try value.foundationValue()
         }
     }
 
     public static func == (lhs: LuxoValue, rhs: LuxoValue) -> Bool {
         switch (lhs, rhs) {
+        case (.json(let value), _): return value.transportEquals(rhs)
+        case (_, .json(let value)): return value.transportEquals(lhs)
         case (.null, .null): return true
         case (.bool(let lhs), .bool(let rhs)): return lhs == rhs
         case (.int(let lhs), .int(let rhs)): return lhs == rhs
@@ -339,6 +439,32 @@ public struct LuxoSchema: Codable, Sendable {
     public let apis: [String: LuxoAPI]
     public let enums: [String: LuxoEnum]?
     public let types: [String: LuxoTypeDecl]?
+    public let sealeds: [String: LuxoSealed]?
+
+    public init(
+        models: [String: LuxoModel], apis: [String: LuxoAPI], enums: [String: LuxoEnum]? = nil,
+        types: [String: LuxoTypeDecl]? = nil, sealeds: [String: LuxoSealed]? = nil
+    ) {
+        self.models = models
+        self.apis = apis
+        self.enums = enums
+        self.types = types
+        self.sealeds = sealeds
+    }
+}
+
+public struct LuxoSealed: Codable, Sendable {
+    public let name: String
+    public let module: String?
+    public let usage: TypeUsage?
+    public let description: String?
+    public let variants: [LuxoSealedVariant]
+}
+
+public struct LuxoSealedVariant: Codable, Sendable {
+    public let id: Int
+    public let name: String
+    public let fields: [LuxoParam]
 }
 
 public struct LuxoEnum: Codable, Sendable {
@@ -468,4 +594,19 @@ public struct LuxoParam: Codable, Sendable {
     public let nullable: Bool?
     public let hasDefault: Bool?
     public let isList: Bool?
+    public let description: String?
+
+    public init(
+        id: Int, name: String, type: String, typeName: String? = nil,
+        nullable: Bool? = nil, hasDefault: Bool? = nil, isList: Bool? = nil, description: String? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.type = type
+        self.typeName = typeName
+        self.nullable = nullable
+        self.hasDefault = hasDefault
+        self.isList = isList
+        self.description = description
+    }
 }
