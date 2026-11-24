@@ -5,17 +5,19 @@ import json
 import os
 from pathlib import Path
 import re
-import selectors
 import shutil
 import subprocess
 import tempfile
 
+from live_fixtures import core_revision, full_test_environment, managed_peer, ready_line
+
 
 def source_hashes(root):
-    files = [root / "Package.swift", root / "Package.resolved", Path(__file__).resolve(),
+    files = [root / "Package.swift", root / "Package.resolved", Path(__file__).resolve(), root / "Scripts/live_fixtures.py",
              *sorted((root / "Sources").rglob("*.swift")),
              *sorted((root / "Tests").rglob("*.swift")),
-             *sorted((root / "Tests/Fixtures/NIO").glob("*.go"))]
+             *sorted((root / "Tests/Fixtures/NIO").glob("*.go")),
+             root / "Tests/Fixtures/WSRenewal/main.go"]
     files = [path for path in files if not any(part in {".tmp", ".build", ".git"}
                                              for part in path.relative_to(root).parts)]
     return {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
@@ -36,14 +38,20 @@ def build_fixture(root, output, credentials):
 
 
 def fixture_environment(server, credentials):
-    with selectors.DefaultSelector() as selector:
-        selector.register(server.stdout, selectors.EVENT_READ)
-        if not selector.select(timeout=10):
-            raise RuntimeError("TLS fixture did not become ready")
-    endpoints = json.loads(server.stdout.readline())
+    endpoints = json.loads(ready_line(server.stdout))
     return dict(os.environ, LUXO_NIO_TEST_H2=endpoints["h2"], LUXO_NIO_TEST_H1=endpoints["h1"],
                 LUXO_NIO_TEST_CERT=str(credentials / "server.crt"),
                 LUXO_NIO_TEST_WRONG_CERT=str(credentials / "wrong/server.crt"))
+
+
+FULL_FIXTURE_TESTS = {
+    "CodegenTests testRealIntrospectionRejectsRedirect",
+    "HTTPResponseCollectorTests testBusinessRedirectsDoNotReplayCredentialsOrBody",
+    "WebSocketDecodeTests testLiveGoPeerCallsKeepNativeDepthBudgetsAndRecover",
+    "WebSocketDecodeTests testLiveGoPeerStreamDepthFailureOnlyRetiresItsSubscription",
+    "WebSocketRenewalTests testLiveGoExpiryRefreshAndReconnect",
+    "WebSocketRenewalTests testLiveGoGatewayStreamExpiryNeverReplaysSubscriptions",
+}
 
 
 def run_tests(root, output, environment, args):
@@ -65,29 +73,19 @@ def run_tests(root, output, environment, args):
     with (output / "test.log").open("w") as log:
         subprocess.run(command, cwd=root, env=environment, check=True,
                        timeout=600 if args.all else 180, stdout=log, stderr=log)
-    text = (output / "test.log").read_text()
+    return test_count((output / "test.log").read_text(), args.all)
+
+
+def test_count(text, full):
     counts = re.findall(r"Executed (\d+) tests, with 0 failures", text)
-    if "skipped" in text or not counts or (not args.all and int(counts[-1]) != 39):
+    if re.search(r"\bskipped\b", text, re.IGNORECASE) or not counts or (not full and int(counts[-1]) != 39):
         raise RuntimeError("Expected all selected tests with zero failures and skips")
+    if full:
+        passed = set(re.findall(r"Test Case '-\[LuxoClientTests\.([^\]]+)\]' passed", text))
+        missing = FULL_FIXTURE_TESTS - passed
+        if missing:
+            raise RuntimeError("Missing live suite results: " + ", ".join(sorted(missing)))
     return int(counts[-1])
-
-
-def stop_fixture(server, result):
-    if server is None:
-        return
-    try:
-        server.stdin.close()
-    except BrokenPipeError:
-        pass
-    try:
-        result["server_exit"] = server.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        server.terminate()
-        result["server_exit"] = server.wait(timeout=5)
-        result["status"] = "failed_cleanup"
-    server.stdout.close()
-    if result["server_exit"] != 0:
-        result["status"] = "failed_cleanup"
 
 
 def main():
@@ -95,7 +93,11 @@ def main():
     parser.add_argument("--all", action="store_true", help="Run all tests with TLS fixtures available")
     parser.add_argument("--coverage", action="store_true", help="Enable source coverage")
     parser.add_argument("--sanitize-thread", action="store_true", help="Enable Thread Sanitizer")
+    parser.add_argument("--core", type=Path, help="Path to the pinned Core fixture checkout")
+    parser.add_argument("--core-revision", help="Exact Core revision used to build the WebSocket peers")
     args = parser.parse_args()
+    if args.all and (not args.core or not args.core_revision):
+        parser.error("--all requires --core and --core-revision for the real WebSocket fixtures")
     root = Path(__file__).resolve().parents[1]
     temporary = root / ".tmp"
     temporary.mkdir(exist_ok=True)
@@ -107,18 +109,32 @@ def main():
     try:
         result["sdk_source_sha256"] = source_hashes(root)
         build_fixture(root, output, credentials)
-        with (output / "server.log").open("w") as log:
-            server = subprocess.Popen([str(output / "server"), str(credentials / "server.crt"),
-                                       str(credentials / "server.key")], stdin=subprocess.PIPE,
-                                      stdout=subprocess.PIPE, stderr=log, text=True)
+        with managed_peer(output / "server", output / "server.log", credentials / "server.crt",
+                          credentials / "server.key") as server:
             environment = fixture_environment(server, credentials)
-            result["tests"] = run_tests(root, output, environment, args)
+            if args.all:
+                core = args.core.resolve()
+                result["core_fixture_revision"] = core_revision(core, args.core_revision)
+                with full_test_environment(root, core, output, environment) as complete:
+                    result["tests"] = run_tests(root, output, complete, args)
+                core_revision(core, args.core_revision)
+            else:
+                result["tests"] = run_tests(root, output, environment, args)
             if source_hashes(root) != result["sdk_source_sha256"]:
                 raise RuntimeError("SDK input changed during integration")
-            result["status"] = "passed"
+        result["status"] = "passed"
+    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
+        for name in ("build.log", "core-fixture-build.log", "server.log", "ws-codable.log", "ws-renewal.log",
+                     "swift-build.log", "test.log"):
+            log = output / name
+            if log.is_file():
+                print(f"{name}:\n{log.read_text(errors='replace')[-8000:]}", flush=True)
+        raise
     finally:
         try:
-            stop_fixture(server, result)
+            result["server_exit"] = None if server is None else server.returncode
+            for name in ("server", "tlscert", "ws-codable", "ws-renewal"):
+                (output / name).unlink(missing_ok=True)
         finally:
             credentials.resolve().relative_to(temporary.resolve())
             shutil.rmtree(credentials)

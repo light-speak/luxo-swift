@@ -46,7 +46,8 @@ class HarnessBuildTests(unittest.TestCase):
 
     def test_instrumentation_matches_build_and_test(self):
         args = SimpleNamespace(all=True, coverage=True, sanitize_thread=True)
-        count, commands = self.run_harness(args)
+        fixture_pass = "\n".join(f"Test Case '-[LuxoClientTests.{name}]' passed" for name in HARNESS.FULL_FIXTURE_TESTS)
+        count, commands = self.run_harness(args, output="Executed 39 tests, with 0 failures\n" + fixture_pass)
         self.assertEqual(count, 39)
         for command, options in commands:
             self.assertIn("--enable-code-coverage", command)
@@ -67,6 +68,12 @@ class HarnessBuildTests(unittest.TestCase):
         for output in ["", "Executed 35 tests, with 0 failures", "Executed 39 tests, with 0 failures; skipped 1"]:
             with self.subTest(output=output), self.assertRaises(RuntimeError):
                 self.run_harness(output=output)
+
+    def test_full_suite_rejects_missing_live_case_even_with_zero_skips(self):
+        named = sorted(HARNESS.FULL_FIXTURE_TESTS)
+        passed = "\n".join(f"Test Case '-[LuxoClientTests.{name}]' passed" for name in named[:-1])
+        with self.assertRaisesRegex(RuntimeError, "Missing live suite results"):
+            HARNESS.test_count("Executed 638 tests, with 0 failures\n" + passed, True)
 
 
 if __name__ == "__main__":

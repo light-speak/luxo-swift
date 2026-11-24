@@ -196,8 +196,8 @@ func benchmarkNewHandwrittenDepthReads() throws {
     }
     let json = String(repeating: "{\"v\":", count: 65) + "7" + String(repeating: "}", count: 65)
     let model = handwrittenReadText(64, lists: false)
-    let input = Data("{\"metadata\":\(json),\"value\":[\(model)],\"value\":[]}".utf8)
-    try measureHandwrittenRead("codableNew/discardedModel65Recovery") {
+    let input = Data("{\"metadata\":\(json),\"value\":[],\"value\":[\(model)]}".utf8)
+    try measureHandwrittenRead("codableNew/retainedModel65Recovery") {
         let failed = try rejectedHandwritten(
             OverwrittenHandwrittenRoot<[HandwrittenDepthNode]>.self,
             input: input, decoder: decoder, name: "DecodingError")
@@ -320,18 +320,18 @@ private func verifyHandwrittenNestedReplayBounds() throws {
     struct Root: Decodable { let metadata: JSONValue; let value: Outer }
     let json = String(repeating: "{\"v\":", count: 65) + "7" + String(repeating: "}", count: 65)
     let decoder = LuxoJSONDecoder()
-    for layers in [61, 62] {
+    for layers in [61, 62, 128, 129] {
         var node = "{}"
         for _ in 1..<layers { node = "{\"child\":\(node)}" }
         for last in ["{}", "{\"node\":null}"] {
             let old = "{\"inner\":{\"node\":\(node)},\"inner\":\(last)}"
             let input = Data("{\"metadata\":\(json),\"value\":\(old),\"value\":{\"inner\":{\"node\":null}}}".utf8)
-            if layers == 61 {
+            if layers <= 128 {
                 guard try decoder.decode(Root.self, from: input).value.inner.node == nil else {
                     throw projectionFailure("nested replay changed last value")
                 }
             } else {
-                _ = try rejectedHandwritten(Root.self, input: input, decoder: decoder, name: "DecodingError")
+                _ = try rejectedHandwritten(Root.self, input: input, decoder: decoder, name: "ParseError")
             }
         }
     }
