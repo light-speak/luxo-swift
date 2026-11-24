@@ -3,6 +3,23 @@ import XCTest
 @testable import LuxoClient
 
 final class JSONNumberTests: XCTestCase {
+    func testRequestSeparatesRoutingAndBusinessFields() throws {
+        let params: [String: LuxoValue] = [
+            "$api": .string("copy"), "$sub": .string("copy"), "$unsub": .int(17), "$id": .int(19),
+            "$select": .string("id"), "value": .int(7),
+        ]
+        for subscription in [false, true] {
+            let data = try LuxoJSONRequest.encode(
+                api: "live", params: params, plan: nil, sequence: 1, subscription: subscription)
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let route = subscription ? "$sub" : "$api"
+            XCTAssertEqual(Set(body.keys), [route, "$id", "$select", "value"])
+            XCTAssertEqual(body[route] as? String, "live")
+            XCTAssertEqual(body["$id"] as? Int, 1)
+            XCTAssertEqual(body["$select"] as? String, "id")
+        }
+    }
+
     func testLuxoJSONWritingKeepsGenericRootInsideModelsAndLists() throws {
         struct Packet: Encodable { let value: JSONValue; let values: [JSONValue] }
         for depth in 127...129 {
