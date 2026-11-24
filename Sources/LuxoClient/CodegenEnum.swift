@@ -208,6 +208,9 @@ enum SwiftEnumCodegen {
     }
 
     static func literal(_ value: String) -> String {
+        if !value.utf8.contains(where: { $0 < 32 || $0 == 127 || $0 == 34 || $0 == 92 }) {
+            return "\"\(value)\""
+        }
         var out = "\""
         for scalar in value.unicodeScalars {
             switch scalar.value {
