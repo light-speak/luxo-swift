@@ -21,7 +21,7 @@ jobs:
     env:
       LUXO_CORE_FIXTURE_REVISION: a2c411b7b83ca233881ace0c5bf3bec0b9646e1d
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 

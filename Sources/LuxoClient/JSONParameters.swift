@@ -192,7 +192,13 @@ enum LuxoJSONRequest {
         var body = Dictionary<String, LuxoValue>(minimumCapacity: (params?.count ?? 0) + 2)
         body[subscription ? "$sub" : "$api"] = .string(api)
         if let sequence { body["$id"] = .jsonNumber(JSONNumber(validated: String(sequence))) }
-        for (name, value) in params ?? [:] where name != "$api" && name != "$id" && name != "$sub" {
+        for (name, value) in params ?? [:] {
+            if name.utf8.first == UInt8(ascii: "$") {
+                switch name {
+                case "$api", "$id", "$sub", "$unsub": continue
+                default: break
+                }
+            }
             body[name] = value
         }
         var writer = JSONWriter()
