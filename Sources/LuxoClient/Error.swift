@@ -158,8 +158,10 @@ private struct BinaryErrorFields {
         case .message: message = decoder.readString()
         case .traceId: traceId = decoder.readString()
         case .data:
+            let bytes = decoder.readBytes()
+            if let error = decoder.error { return error }
             do {
-                data = try LuxoValue.decodeJSONData(decoder.readBytes(), allowDocumentBOM: false).foundationValue()
+                data = try LuxoValue.decodeJSONData(bytes, allowDocumentBOM: false).foundationValue()
             } catch {
                 return "invalid JSON data"
             }

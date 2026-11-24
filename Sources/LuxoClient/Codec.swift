@@ -185,12 +185,14 @@ public struct Decoder {
     public var remaining: Int { data.endIndex - offset }
 
     public mutating func readRemainingData() -> Data {
+        guard error == nil else { return Data() }
         let remaining = Data(data[offset...])
         offset = data.endIndex
         return remaining
     }
 
     public mutating func readVarint() -> UInt64 {
+        guard error == nil else { return 0 }
         let start = offset
         var result: UInt64 = 0
         var shift: UInt64 = 0
@@ -198,14 +200,14 @@ public struct Decoder {
             let byte = data[offset]
             offset += 1
             if shift >= 64 || (shift == 63 && byte & 0x7E != 0) {
-                if error == nil { error = "varint overflow at offset \(start)" }
+                error = "varint overflow at offset \(start)"
                 return 0
             }
             result |= UInt64(byte & 0x7F) << shift
             if byte & 0x80 == 0 { return result }
             shift += 7
         }
-        if error == nil { error = "truncated varint at offset \(start)" }
+        error = "truncated varint at offset \(start)"
         return 0
     }
 
@@ -235,15 +237,9 @@ public struct Decoder {
     }
 
     public mutating func readString() -> String {
-        let rawLength = readVarint()
-        guard error == nil, rawLength <= UInt64(Int.max) else { return "" }
-        let len = Int(rawLength)
-        guard len <= remaining else {
-            if error == nil { error = "truncated string at offset \(offset)" }
-            return ""
-        }
+        guard let len = readLength("string") else { return "" }
         guard let str = strictUTF8String(data[offset..<offset + len]) else {
-            if error == nil { error = "invalid UTF-8 string at offset \(offset)" }
+            error = "invalid UTF-8 string at offset \(offset)"
             return ""
         }
         offset += len
@@ -251,21 +247,25 @@ public struct Decoder {
     }
 
     public mutating func readBytes() -> Data {
-        let rawLength = readVarint()
-        guard error == nil, rawLength <= UInt64(Int.max) else { return Data() }
-        let len = Int(rawLength)
-        guard len <= remaining else {
-            if error == nil { error = "truncated bytes at offset \(offset)" }
-            return Data()
-        }
+        guard let len = readLength("bytes") else { return Data() }
         let bytes = data[offset..<offset + len]
         offset += len
         return Data(bytes)
     }
 
+    private mutating func readLength(_ kind: String) -> Int? {
+        let length = readVarint()
+        guard error == nil else { return nil }
+        guard length <= UInt64(remaining) else {
+            error = "truncated \(kind) at offset \(offset)"
+            return nil
+        }
+        return Int(length)
+    }
+
     /// Read a fixed 16-byte UUID (no length prefix). Returns a zero UUID on truncation.
     public mutating func readUUID() -> UUID {
-        guard remaining >= 16 else {
+        guard error == nil, remaining >= 16 else {
             if error == nil { error = "truncated uuid at offset \(offset)" }
             return UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
         }
@@ -361,8 +361,9 @@ public struct Decoder {
     }
 
     private mutating func readCanonicalMarker(_ kind: String) -> Bool {
+        guard error == nil else { return false }
         guard !isAtEnd else {
-            if error == nil { error = "truncated \(kind) marker at offset \(offset)" }
+            error = "truncated \(kind) marker at offset \(offset)"
             return false
         }
         let markerOffset = offset
@@ -374,7 +375,7 @@ public struct Decoder {
         case 0x01:
             return true
         default:
-            if error == nil { error = "invalid \(kind) marker at offset \(markerOffset)" }
+            error = "invalid \(kind) marker at offset \(markerOffset)"
             return false
         }
     }
@@ -427,7 +428,9 @@ public struct Decoder {
         var items: [T] = []
         items.reserveCapacity(count)
         for _ in 0..<count {
-            items.append(try decode(&self))
+            let item = try decode(&self)
+            guard error == nil else { return [] }
+            items.append(item)
         }
         return items
     }
@@ -699,6 +702,7 @@ public struct ColumnarDecoder {
     }
 
     private mutating func readVarintValue(_ context: @autoclosure () -> String) -> UInt64? {
+        guard error == nil else { return nil }
         let start = off
         var result: UInt64 = 0
         var shift: UInt64 = 0
