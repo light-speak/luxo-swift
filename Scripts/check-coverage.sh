@@ -5,7 +5,15 @@ set -euo pipefail
 minimum="${1:-90.0}"
 output="${2:-coverage.lcov}"
 profile="$(find .build -path '*/debug/codecov/default.profdata' -print -quit)"
-binary="$(find .build -type f -path '*.xctest/Contents/MacOS/*PackageTests' -perm -111 -print -quit)"
+binary=""
+if [[ -n "${profile}" ]]; then
+  for candidate in "${profile%/codecov/*}"/*.xctest/Contents/MacOS/*PackageTests; do
+    if [[ -f "${candidate}" && -x "${candidate}" ]]; then
+      binary="${candidate}"
+      break
+    fi
+  done
+fi
 
 if [[ -z "${profile}" || -z "${binary}" ]]; then
   echo "::error::Swift coverage profile or test binary was not found"
@@ -15,7 +23,7 @@ fi
 report="$(xcrun llvm-cov report "${binary}" \
   -instr-profile="${profile}" \
   -ignore-filename-regex='(.build|Tests)/' \
-  Sources/LuxoClient Sources/LuxoCompiler)"
+  Sources/LuxoClient Sources/LuxoCompiler Sources/LuxoNIO)"
 printf '%s\n' "${report}"
 
 coverage="$(awk '/^TOTAL/ { gsub("%", "", $10); print $10 }' <<<"${report}")"
@@ -34,6 +42,6 @@ xcrun llvm-cov export "${binary}" \
   -instr-profile="${profile}" \
   -format=lcov \
   -ignore-filename-regex='(.build|Tests)/' \
-  Sources/LuxoClient Sources/LuxoCompiler >"${output}"
+  Sources/LuxoClient Sources/LuxoCompiler Sources/LuxoNIO >"${output}"
 
 echo "Source line coverage ${coverage}% meets ${minimum}%"

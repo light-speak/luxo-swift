@@ -9,13 +9,18 @@ on:
 permissions:
   contents: read
 
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   quality:
-    runs-on: macos-15
+    env:
+      LUXO_CORE_FIXTURE_REVISION: a2c411b7b83ca233881ace0c5bf3bec0b9646e1d
+    runs-on: macos-26
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -33,16 +38,43 @@ jobs:
         run: swift package resolve
 
       - name: Check formatting
-        run: swift format lint --recursive --strict Sources Tests Package.swift
+        run: swift format lint --recursive --strict Sources Tests Benchmarks Package.swift
 
       - name: Build release with strict concurrency
         run: swift build -c release -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete
 
-      - name: Test with coverage
-        run: swift test --parallel --enable-code-coverage -Xswiftc -warnings-as-errors
+      - name: Check minimum deployment targets
+        run: |
+          ios_sdk_path="$(xcrun --sdk iphoneos --show-sdk-path)"
+          macos_sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
+          swiftc -typecheck -module-name LuxoClient -swift-version 6 -warnings-as-errors -strict-concurrency=complete \
+            -target arm64-apple-ios15.0 -sdk "$ios_sdk_path" Sources/LuxoClient/*.swift
+          swiftc -typecheck -module-name LuxoClient -swift-version 6 -warnings-as-errors -strict-concurrency=complete \
+            -target x86_64-apple-macos13.0 -sdk "$macos_sdk_path" Sources/LuxoClient/*.swift
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Check out pinned Core test fixtures
+        uses: actions/checkout@v7
+        with:
+          repository: light-speak/luxo
+          ref: ${{ env.LUXO_CORE_FIXTURE_REVISION }}
+          path: .tmp/luxo-core
+          persist-credentials: false
+
+      - name: Test with coverage and real loopback fixtures
+        run: |
+          python3 -m unittest discover -s Scripts -p 'test_*_test.py'
+          python3 Scripts/test-nio.py --all --coverage \
+            --core .tmp/luxo-core --core-revision "$LUXO_CORE_FIXTURE_REVISION"
 
       - name: Enforce source coverage
-        run: bash Scripts/check-coverage.sh 90.0 coverage.lcov
+        run: |
+          bash Scripts/check-coverage-test.sh
+          bash Scripts/check-coverage.sh 90.0 coverage.lcov
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
@@ -52,16 +84,24 @@ jobs:
           fail_ci_if_error: false
 
   thread-sanitizer:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
       - name: Test transport concurrency
-        run: swift test --sanitize=thread --filter TransportTests
+        run: swift test --sanitize=thread --filter 'TransportTests|WebSocketSubscriptionTests|WebSocketTerminalTests'
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Test NIO lifecycle with Thread Sanitizer
+        run: python3 Scripts/test-nio.py --sanitize-thread
 
   external-consumer:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -70,6 +110,11 @@ jobs:
         run: |
           mkdir -p Tests/Consumer/.tmp/generated-consumer
           cp Tests/Consumer/Fixtures/GeneratedMain.swift Tests/Consumer/.tmp/generated-consumer/main.swift
+          cp Tests/Consumer/Fixtures/ScalarResponses.swift Tests/Consumer/.tmp/generated-consumer/ScalarResponses.swift
+          cp Tests/Consumer/Fixtures/ScalarResponseBenchmark.swift Tests/Consumer/.tmp/generated-consumer/ScalarResponseBenchmark.swift
+          cp Tests/Consumer/Fixtures/StructuredResponses.swift Tests/Consumer/.tmp/generated-consumer/StructuredResponses.swift
+          cp Tests/Consumer/Fixtures/JSONProjection.swift Tests/Consumer/.tmp/generated-consumer/JSONProjection.swift
+          cp Tests/Consumer/Fixtures/EnumResponses.swift Tests/Consumer/.tmp/generated-consumer/EnumResponses.swift
           swift build \
             --package-path Tests/Consumer \
             --product LuxoConsumer \
@@ -85,13 +130,26 @@ jobs:
           curl --retry 20 --retry-connrefused --retry-delay 1 -fsS -o /dev/null http://127.0.0.1:18080/luxo.schema.json
           .tmp/consumer-build/debug/LuxoConsumer --generate http://127.0.0.1:18080/luxo.schema.json Tests/Consumer/.tmp/generated-consumer
           cp Tests/Consumer/Fixtures/GeneratedMain.swift Tests/Consumer/.tmp/generated-consumer/main.swift
+          cp Tests/Consumer/Fixtures/ScalarResponses.swift Tests/Consumer/.tmp/generated-consumer/ScalarResponses.swift
+          cp Tests/Consumer/Fixtures/ScalarResponseBenchmark.swift Tests/Consumer/.tmp/generated-consumer/ScalarResponseBenchmark.swift
+          cp Tests/Consumer/Fixtures/StructuredResponses.swift Tests/Consumer/.tmp/generated-consumer/StructuredResponses.swift
+          cp Tests/Consumer/Fixtures/JSONProjection.swift Tests/Consumer/.tmp/generated-consumer/JSONProjection.swift
+          cp Tests/Consumer/Fixtures/EnumResponses.swift Tests/Consumer/.tmp/generated-consumer/EnumResponses.swift
           swift build \
             --package-path Tests/Consumer \
             --product LuxoGeneratedConsumer \
             --scratch-path .tmp/generated-consumer-build \
             -Xswiftc -warnings-as-errors \
             -Xswiftc -strict-concurrency=complete
-          swift run LuxoAnalyze \
-            --source-dir Tests/Consumer/.tmp/generated-consumer \
-            --output Tests/Consumer/.tmp/SelectHints.swift
-          grep -F '"getRecord": "profile{name}"' Tests/Consumer/.tmp/SelectHints.swift
+          .tmp/generated-consumer-build/debug/LuxoGeneratedConsumer
+          # GeneratedSelectionBuildTests in the quality job verifies per-call selections.
+
+      - name: Run optimized generated consumer
+        run: |
+          swift run \
+            --package-path Tests/Consumer \
+            --scratch-path .tmp/generated-consumer-build \
+            -c release \
+            -Xswiftc -warnings-as-errors \
+            -Xswiftc -strict-concurrency=complete \
+            LuxoGeneratedConsumer

@@ -2,11 +2,201 @@ import XCTest
 @testable import LuxoClient
 
 final class TypesTests: XCTestCase {
+    func testSchemaEnumValuesRejectNonStringMembers() throws {
+        for value in ["null", "false", "true", "0", "7", "[]", "{}"] {
+            XCTAssertThrowsError(
+                try JSONDecoder().decode(LuxoEnum.self, from: Data(#"{"name":"State","values":[\#(value)]}"#.utf8)))
+        }
+        let valid = try JSONDecoder().decode(
+            LuxoEnum.self, from: Data(#"{"name":"State","values":["READY","0"]}"#.utf8))
+        XCTAssertEqual(valid.values, ["READY", "0"])
+    }
+
+    func testSchemaMemberStringsRejectMalformedValues() {
+        for target in ["model", "type", "param"] {
+            func document(_ field: String) -> Data {
+                let body: String
+                switch target {
+                case "model":
+                    body = #"{"models":{"Payload":{"name":"Payload","fields":[\#(field)]}},"apis":{}}"#
+                case "type":
+                    body = #"{"models":{},"types":{"Input":{"name":"Input","fields":[\#(field)]}},"apis":{}}"#
+                default:
+                    body = #"{"models":{},"apis":{"read":{"id":1,"name":"read","module":"test","params":[\#(field)]}}}"#
+                }
+                return Data(body.utf8)
+            }
+            XCTAssertNoThrow(
+                try JSONDecoder().decode(LuxoSchema.self, from: document(#"{"id":1,"name":"value","type":"String"}"#)))
+            for member in ["name", "type", "typeName"] {
+                let values =
+                    member == "typeName"
+                    ? ["false", "true", "0", "7", "[]", "{}"]
+                    : ["missing", "null", "false", "true", "0", "7", "[]", "{}"]
+                for value in values {
+                    var properties = [#""id":1"#]
+                    if member != "name" { properties.append(#""name":"value""#) }
+                    if member != "type" { properties.append(#""type":"String""#) }
+                    if value != "missing" { properties.append(#""\#(member)":\#(value)"#) }
+                    let field = "{\(properties.joined(separator: ","))}"
+                    XCTAssertThrowsError(
+                        try JSONDecoder().decode(LuxoSchema.self, from: document(field)), "\(target).\(member)=\(value)"
+                    )
+                }
+            }
+            XCTAssertNoThrow(
+                try JSONDecoder().decode(
+                    LuxoSchema.self, from: document(#"{"id":1,"name":"value","type":"String","typeName":null}"#)))
+        }
+    }
+
+    func testSchemaFlagsRejectNonBooleanMetadata() {
+        let groups: [(flags: [String], decode: (Data) throws -> Void)] = [
+            (
+                ["internal", "returnList", "returnNullable", "paginated", "stream"],
+                {
+                    _ = try JSONDecoder().decode(LuxoAPI.self, from: $0)
+                }
+            ),
+            (
+                ["nullable", "isList", "relation"],
+                {
+                    _ = try JSONDecoder().decode(LuxoField.self, from: $0)
+                }
+            ),
+            (
+                ["nullable", "isList", "hasDefault"],
+                {
+                    _ = try JSONDecoder().decode(LuxoParam.self, from: $0)
+                }
+            ),
+        ]
+        for group in groups {
+            for flag in group.flags {
+                for value in ["true", "false", #""true""#, #""false""#, "0", "1", "[]", "{}"] {
+                    let json =
+                        "{\"id\":1,\"name\":\"value\",\"type\":\"String\",\"module\":\"test\",\"\(flag)\":\(value)}"
+                    if value == "true" || value == "false" {
+                        XCTAssertNoThrow(try group.decode(Data(json.utf8)), "\(flag)=\(value)")
+                    } else {
+                        XCTAssertThrowsError(try group.decode(Data(json.utf8)), "\(flag)=\(value)")
+                    }
+                }
+            }
+        }
+    }
+
+    func testComputedSourceMetadataRoundTrips() throws {
+        let input = #"""
+            {"name":"User","fields":[{"id":1,"name":"postCount","type":"Int"}],
+            "computedSources":{"postCount":{"model":"Post","module":"blog"},"localCount":{"model":"Local"}}}
+            """#
+        let model = try JSONDecoder().decode(LuxoModel.self, from: Data(input.utf8))
+        XCTAssertEqual(model.computedSources?["postCount"]?.model, "Post")
+        XCTAssertEqual(model.computedSources?["postCount"]?.module, "blog")
+        XCTAssertNil(model.computedSources?["localCount"]?.module)
+        XCTAssertEqual(model.fields.first?.type, "Int")
+        let roundTrip = try JSONDecoder().decode(LuxoModel.self, from: JSONEncoder().encode(model))
+        XCTAssertEqual(roundTrip.computedSources?["postCount"]?.model, "Post")
+        let plain = try JSONDecoder().decode(LuxoModel.self, from: Data(#"{"name":"Plain","fields":[]}"#.utf8))
+        XCTAssertNil(plain.computedSources)
+    }
+
+    func testJSONValueKeepsIntegersOnTheExactIntegerPath() throws {
+        for source in ["0", "1", "42", "9007199254740991"] {
+            let value = try JSONValue.parse(Data(source.utf8))
+            guard case .integer(let number) = value else { return XCTFail("expected exact integer") }
+            XCTAssertEqual(number, Int64(source))
+        }
+    }
+
+    func testJSONValueNumericEqualityNeverRoundsAnInteger() throws {
+        XCTAssertEqual(JSONValue.integer(42), .number(42))
+        XCTAssertEqual(JSONValue.number(42), .integer(42))
+        XCTAssertEqual(JSONValue.integer(0), .number(-0.0))
+        XCTAssertNotEqual(JSONValue.integer(1), .number(1.5))
+        XCTAssertNotEqual(JSONValue.integer(Int64.max), .number(Double(Int64.max)))
+        XCTAssertNotEqual(JSONValue.integer(9_007_199_254_740_993), .number(9_007_199_254_740_992))
+        XCTAssertNotEqual(JSONValue.integer(0), .bool(false))
+        XCTAssertEqual(JSONValue.array([.integer(42)]), .array([.number(42)]))
+        XCTAssertEqual(JSONValue.object(["n": .number(42)]), .object(["n": .integer(42)]))
+    }
+
+    func testJSONValuePreservesNegativeZero() throws {
+        for literal in ["-0", "-0.0", "-0e0"] {
+            let value = try JSONValue.parse(Data(literal.utf8))
+            guard case .rawNumber(let number) = value else { return XCTFail("negative zero must retain its token") }
+            XCTAssertEqual(number.literal, literal)
+            XCTAssertEqual(try number.toDouble().bitPattern, (-0.0).bitPattern)
+        }
+    }
+
+    func testJSONValuePreservesFullWidthIntegers() throws {
+        for value in [Int64.min, -9_007_199_254_740_993, -1, 0, 1, 9_007_199_254_740_993, Int64.max] {
+            let source = Data("{\"value\":\(value)}".utf8)
+            let parsed = try LuxoJSONDecoder().decode(JSONValue.self, from: source)
+            let result = try JSONEncoder().encode(parsed)
+            XCTAssertEqual(try JSONDecoder().decode([String: Int64].self, from: result)["value"], value)
+            XCTAssertEqual(try LuxoValue(parsed).jsonData(), source)
+        }
+    }
+
+    private struct ProjectedInput: LuxoBinaryEncodable {
+        let count: Int64
+
+        func writeLuxo(to encoder: inout Encoder) throws {
+            encoder.writeSvarint(count)
+        }
+
+        func luxoJSONValue() throws -> LuxoValue {
+            .object(["count": .int(count)])
+        }
+
+        func encode(to encoder: Swift.Encoder) throws {
+            throw LuxoError(code: 0, message: "intermediate serialization must not run", name: "TestError")
+        }
+    }
+
+    func testStructuredInputUsesTypedProjectionWithoutIntermediateSerialization() throws {
+        for count in [Int64.min, 9_007_199_254_740_993, Int64.max] {
+            let value = LuxoValue.structured(ProjectedInput(count: count))
+            XCTAssertEqual(try value.jsonData(), Data("{\"count\":\(count)}".utf8))
+            XCTAssertEqual(value, .structured(ProjectedInput(count: count)))
+        }
+    }
+
+    func testFiniteFloatConversionPreservesValuesAndRejectsNonFiniteInputs() throws {
+        for value in [-Double.greatestFiniteMagnitude, -0.0, 0.0, 1.0, 1.5, Double.leastNonzeroMagnitude] {
+            let converted = try LuxoValue(finiteFloat: value)
+            guard case .float(let number) = converted else { return XCTFail("expected Float") }
+            XCTAssertEqual(number.bitPattern, value.bitPattern)
+            let encoded = try converted.jsonData()
+            let decoded = try LuxoJSONDecoder().decode(Double.self, from: encoded)
+            XCTAssertEqual(decoded.bitPattern, value.bitPattern)
+        }
+        for value in [Double.nan, .infinity, -.infinity] {
+            XCTAssertThrowsError(try LuxoValue(finiteFloat: value)) { error in
+                XCTAssertEqual((error as? LuxoError)?.name, "EncodingError")
+            }
+        }
+    }
+
     private struct EncodedInput: Codable, Sendable {
         let count: Int64
         let ratio: Double
         let enabled: Bool
         let names: [String]
+    }
+
+    private struct BinaryInput: Codable, Sendable, LuxoBinaryEncodable {
+        let name: String
+
+        func writeLuxo(to encoder: inout Encoder) throws {
+            encoder.writeVarint(UInt64(name.utf8.count))
+            encoder.writeVarint(1)
+            encoder.writeString(name)
+            encoder.writeEnd()
+        }
     }
 
     private struct SelectedRecord: Codable {
@@ -37,13 +227,13 @@ final class TypesTests: XCTestCase {
 
     func testJSONValueRoundTripsEveryCase() throws {
         let value = JSONValue.object([
-            "array": .array([.null, .bool(true), .number(1.5), .string("luxo")]),
+            "array": .array([.null, .bool(true), .integer(42), .rawNumber(try JSONNumber("1.5")), .string("luxo")]),
             "object": .object(["enabled": .bool(false)]),
         ])
 
-        let data = try JSONEncoder().encode(value)
+        let data = try LuxoJSONEncoder().encode(value)
 
-        XCTAssertEqual(try JSONDecoder().decode(JSONValue.self, from: data), value)
+        XCTAssertEqual(try LuxoJSONDecoder().decode(JSONValue.self, from: data), value)
     }
 
     func testLuxoValueIsSendableAndPreservesWireTypes() throws {
@@ -66,7 +256,7 @@ final class TypesTests: XCTestCase {
                 "null": .null,
                 "bool": .bool(true),
                 "int": .int(9_007_199_254_740_993),
-                "float": .float(1.5),
+                "float": .jsonNumber(try JSONNumber("1.5")),
                 "string": .string("luxo"),
                 "bytes": .string("AAEC"),
                 "array": .array([.int(1), .string("two")]),
@@ -88,6 +278,42 @@ final class TypesTests: XCTestCase {
                 "names": .array([.string("a"), .string("b")]),
             ])
         )
+    }
+
+    func testLuxoValuePreservesUnsignedJSONWithoutExpandingSchemaInt() throws {
+        let schema = APISchema(id: 1, params: [.init(fieldID: 1, name: "value", type: "Int")])
+        for value in [UInt64(Int64.max) + 1, UInt64.max] {
+            let encoded = try LuxoValue.encode(value)
+            XCTAssertEqual(try encoded.jsonData(), Data(String(value).utf8))
+            XCTAssertEqual(try LuxoValue.encode(["values": [value]]).jsonData(), Data("{\"values\":[\(value)]}".utf8))
+            XCTAssertThrowsError(
+                try LuxoJSONRequest.encode(api: "echo", params: ["value": encoded], plan: schema.jsonParameters))
+            XCTAssertThrowsError(try LuxoBinaryProtocol.encodeRequest(schema: schema, params: ["value": encoded]))
+        }
+    }
+
+    func testLuxoValuePreservesSignedBoundariesAndValidUnsignedInputs() throws {
+        for value in [Int64.min, -1, 0, 1, 9_007_199_254_740_993, Int64.max] {
+            XCTAssertEqual(try LuxoValue.encode(value), .int(value))
+            XCTAssertEqual(try LuxoValue.decodeJSONData(LuxoValue.int(value).jsonData()), .int(value))
+        }
+        for value in [UInt64(0), 1, UInt64(Int64.max)] {
+            XCTAssertEqual(try LuxoValue.encode(value), .int(Int64(value)))
+        }
+        XCTAssertEqual(try LuxoValue.encode(true), .bool(true))
+        XCTAssertEqual(try LuxoValue.encode(false), .bool(false))
+        XCTAssertEqual(try LuxoValue.encode(1.5), .float(1.5))
+    }
+
+    func testStructuredLuxoValueDefersToJSONUntilJSONTransportNeedsIt() throws {
+        let value = LuxoValue.structured(BinaryInput(name: "Luxo"))
+        XCTAssertEqual(
+            try LuxoValue.decodeJSONData(value.jsonData()),
+            .object(["name": .string("Luxo")])
+        )
+        XCTAssertEqual(value, .structured(BinaryInput(name: "Luxo")))
+        XCTAssertNotEqual(value, .structured(BinaryInput(name: "Other")))
+        XCTAssertNotEqual(value, .string("Luxo"))
     }
 
     func testPageCanBeConstructedAndDecoded() throws {
