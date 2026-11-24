@@ -6,7 +6,38 @@ import XCTest
 #endif
 
 final class CodegenTests: XCTestCase {
+    func testSwiftStringLiteralPreservesUnicodeAndEscapesSwiftSyntax() {
+        XCTAssertEqual(SwiftEnumCodegen.literal(""), #""""#)
+        XCTAssertEqual(SwiftEnumCodegen.literal("目录.📚"), #""目录.📚""#)
+        XCTAssertEqual(SwiftEnumCodegen.literal("a\"\\b\n\u{0}\u{7f}"), #""a\"\\b\u{a}\u{0}\u{7f}""#)
+    }
+
     #if os(macOS) || os(Linux)
+        func testGeneratedTypeMetadataIsValidSwiftSource() throws {
+            let document = #"""
+                {"models":{"Item":{"name":"Item","fields":[{"id":1,"name":"label","type":"String","typeName":"writer's \"edition\".txt"}]}},
+                 "apis":{"read":{"id":1,"name":"read","module":"catalogue","returnType":"Item","params":[{"id":1,"name":"label","type":"String","typeName":"writer's \"edition\".txt"}]}}}
+                """#
+            let schema = try JSONDecoder().decode(LuxoSchema.self, from: Data(document.utf8))
+            try schema.validateIDs()
+            try SwiftEnumCodegen.validate(schema)
+            let generator = try makeCodegen()
+            try runNullableJSONConsumer([
+                "Schema.swift": generator.generateSchema(schema),
+                "Main.swift": """
+                import LuxoClient
+                @main struct Main {
+                    static func main() {
+                        let expected = #"writer's "edition".txt"#
+                        let api = LUXO_SCHEMA["read"]!
+                        precondition(api.fields["label"]?.typeName == expected)
+                        precondition(api.params?.first?.typeName == expected)
+                    }
+                }
+                """,
+            ])
+        }
+
         func testNullableJSONGeneratedWireNormalizesLegacyNull() throws {
             let raw = #"""
                 {"models":{},"types":{"Packet":{"name":"Packet","usage":"inputOutput","fields":[

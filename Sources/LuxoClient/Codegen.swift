@@ -1284,7 +1284,7 @@ public final class LuxoCodegen {
                 let typeName = field.typeName ?? field.type
                 let nested =
                     isNested(field, schema: schema) || field.type == "Sealed" || field.typeName?.contains(".") == true
-                    ? ", typeName: \"\(typeName)\"" : ""
+                    ? ", typeName: \(SwiftEnumCodegen.literal(typeName))" : ""
                 return
                     "\"\(field.name)\": .init(fieldID: \(field.id)\(nested), type: \"\(field.type)\", isList: \(field.isList ?? false), nullable: \(field.nullable ?? false))"
             }.joined(separator: ", ")
@@ -1307,7 +1307,7 @@ public final class LuxoCodegen {
             if let params = api.params, !params.isEmpty {
                 let paramItems = params.map { p in
                     let isList = p.isList ?? false
-                    let typeName = p.typeName.map { ", typeName: \"\($0)\"" } ?? ""
+                    let typeName = p.typeName.map { ", typeName: \(SwiftEnumCodegen.literal($0))" } ?? ""
                     return
                         "APISchema.ParamSchema(fieldID: \(p.id), name: \"\(p.name)\", type: \"\(p.type)\"\(typeName), isList: \(isList), nullable: \(p.nullable ?? false))"
                 }
