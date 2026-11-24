@@ -2,6 +2,73 @@ import XCTest
 @testable import LuxoClient
 
 final class CodecTests: XCTestCase {
+    func testFirstRowErrorKeepsLaterValuesUnread() {
+        var decoder = Decoder(Data([2, 1] + Array(repeating: UInt8(0), count: 17)))
+        XCTAssertFalse(decoder.readBool())
+        let first = decoder.error
+        XCTAssertNotNil(first)
+        let remaining = decoder.remaining
+
+        XCTAssertEqual(decoder.readVarint(), 0)
+        XCTAssertFalse(decoder.readBool())
+        XCTAssertEqual(decoder.readBytes(), Data())
+        XCTAssertEqual(decoder.readUUID().uuidString, "00000000-0000-0000-0000-000000000000")
+        XCTAssertEqual(decoder.readRemainingData(), Data())
+        var nestedCalled = false
+        XCTAssertNil(
+            decoder.readNullable { _ in
+                nestedCalled = true
+                return true
+            })
+        XCTAssertFalse(nestedCalled)
+        XCTAssertEqual(decoder.error, first)
+        XCTAssertEqual(decoder.remaining, remaining)
+    }
+
+    func testRowArrayStopsAtFirstError() {
+        var decoder = Decoder(Data([2, 2, 1, 0]))
+        var reads = 0
+        XCTAssertTrue(
+            decoder.readArray { cell in
+                reads += 1
+                return cell.readBool()
+            }.isEmpty)
+        XCTAssertEqual(reads, 1)
+        XCTAssertNotNil(decoder.error)
+        XCTAssertEqual(decoder.remaining, 2)
+    }
+
+    func testFirstColumnErrorKeepsFollowingCursor() {
+        var decoder = ColumnarDecoder(data: Data([1, 0, 1, 2, 42, 0]))
+        XCTAssertTrue(decoder.nextColumn())
+        XCTAssertTrue(decoder.readColumnBool().isEmpty)
+        let first = decoder.error
+        XCTAssertNotNil(first)
+        let offset = decoder.offset
+        XCTAssertEqual(decoder.readSvarint(), 0)
+        XCTAssertFalse(decoder.nextColumn())
+        XCTAssertEqual(decoder.error, first)
+        XCTAssertEqual(decoder.offset, offset)
+    }
+
+    func testRowLengthBeyondIntegerRangeRecordsAnError() {
+        var encoder = Encoder()
+        encoder.writeVarint(.max)
+        encoder.writeBool(true)
+
+        var text = Decoder(encoder.data)
+        XCTAssertEqual(text.readString(), "")
+        XCTAssertEqual(text.error, "truncated string at offset 10")
+        XCTAssertFalse(text.readBool())
+        XCTAssertEqual(text.remaining, 1)
+
+        var bytes = Decoder(encoder.data)
+        XCTAssertEqual(bytes.readBytes(), Data())
+        XCTAssertEqual(bytes.error, "truncated bytes at offset 10")
+        XCTAssertFalse(bytes.readBool())
+        XCTAssertEqual(bytes.remaining, 1)
+    }
+
     func testFieldStringsPreserveLeadingFEFFAndSliceBounds() throws {
         for text in ["\u{feff}", "\u{feff}text", "\u{feff}\u{feff}東京", "\u{feff}\u{fffd}", "plain", "e\u{301}"] {
             var encoder = Encoder()
