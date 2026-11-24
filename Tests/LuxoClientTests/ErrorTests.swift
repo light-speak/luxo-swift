@@ -216,6 +216,23 @@ final class ErrorTests: XCTestCase {
         XCTAssertEqual((error.data as? [String: String])?["detail"], text)
     }
 
+    func testBinaryErrorPreservesTruncatedDataDiagnostic() {
+        var encoder = Encoder()
+        encoder.writeVarint(1)
+        encoder.writeSvarint(409)
+        encoder.writeVarint(2)
+        encoder.writeString("Conflict")
+        encoder.writeVarint(3)
+        encoder.writeString("resource changed")
+        encoder.writeVarint(5)
+        encoder.writeVarint(4)
+
+        let error = LuxoBinaryProtocol.decodeError(encoder.data + Data([123]), statusCode: 502)
+        XCTAssertEqual(error.name, "ParseError")
+        XCTAssertEqual(error.code, 502)
+        XCTAssertTrue(error.message.contains("truncated bytes at offset"), error.message)
+    }
+
     func testBinaryErrorValidatesFieldIDsBeforeBuildingSeenMask() {
         for id in [7, 63, 64, 65, Int.max] {
             var encoder = Encoder()
