@@ -318,12 +318,18 @@ final class WebSocketSubscriptionTests: XCTestCase {
             let socket = MockWebSocketTask()
             let transport = try makeTransport(socket, mode: mode)
             defer { transport.close() }
+            let cancelled = expectation(description: "unsubscribe frame sent")
+            socket.onSend = { message in
+                if (try? Self.subscriptionID(message)) == nil { cancelled.fulfill() }
+            }
             do {
                 _ = try await transport.subscribe("watch", decoder: { $0 }) { _ in }
                 XCTFail("expected timeout")
             } catch let error as LuxoError {
                 XCTAssertEqual(error.name, "TimeoutError")
             }
+            // The timeout resumes the caller before sending the cancellation frame.
+            await fulfillment(of: [cancelled], timeout: 2)
             if mode == .json {
                 guard case .string(let message) = socket.sentMessages.last else { return XCTFail("missing cancel") }
                 XCTAssertEqual(message, #"{"$unsub":1}"#)
