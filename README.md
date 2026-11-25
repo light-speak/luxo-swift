@@ -148,10 +148,20 @@ transport.onTokenExpired = {
     await refreshToken()
 }
 
-// Every API call is one line
-let user = try await transport.call("getUser", params: ["id": 1])
-let posts = try await transport.call("listPosts", params: ["page": 1, "pageSize": 20])
+let user = try await transport.call("getUser", params: ["id": 1, "$select": "id, name"])
+let posts = try await transport.call(
+    "listPosts", params: ["page": 1, "pageSize": 20, "$select": "id, title"]
+)
 ```
+
+These examples assume that `getUser` returns a `User` with `id` and `name`, and
+that `listPosts` returns `Post` records with `id` and `title`. Raw transport calls
+for structured responses require a non-empty `$select`. Generated clients take
+an explicit `select:` argument.
+
+示例假定 `getUser` 返回含 `id` 和 `name` 的 `User`，`listPosts` 返回含 `id` 和
+`title` 的 `Post` 记录。直接通过传输层调用返回结构化数据的接口时，必须提供非空的
+`$select`。使用生成客户端时，可以通过 `select:` 参数显式选择字段。
 
 ## Features
 
