@@ -16,7 +16,59 @@ public struct HTTPBackendResponse: Sendable {
 }
 
 public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Sendable {
-    private final class CredentialRevision: Sendable {}
+    private final class CredentialRevision: @unchecked Sendable {
+        private let original: CredentialRevision?
+        // The transport lock protects the outcome retained by already-sent requests.
+        var refreshSucceeded: Bool?
+
+        init(previous: CredentialRevision? = nil) { original = previous?.identity }
+
+        var identity: CredentialRevision { original ?? self }
+    }
+
+    private typealias RefreshContinuation = CheckedContinuation<Bool, Error>
+
+    private struct RefreshWaiters {
+        private var first: (key: ObjectIdentifier, continuation: RefreshContinuation)?
+        private var remaining: [ObjectIdentifier: RefreshContinuation] = [:]
+
+        var isEmpty: Bool { first == nil && remaining.isEmpty }
+
+        mutating func insert(_ continuation: RefreshContinuation, for key: ObjectIdentifier) {
+            if first == nil {
+                first = (key, continuation)
+            } else {
+                remaining[key] = continuation
+            }
+        }
+
+        mutating func removeValue(forKey key: ObjectIdentifier) -> RefreshContinuation? {
+            if let first, first.key == key {
+                self.first = nil
+                return first.continuation
+            }
+            return remaining.removeValue(forKey: key)
+        }
+
+        func resume(with result: Result<Bool, Error>) {
+            first?.continuation.resume(with: result)
+            for continuation in remaining.values { continuation.resume(with: result) }
+        }
+    }
+
+    private final class Refresh: @unchecked Sendable {
+        let handler: () async -> String?
+        // The transport lock protects registration, retirement and settlement.
+        var waiters = RefreshWaiters()
+        var task: Task<Void, Never>?
+
+        init(handler: @escaping () async -> String?) { self.handler = handler }
+    }
+
+    private final class RefreshWaiter: @unchecked Sendable {
+        // Protected by the transport lock, even before registration.
+        var cancelled = false
+    }
 
     private struct HTTPFailure: Error {
         let statusCode: Int
@@ -27,7 +79,7 @@ public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Se
         let headers: [String: String]
         let mode: TransportMode
         let schema: [String: APISchema]
-        let credentialRevision: CredentialRevision?
+        let credentialRevision: CredentialRevision
     }
 
     /// The concrete backend owns its network lifecycle.
@@ -35,13 +87,15 @@ public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Se
     private let timeout: TimeInterval
     private let lock = NSLock()
     private var headers: [String: String] = [:]
-    private var credentialRevision: CredentialRevision?
+    private var credentialRevision = CredentialRevision()
     private var mode: TransportMode = .json
     private var schema: [String: APISchema] = [:]
     private var tokenExpiredHandler: (() async -> String?)?
+    private var activeRefresh: Refresh?
 
     /// Called only when HTTP status and the validated error code are both 401.
-    /// Return a new token to retry once, or nil to propagate the original error.
+    /// Concurrent calls for the current credential share an active refresh.
+    /// Return a new token to retry once, or nil to propagate each call's error.
     public var onTokenExpired: (() async -> String?)? {
         get { lock.withLock { tokenExpiredHandler } }
         set { lock.withLock { tokenExpiredHandler = newValue } }
@@ -54,9 +108,14 @@ public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Se
     }
 
     public func setToken(_ token: String) {
-        lock.withLock {
+        let obsolete = lock.withLock {
             credentialRevision = CredentialRevision()
             headers["Authorization"] = "Bearer \(token)"
+            return activeRefresh.map(retireRefresh)
+        }
+        if let obsolete {
+            obsolete.waiters.resume(with: .success(false))
+            obsolete.task?.cancel()
         }
     }
 
@@ -102,28 +161,101 @@ public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Se
                 throw error
             }
             try Task.checkCancellation()
-            let refresh = lock.withLock {
-                credentialRevision === state.credentialRevision ? tokenExpiredHandler : nil
+            guard try await waitForRefresh(after: state.credentialRevision) else { throw error }
+            try Task.checkCancellation()
+            let retry = lock.withLock { () -> State? in
+                guard credentialRevision.identity === state.credentialRevision.identity else { return nil }
+                return State(
+                    headers: headers, mode: state.mode, schema: state.schema, credentialRevision: credentialRevision)
             }
-            if let refresh, let newToken = await refresh() {
-                try Task.checkCancellation()
-                let retry = try lock.withLock {
-                    guard credentialRevision === state.credentialRevision else { throw error }
-                    credentialRevision = CredentialRevision()
-                    headers["Authorization"] = "Bearer \(newToken)"
-                    return State(
-                        headers: headers, mode: state.mode, schema: state.schema,
-                        credentialRevision: credentialRevision)
-                }
-                do {
-                    return try await doCall(
-                        operation: operation, state: retry, responseSchema: state.schema[api]?.response)
-                } catch let retryFailure as HTTPFailure {
-                    throw retryFailure.error
-                }
+            guard let retry else { throw error }
+            do {
+                return try await doCall(operation: operation, state: retry, responseSchema: state.schema[api]?.response)
+            } catch let retryFailure as HTTPFailure {
+                throw retryFailure.error
             }
-            throw error
         }
+    }
+
+    private func waitForRefresh(after revision: CredentialRevision) async throws -> Bool {
+        let waiter = RefreshWaiter()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let ready = lock.withLock { registerRefresh(waiter, continuation, after: revision) }
+                if let ready { continuation.resume(with: ready) }
+            }
+        } onCancel: {
+            let pending = self.lock.withLock { () -> (waiter: RefreshContinuation?, task: Task<Void, Never>?) in
+                waiter.cancelled = true
+                guard let refresh = self.activeRefresh,
+                    let continuation = refresh.waiters.removeValue(forKey: ObjectIdentifier(waiter))
+                else { return (nil, nil) }
+                return (continuation, refresh.waiters.isEmpty ? self.retireRefresh(refresh).task : nil)
+            }
+            pending.waiter?.resume(throwing: CancellationError())
+            pending.task?.cancel()
+        }
+    }
+
+    private func registerRefresh(
+        _ waiter: RefreshWaiter, _ continuation: RefreshContinuation, after revision: CredentialRevision
+    ) -> Result<Bool, Error>? {
+        if waiter.cancelled { return .failure(CancellationError()) }
+        guard credentialRevision.identity === revision.identity else { return .success(false) }
+        if let succeeded = revision.refreshSucceeded { return .success(succeeded) }
+        let key = ObjectIdentifier(waiter)
+        if let refresh = activeRefresh {
+            refresh.waiters.insert(continuation, for: key)
+            return nil
+        }
+        guard let handler = tokenExpiredHandler else { return .success(false) }
+        let refresh = Refresh(handler: handler)
+        refresh.waiters.insert(continuation, for: key)
+        activeRefresh = refresh
+        refresh.task = Task { [weak self] in
+            guard self?.mayStartRefresh(refresh) == true else { return }
+            let token = await refresh.handler()
+            self?.finishRefresh(refresh, token: token, cancelled: Task.isCancelled)
+        }
+        return nil
+    }
+
+    private func mayStartRefresh(_ refresh: Refresh) -> Bool {
+        lock.withLock { activeRefresh === refresh }
+    }
+
+    private func finishRefresh(_ refresh: Refresh, token: String?, cancelled: Bool) {
+        let settlement = lock.withLock { () -> (RefreshWaiters, Result<Bool, Error>)? in
+            guard activeRefresh === refresh else { return nil }
+            let pending = retireRefresh(refresh)
+            guard let token, !cancelled else {
+                advanceCredential(refreshSucceeded: false)
+                let result: Result<Bool, Error> =
+                    cancelled && token != nil ? .failure(CancellationError()) : .success(false)
+                return (pending.waiters, result)
+            }
+            advanceCredential(refreshSucceeded: true)
+            headers["Authorization"] = "Bearer \(token)"
+            return (pending.waiters, .success(true))
+        }
+        if let (waiters, outcome) = settlement {
+            waiters.resume(with: outcome)
+        }
+    }
+
+    // Keep the outcome with the requests that shared this refresh.
+    private func advanceCredential(refreshSucceeded: Bool) {
+        credentialRevision.refreshSucceeded = refreshSucceeded
+        credentialRevision = CredentialRevision(previous: credentialRevision)
+    }
+
+    // The caller verifies the current refresh under the transport lock.
+    private func retireRefresh(_ refresh: Refresh) -> (task: Task<Void, Never>?, waiters: RefreshWaiters) {
+        activeRefresh = nil
+        let pending = (refresh.task, refresh.waiters)
+        refresh.task = nil
+        refresh.waiters = RefreshWaiters()
+        return pending
     }
 
     private func doCall(operation: HTTPCallDeadline, state: State, responseSchema: LuxoJSONReadSchema?) async throws

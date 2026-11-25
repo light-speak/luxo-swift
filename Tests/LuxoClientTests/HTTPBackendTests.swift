@@ -731,3 +731,470 @@ final class HTTPBackendTests: XCTestCase {
     }
 
 }
+
+extension HTTPBackendTests {
+    private actor RefreshBatch {
+        private let entered: XCTestExpectation
+        private let token: String?
+        private var pending: [CheckedContinuation<String?, Never>] = []
+        private var released = false
+        private(set) var calls = 0
+
+        init(entered: XCTestExpectation, token: String? = "renewed") {
+            self.entered = entered
+            self.token = token
+        }
+
+        func receive() async -> String? {
+            calls += 1
+            if calls == 1 { entered.fulfill() }
+            if released { return token }
+            return await withCheckedContinuation { pending.append($0) }
+        }
+
+        func release() {
+            released = true
+            let waiting = pending
+            pending.removeAll()
+            for continuation in waiting { continuation.resume(returning: token) }
+        }
+    }
+
+    private actor ConcurrentUnauthorizedBackend: HTTPBackend {
+        static let names = ["first", "second", "late", "fresh"]
+
+        struct Attempt: Equatable {
+            let body: Data
+            let token: String
+        }
+
+        let arrived: XCTestExpectation
+        let freshArrived: XCTestExpectation?
+        private var pending: [String: CheckedContinuation<Void, Never>] = [:]
+        private var released: Set<String> = []
+        private(set) var attempts: [String: [Attempt]] = [:]
+
+        init(arrived: XCTestExpectation, freshArrived: XCTestExpectation? = nil) {
+            self.arrived = arrived
+            self.freshArrived = freshArrived
+        }
+
+        func release(_ name: String) {
+            released.insert(name)
+            pending.removeValue(forKey: name)?.resume()
+        }
+
+        func send(body: Data, mode: TransportMode, headers: [String: String]) async throws -> HTTPBackendResponse {
+            let name: String
+            if mode == .binary {
+                var decoder = Decoder(body)
+                let id = decoder.readVarint()
+                guard (1...UInt64(Self.names.count)).contains(id) else { throw URLError(.badServerResponse) }
+                name = Self.names[Int(id) - 1]
+            } else {
+                let decoded = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+                name = try XCTUnwrap(decoded?["$api"] as? String)
+            }
+            let token = headers["Authorization", default: ""]
+            attempts[name, default: []].append(Attempt(body: body, token: token))
+            if token == "Bearer old" {
+                if name == "fresh" { freshArrived?.fulfill() } else { arrived.fulfill() }
+                if !released.contains(name) {
+                    await withCheckedContinuation { pending[name] = $0 }
+                }
+                return unauthorized(mode, message: "expired")
+            }
+            if name == "late" {
+                return unauthorized(mode, message: "retry denied")
+            }
+            let body = mode == .binary ? Data([84]) : Data(#"{"data":42}"#.utf8)
+            return HTTPBackendResponse(status: 200, body: body)
+        }
+
+        private func unauthorized(_ mode: TransportMode, message: String) -> HTTPBackendResponse {
+            if mode == .binary {
+                var encoder = Encoder()
+                encoder.writeVarint(1)
+                encoder.writeSvarint(401)
+                encoder.writeVarint(2)
+                encoder.writeString("Unauthorized")
+                encoder.writeVarint(3)
+                encoder.writeString(message)
+                encoder.writeEnd()
+                return HTTPBackendResponse(status: 401, body: encoder.data)
+            }
+            let json = #"{"error":"Unauthorized","code":401,"message":"\#(message)"}"#
+            return HTTPBackendResponse(status: 401, body: Data(json.utf8))
+        }
+    }
+
+    func testThreeRequestsShareRefreshAndLate401RetriesOnlyOnce() async throws {
+        for mode in [TransportMode.json, .binary] {
+            try await verifyConcurrentRefresh(mode)
+        }
+    }
+
+    private func makeRefreshTransport(_ backend: ConcurrentUnauthorizedBackend, mode: TransportMode) throws
+        -> HTTPTransport<ConcurrentUnauthorizedBackend>
+    {
+        let transport = HTTPTransport(backend: backend, token: "old", timeout: 5)
+        transport.setMode(mode)
+        let schemas = ConcurrentUnauthorizedBackend.names.enumerated().map {
+            ($0.element, APISchema(id: $0.offset + 1, params: [.init(fieldID: 1, name: "value", type: "Int")]))
+        }
+        try transport.setSchema(Dictionary(uniqueKeysWithValues: schemas))
+        return transport
+    }
+
+    private func verifyConcurrentRefresh(_ mode: TransportMode) async throws {
+        let arrived = expectation(description: "three requests sent with the original credential")
+        arrived.expectedFulfillmentCount = 3
+        let refreshing = expectation(description: "refresh callback entered")
+        let backend = ConcurrentUnauthorizedBackend(arrived: arrived)
+        let refresh = RefreshBatch(entered: refreshing)
+        let transport = try makeRefreshTransport(backend, mode: mode)
+        transport.onTokenExpired = { await refresh.receive() }
+
+        let first = Task { try await transport.call("first", params: ["value": .int(1)]) }
+        let second = Task { try await transport.call("second", params: ["value": .int(2)]) }
+        let late = Task { try await transport.call("late", params: ["value": .int(3)]) }
+
+        await fulfillment(of: [arrived], timeout: 2)
+        await backend.release("first")
+        await fulfillment(of: [refreshing], timeout: 2)
+        await backend.release("second")
+        await refresh.release()
+        let early = [await first.result, await second.result]
+        await backend.release("late")
+        let lateResult = await late.result
+
+        for outcome in early {
+            switch outcome {
+            case .success(let payload):
+                XCTAssertEqual(payload.mode, mode)
+                XCTAssertEqual(payload.data, mode == .binary ? Data([84]) : Data("42".utf8))
+            case .failure(let error): XCTFail("expected a retried success, got \(error)")
+            }
+        }
+        switch lateResult {
+        case .success: XCTFail("401 from the retry must be returned")
+        case .failure(let error):
+            XCTAssertEqual((error as? LuxoError)?.message, "retry denied")
+        }
+
+        let calls = await refresh.calls
+        let attempts = await backend.attempts
+        XCTAssertEqual(calls, 1)
+        for name in ["first", "second", "late"] {
+            let requests = try XCTUnwrap(attempts[name])
+            XCTAssertEqual(requests.map(\.token), ["Bearer old", "Bearer renewed"])
+            XCTAssertEqual(requests.first?.body, requests.last?.body)
+        }
+    }
+
+    func testPendingRefreshAndLate401CannotReplayAcrossIdentityReplacement() async throws {
+        for mode in [TransportMode.json, .binary] {
+            for replacement in ["different-user", "old", ""] {
+                try await verifyRefreshInvalidation(mode: mode, replacement: replacement)
+            }
+        }
+    }
+
+    private func verifyRefreshInvalidation(mode: TransportMode, replacement: String) async throws {
+        let arrived = expectation(description: "two requests sent with the old credential")
+        arrived.expectedFulfillmentCount = 2
+        let refreshing = expectation(description: "refresh callback is waiting")
+        let backend = ConcurrentUnauthorizedBackend(arrived: arrived)
+        let refresh = RefreshBatch(entered: refreshing)
+        let transport = try makeRefreshTransport(backend, mode: mode)
+        transport.onTokenExpired = { await refresh.receive() }
+
+        let first = Task { try await transport.call("first") }
+        let late = Task { try await transport.call("late") }
+        await fulfillment(of: [arrived], timeout: 2)
+        await backend.release("first")
+        await fulfillment(of: [refreshing], timeout: 2)
+        transport.setToken(replacement)
+        await backend.release("late")
+        assertUnauthorized(await late.result)
+        await refresh.release()
+        assertUnauthorized(await first.result)
+        let attempts = await backend.attempts
+        let calls = await refresh.calls
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(attempts["first"]?.map(\.token), ["Bearer old"])
+        XCTAssertEqual(attempts["late"]?.map(\.token), ["Bearer old"])
+    }
+
+    func testLateUnauthorizedAfterMissingRefreshDoesNotStartAnotherAttempt() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let arrived = expectation(description: "three requests sent with the original credential")
+            arrived.expectedFulfillmentCount = 3
+            let refreshing = expectation(description: "refresh callback entered")
+            let backend = ConcurrentUnauthorizedBackend(arrived: arrived)
+            let refresh = RefreshBatch(entered: refreshing, token: nil)
+            let transport = try makeRefreshTransport(backend, mode: mode)
+            transport.onTokenExpired = { await refresh.receive() }
+
+            let first = Task { try await transport.call("first") }
+            let second = Task { try await transport.call("second") }
+            let late = Task { try await transport.call("late") }
+            await fulfillment(of: [arrived], timeout: 2)
+            await backend.release("first")
+            await fulfillment(of: [refreshing], timeout: 2)
+            await backend.release("second")
+            await refresh.release()
+            assertUnauthorized(await first.result)
+            assertUnauthorized(await second.result)
+            await backend.release("late")
+            assertUnauthorized(await late.result)
+
+            let initialCalls = await refresh.calls
+            XCTAssertEqual(initialCalls, 1)
+            await backend.release("fresh")
+            let fresh = Task { try await transport.call("fresh") }
+            assertUnauthorized(await fresh.result)
+            let totalCalls = await refresh.calls
+            XCTAssertEqual(totalCalls, 2)
+            let attempts = await backend.attempts
+            for name in ConcurrentUnauthorizedBackend.names {
+                XCTAssertEqual(attempts[name]?.map(\.token), ["Bearer old"])
+            }
+        }
+    }
+
+    func testLateUnauthorizedKeepsDeclinedRefreshAfterAnotherGenerationSucceeds() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let arrived = expectation(description: "two requests sent with the original credential")
+            arrived.expectedFulfillmentCount = 2
+            let backend = ConcurrentUnauthorizedBackend(arrived: arrived)
+            let transport = try makeRefreshTransport(backend, mode: mode)
+            transport.onTokenExpired = { nil }
+
+            let first = Task { try await transport.call("first") }
+            let late = Task { try await transport.call("late") }
+            await fulfillment(of: [arrived], timeout: 2)
+            await backend.release("first")
+            assertUnauthorized(await first.result)
+
+            transport.onTokenExpired = { "renewed" }
+            await backend.release("fresh")
+            let payload = try await transport.call("fresh")
+            XCTAssertEqual(payload.data, mode == .binary ? Data([84]) : Data("42".utf8))
+
+            await backend.release("late")
+            switch await late.result {
+            case .success: XCTFail("the declined refresh must preserve the initial 401")
+            case .failure(let error): XCTAssertEqual((error as? LuxoError)?.message, "expired")
+            }
+            let attempts = await backend.attempts
+            XCTAssertEqual(attempts["fresh"]?.map(\.token), ["Bearer old", "Bearer renewed"])
+            XCTAssertEqual(attempts["late"]?.map(\.token), ["Bearer old"])
+        }
+    }
+
+    private func assertUnauthorized(
+        _ result: Result<TransportPayload, Error>, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        switch result {
+        case .success: XCTFail("expected the original 401", file: file, line: line)
+        case .failure(let error):
+            XCTAssertEqual((error as? LuxoError)?.code, 401, file: file, line: line)
+            XCTAssertEqual((error as? LuxoError)?.message, "expired", file: file, line: line)
+        }
+    }
+}
+
+extension HTTPBackendTests {
+    func testCancellingOneUnauthorizedCallPreservesTheOther() async throws {
+        for index in 0..<48 {
+            let arrived = expectation(description: "both original requests sent")
+            arrived.expectedFulfillmentCount = 2
+            let refreshing = expectation(description: "first refresh started")
+            let backend = ConcurrentUnauthorizedBackend(arrived: arrived)
+            let refresh = RefreshBatch(entered: refreshing)
+            let transport = try makeRefreshTransport(backend, mode: .json)
+            transport.onTokenExpired = { await refresh.receive() }
+
+            let first = Task { try await transport.call("first") }
+            let second = Task { try await transport.call("second") }
+            await fulfillment(of: [arrived], timeout: 2)
+            await backend.release("first")
+            await fulfillment(of: [refreshing], timeout: 2)
+            await backend.release("second")
+            for _ in 0..<(index % 8) { await Task.yield() }
+            first.cancel()
+            await refresh.release()
+
+            if case .failure(let error) = await first.result {
+                XCTAssertTrue(error is CancellationError)
+            } else {
+                XCTFail("a cancelled request must not retry")
+            }
+            let response = try await second.value
+            XCTAssertEqual(response.data, Data("42".utf8))
+            let attempts = await backend.attempts
+            XCTAssertEqual(attempts["first"]?.map(\.token), ["Bearer old"])
+            XCTAssertEqual(attempts["second"]?.map(\.token), ["Bearer old", "Bearer renewed"])
+        }
+    }
+
+    func testCancellingFirstRefreshWaiterPreservesLaterRequests() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let arrived = expectation(description: "both waiting requests sent")
+            arrived.expectedFulfillmentCount = 2
+            let refreshing = expectation(description: "the first refresh started")
+            let freshArrived = expectation(description: "the later request sent with the same credential")
+            let backend = ConcurrentUnauthorizedBackend(arrived: arrived, freshArrived: freshArrived)
+            let refresh = RefreshBatch(entered: refreshing)
+            let transport = try makeRefreshTransport(backend, mode: mode)
+            transport.onTokenExpired = { await refresh.receive() }
+
+            let first = Task { try await transport.call("first") }
+            let second = Task { try await transport.call("second") }
+            await fulfillment(of: [arrived], timeout: 2)
+            await backend.release("first")
+            await fulfillment(of: [refreshing], timeout: 2)
+            await backend.release("second")
+
+            first.cancel()
+            if case .failure(let error) = await first.result {
+                XCTAssertTrue(error is CancellationError)
+            } else {
+                XCTFail("a cancelled request must not retry")
+            }
+
+            let later = Task { try await transport.call("fresh") }
+            await fulfillment(of: [freshArrived], timeout: 2)
+            await backend.release("fresh")
+            await refresh.release()
+
+            let expected = mode == .binary ? Data([84]) : Data("42".utf8)
+            let responses = try await [second.value, later.value]
+            XCTAssertEqual(responses.map(\.data), [expected, expected])
+            let attempts = await backend.attempts
+            XCTAssertEqual(attempts["first"]?.map(\.token), ["Bearer old"])
+            for name in ["second", "fresh"] {
+                XCTAssertEqual(attempts[name]?.map(\.token), ["Bearer old", "Bearer renewed"])
+            }
+        }
+    }
+
+    func testCancellingAdditionalRefreshWaiterPreservesFirstAndRetiresWhenEmpty() async throws {
+        for mode in [TransportMode.json, .binary] {
+            try await verifyAdditionalWaiterCancellation(mode, cancelLastWaiter: false)
+            try await verifyAdditionalWaiterCancellation(mode, cancelLastWaiter: true)
+        }
+    }
+
+    private func verifyAdditionalWaiterCancellation(_ mode: TransportMode, cancelLastWaiter: Bool) async throws {
+        let arrived = expectation(description: "both requests sent with the original credential")
+        arrived.expectedFulfillmentCount = 2
+        let refreshing = expectation(description: "the first request started refresh")
+        let cancelled = XCTestExpectation(description: "the last waiter cancelled the suspended refresh")
+        let backend = ConcurrentUnauthorizedBackend(arrived: arrived)
+        let refresh = RefreshBatch(entered: refreshing)
+        let transport = try makeRefreshTransport(backend, mode: mode)
+        transport.onTokenExpired = {
+            await withTaskCancellationHandler {
+                await refresh.receive()
+            } onCancel: {
+                cancelled.fulfill()
+            }
+        }
+
+        let first = Task { try await transport.call("first") }
+        let second = Task { try await transport.call("second") }
+        await fulfillment(of: [arrived], timeout: 2)
+        await backend.release("first")
+        await fulfillment(of: [refreshing], timeout: 2)
+        await backend.release("second")
+        // Give the second 401 a chance to join while the first keeps the refresh suspended.
+        try await Task.sleep(for: .milliseconds(20))
+        second.cancel()
+        let secondResult = await second.result
+        if cancelLastWaiter {
+            first.cancel()
+            await fulfillment(of: [cancelled], timeout: 2)
+        }
+        await refresh.release()
+
+        let firstResult = await first.result
+        let attempts = await backend.attempts
+        let refreshCalls = await refresh.calls
+        XCTAssertEqual(refreshCalls, 1)
+        XCTAssertEqual(attempts["second"]?.map(\.token), ["Bearer old"])
+        if case .failure(let error) = secondResult {
+            XCTAssertTrue(error is CancellationError)
+        } else {
+            XCTFail("a cancelled additional waiter must not retry")
+        }
+        if cancelLastWaiter {
+            if case .failure(let error) = firstResult {
+                XCTAssertTrue(error is CancellationError)
+            } else {
+                XCTFail("the last cancelled waiter must not retry")
+            }
+            XCTAssertEqual(attempts["first"]?.map(\.token), ["Bearer old"])
+        } else {
+            let expected = mode == .binary ? Data([84]) : Data("42".utf8)
+            XCTAssertEqual(try firstResult.get().data, expected)
+            XCTAssertEqual(attempts["first"]?.map(\.token), ["Bearer old", "Bearer renewed"])
+        }
+    }
+
+    func testCancellationRacingUnauthorizedDoesNotReplay() async throws {
+        for index in 0..<128 {
+            let arrived = expectation(description: "original request sent")
+            let backend = ConcurrentUnauthorizedBackend(arrived: arrived)
+            let refresh = RefreshBatch(entered: XCTestExpectation(description: "refresh may start"))
+            let transport = try makeRefreshTransport(backend, mode: .json)
+            transport.onTokenExpired = { await refresh.receive() }
+
+            let request = Task { try await transport.call("first") }
+            await fulfillment(of: [arrived], timeout: 2)
+            await backend.release("first")
+            for _ in 0..<(index % 8) { await Task.yield() }
+            request.cancel()
+            await refresh.release()
+
+            if case .failure(let error) = await request.result {
+                XCTAssertTrue(error is CancellationError)
+            } else {
+                XCTFail("a cancelled request must not retry")
+            }
+            let attempts = await backend.attempts
+            XCTAssertEqual(attempts["first"]?.map(\.token), ["Bearer old"])
+        }
+    }
+
+    func testIdentityReplacementRacingRefreshDoesNotSendTheNewIdentity() async throws {
+        for index in 0..<128 {
+            let arrived = expectation(description: "request sent with the original credential")
+            let refreshing = expectation(description: "refresh callback is waiting")
+            let backend = ConcurrentUnauthorizedBackend(arrived: arrived)
+            let refresh = RefreshBatch(entered: refreshing)
+            let transport = try makeRefreshTransport(backend, mode: .json)
+            transport.onTokenExpired = { await refresh.receive() }
+
+            let request = Task { try await transport.call("first") }
+            await fulfillment(of: [arrived], timeout: 2)
+            await backend.release("first")
+            await fulfillment(of: [refreshing], timeout: 2)
+            await refresh.release()
+            for _ in 0..<(index % 8) { await Task.yield() }
+            transport.setToken("different-user")
+
+            let outcome = await request.result
+            let attempts = await backend.attempts
+            switch outcome {
+            case .success(let response):
+                XCTAssertEqual(response.data, Data("42".utf8))
+                XCTAssertEqual(attempts["first"]?.map(\.token), ["Bearer old", "Bearer renewed"])
+            case .failure:
+                assertUnauthorized(outcome)
+                XCTAssertEqual(attempts["first"]?.map(\.token), ["Bearer old"])
+            }
+        }
+    }
+}
