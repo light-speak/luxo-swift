@@ -131,15 +131,32 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
 
     public func setToken(_ token: String) {
         sendOrder.withLock {
-            let previous = lock.withLock {
-                self.token = token; authenticationError = nil
-                return removeRenewalLocked()
+            let (renewal, refresh, retired) = lock.withLock {
+                let changed = self.token != token
+                self.token = token
+                authenticationError = nil
+                let (renewal, refresh) = removeRenewalLocked()
+                var retired: (LuxoWebSocketTask, RetiredConnection)?
+                if changed, let socket = task {
+                    task = nil
+                    reconnectAttempt = 0
+                    reconnectWork?.cancel()
+                    reconnectWork = nil
+                    retired = (socket, removePendingLocked())
+                }
+                return (renewal, refresh, retired)
             }
-            previous.1?.cancel()
-            if let waiting = previous.0 {
+            refresh?.cancel()
+            if let (socket, waiting) = retired {
+                socket.cancel(with: .goingAway, reason: nil)
+                let error = LuxoError(code: 0, message: "WebSocket credentials changed", name: "CancelledError")
+                finishPending(waiting, error: error)
                 openConnection()
-                waiting.finish(.success(()))
+                notifyDisconnected(waiting.observers, error: error)
+            } else if renewal != nil {
+                openConnection()
             }
+            renewal?.finish(.success(()))
         }
     }
     public func setMode(_ mode: TransportMode) { lock.withLock { self.mode = mode } }
@@ -443,8 +460,24 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
     private func openConnection() {
         let request = lock.withLock { () -> URLRequest? in
             guard shouldReconnect, task == nil, authenticationError == nil else { return nil }
-            var request = URLRequest(url: url)
-            if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+            var endpoint = url
+            if token != nil, url.query != nil {
+                guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+                if let query = components.percentEncodedQuery, Self.queryMayContainToken(query),
+                    let items = components.percentEncodedQueryItems
+                {
+                    let kept = items.filter { $0.name.removingPercentEncoding != "token" }
+                    if kept.count != items.count {
+                        components.percentEncodedQueryItems = kept.isEmpty ? nil : kept
+                        guard let cleaned = components.url else { return nil }
+                        endpoint = cleaned
+                    }
+                }
+            }
+            var request = URLRequest(url: endpoint)
+            if let token, !token.isEmpty {
+                request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            }
             return request
         }
         guard let request else { return }
@@ -459,6 +492,21 @@ public final class WebSocketTransport: Transport, @unchecked Sendable {
         guard installed else { socket.cancel(with: .goingAway, reason: nil); return }
         socket.resume()
         receiveLoop(socket, identity: identity)
+    }
+
+    private static func queryMayContainToken(_ query: String) -> Bool {
+        var remaining = query.utf8[...]
+        while !remaining.isEmpty {
+            let separator = remaining.firstIndex(of: UInt8(ascii: "&")) ?? remaining.endIndex
+            let name = remaining[..<separator].prefix { $0 != UInt8(ascii: "=") }
+            // Foundation still decodes percent-encoded names before the final comparison.
+            if name.elementsEqual("token".utf8) || name.contains(UInt8(ascii: "%")) {
+                return true
+            }
+            guard separator != remaining.endIndex else { break }
+            remaining = remaining[remaining.index(after: separator)...]
+        }
+        return false
     }
 
     private func receiveLoop(_ socket: LuxoWebSocketTask, identity: ConnectionIdentity) {
