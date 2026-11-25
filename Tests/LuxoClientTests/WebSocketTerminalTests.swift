@@ -3,6 +3,89 @@ import XCTest
 @testable import LuxoClient
 
 final class WebSocketTerminalTests: XCTestCase {
+    func testCredentialRotationRetiresConnectedWorkAndReplacesUpgrade() async throws {
+        let old = MockWebSocketTask(), fresh = MockWebSocketTask(), anonymous = MockWebSocketTask()
+        let session = MockWebSocketSession(sockets: [old, fresh, anonymous])
+        let transport = try WebSocketTransport(
+            url: "ws://localhost/test?token=original&keep=x&keep=y", timeout: 1, session: session)
+        defer { transport.close() }
+        transport.connect()
+        XCTAssertTrue(old.isResumed)
+        XCTAssertTrue(try XCTUnwrap(session.lastRequest?.url?.query).contains("token=original"))
+
+        let sent = expectation(description: "in-flight original call")
+        old.onSend = { _ in sent.fulfill() }
+        let pending = Task { try await transport.call("echo") }
+        await fulfillment(of: [sent], timeout: 1)
+        transport.setToken("new")
+        XCTAssertEqual(old.cancelCode, .goingAway)
+        XCTAssertTrue(fresh.isResumed)
+        do {
+            _ = try await pending.value
+            XCTFail("expected cancellation")
+        } catch let error as LuxoError {
+            XCTAssertEqual(error.name, "CancelledError")
+        }
+        let request = try XCTUnwrap(session.lastRequest)
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer new")
+        XCTAssertEqual(request.url?.query, "keep=x&keep=y")
+
+        old.expireAccess()
+        fresh.onSend = { [weak fresh] _ in
+            fresh?.deliver(.success(.string(#"{"$id":2,"data":42}"#)))
+        }
+        let result = try await transport.call("echo")
+        XCTAssertEqual(result.data, Data("42".utf8))
+        XCTAssertEqual(old.sentMessages.count, 1)
+
+        transport.setToken("new")
+        XCTAssertNil(fresh.cancelCode)
+        transport.setToken("")
+        XCTAssertEqual(fresh.cancelCode, .goingAway)
+        XCTAssertTrue(anonymous.isResumed)
+        XCTAssertNil(session.lastRequest?.value(forHTTPHeaderField: "Authorization"))
+        XCTAssertEqual(session.lastRequest?.url?.query, "keep=x&keep=y")
+    }
+
+    func testCredentialRotationRetiresUpgradeBeforeItReceivesAnything() throws {
+        let old = MockWebSocketTask(), fresh = MockWebSocketTask()
+        let session = MockWebSocketSession(sockets: [old, fresh])
+        let transport = try WebSocketTransport(url: "ws://localhost/test", token: "old", session: session)
+        defer { transport.close() }
+        transport.connect()
+        XCTAssertTrue(old.isResumed)
+        transport.setToken("new")
+        XCTAssertEqual(old.cancelCode, .goingAway)
+        XCTAssertTrue(fresh.isResumed)
+        XCTAssertEqual(session.lastRequest?.value(forHTTPHeaderField: "Authorization"), "Bearer new")
+    }
+
+    func testBearerUpgradeFiltersEncodedTokenNamesAndPreservesQueryValues() throws {
+        let examples: [(query: String, expected: String?)] = [
+            ("cursor=a%2Bb%26token%3Dtext&mode=live", "cursor=a%2Bb%26token%3Dtext&mode=live"),
+            ("tag=x&%74oken=legacy&tag=y&token=legacy", "tag=x&tag=y"),
+            ("Token=other&t%6Fken=legacy&flag&blank=", "Token=other&flag&blank="),
+            ("tokenized=one&key=token&%25token=two", "tokenized=one&key=token&%25token=two"),
+            ("token", nil),
+            ("", ""),
+        ]
+        for sample in examples {
+            let socket = MockWebSocketTask()
+            let session = MockWebSocketSession(sockets: [socket])
+            let transport = try WebSocketTransport(
+                url: "ws://localhost/test?\(sample.query)", token: "new", session: session
+            )
+            defer { transport.close() }
+            transport.connect()
+            let request = try XCTUnwrap(session.lastRequest)
+            let endpoint = try XCTUnwrap(request.url)
+            let components = try XCTUnwrap(URLComponents(url: endpoint, resolvingAgainstBaseURL: false))
+            XCTAssertTrue(socket.isResumed)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer new")
+            XCTAssertEqual(components.percentEncodedQuery, sample.expected, sample.query)
+        }
+    }
+
     func testInvalidErrorStatusOnlyEndsItsOwnSubscription() async throws {
         for mode in [TransportMode.json, .binary] {
             let (transport, socket) = try fixture(mode)
