@@ -1,4 +1,4 @@
-name: Native HTTP refresh allocation attribution
+name: Native HTTP refresh allocation attribution after callback optimization
 
 on:
   push:
@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 9
+          fetch-depth: 10
           persist-credentials: false
 
       - name: Attribute malloc stacks on the pinned upstream SDK and exact candidate
@@ -31,7 +31,7 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: swift-http-refresh-reentry-ar-attribution-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swift-http-refresh-reentry-av-attribution-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/refresh-reentry-evidence
           if-no-files-found: error
           include-hidden-files: true

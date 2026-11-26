@@ -6,7 +6,8 @@ case "$phase" in test|performance|allocation-stacks|allocation-attribution) ;; *
 cd "${GITHUB_WORKSPACE:?}"
 repo=$(pwd -P)
 base=d6578969bcef258141c7c99cb6cface30a22a0e2
-diagnostic_parent=6db74f84ef60aa2ea4046ef7a6e76f73097b4263
+diagnostic_parent=3018b942b4c477b10c424072695d7278b739aafa
+attribution_parent=6db74f84ef60aa2ea4046ef7a6e76f73097b4263
 performance_parent=6f7f917eeae867a7e3ba54d514504e3e5d41f731
 stacks_parent=d7869d4c2a4e6737d863322596b42589186bd118
 allocation_parent=c42a1abda08d57ad58daaed502ec6ddaad3f36a1
@@ -14,11 +15,14 @@ direct_parent=611c80754edcdd5413fc7d1a67b4c9d7d6c1626d
 pq_initial=1a1b3fc090e8dbe06ff309aab7d37d78cd452c22
 initial_diagnostic=35e593a50854cc208ac52f8aad9e5be3f06b9138
 prior=c106719f7f78608173fcbe522f90064552f32b4a
-candidate=168f4f54dfeda7ae37d6a06c0754645ae98c792e
+attributed_candidate=168f4f54dfeda7ae37d6a06c0754645ae98c792e
+candidate=dac21227057bddb1d95bc872699515ab9301aaff
+void_patch_digest=16c6e65fe799bc835ab6008a159bed132f91b32275c68f3a05ec2b84b42f4563
 optimization_patch_digest=53549d30e67c3420c843fe045121b0524c27929314b1c1e76a4689c3a0673a86
 base_sources=dbdaed8acd534ea691215f839b6e57a4504c333a
 prior_sources=e89a325d40b0e0cd334cb0ffbf9c428dc9b2e6e2
-candidate_sources=bc45cfd3ea3c107c494fb3a76a9274e1a8324318
+attributed_sources=bc45cfd3ea3c107c494fb3a76a9274e1a8324318
+candidate_sources=ea0383b2fc3dd454e54109ad6ba70a31f2639209
 patch_digest=5c26ee2f33344a2554faa9f905df4c9eed999d142b2fe5d3ae4745e9a9096024
 lock_digest=b591abc67a0576311e15869bc841db99743f9f0398b6a8828e78984a86079fd2
 core_revision=a2c411b7b83ca233881ace0c5bf3bec0b9646e1d
@@ -32,7 +36,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 test "$(git rev-parse HEAD)" = "${GITHUB_SHA:?}"
 test "$(git show -s --format=%P HEAD)" = "$diagnostic_parent"
-test "$(git show -s --format=%P "$diagnostic_parent")" = "$performance_parent"
+test "$(git show -s --format=%P "$diagnostic_parent")" = "$attribution_parent"
+test "$(git show -s --format=%P "$attribution_parent")" = "$performance_parent"
 test "$(git show -s --format=%P "$performance_parent")" = "$stacks_parent"
 test "$(git show -s --format=%P "$stacks_parent")" = "$allocation_parent"
 test "$(git show -s --format=%P "$allocation_parent")" = "$direct_parent"
@@ -63,13 +68,14 @@ python3 - "$input" "$work" <<'PY'
 import base64
 from pathlib import Path
 import sys
-for patch in ("candidate.patch", "optimization.patch"):
+for patch in ("candidate.patch", "optimization.patch", "void-operation.patch"):
     source = Path(sys.argv[1]) / (patch + ".base64")
     data = b"".join(source.read_bytes().splitlines())
     (Path(sys.argv[2]) / patch).write_bytes(base64.b64decode(data, validate=True))
 PY
 test "$(sha256 "$work/candidate.patch")" = "$patch_digest"
 test "$(sha256 "$work/optimization.patch")" = "$optimization_patch_digest"
+test "$(sha256 "$work/void-operation.patch")" = "$void_patch_digest"
 test "$(sha256 "$input/pins.json")" = "$lock_digest"
 sdk="$work/sdk"
 git clone -q --shared --no-checkout "$repo" "$sdk"
@@ -78,6 +84,9 @@ git -C "$sdk" apply --index --whitespace=error-all "$work/candidate.patch"
 test "$(git -C "$sdk" write-tree)" = "$prior"
 test "$(git -C "$sdk" rev-parse "$prior:Sources/LuxoClient")" = "$prior_sources"
 git -C "$sdk" apply --index --whitespace=error-all "$work/optimization.patch"
+test "$(git -C "$sdk" write-tree)" = "$attributed_candidate"
+test "$(git -C "$sdk" rev-parse "$attributed_candidate:Sources/LuxoClient")" = "$attributed_sources"
+git -C "$sdk" apply --index --whitespace=error-all "$work/void-operation.patch"
 check_tree() {
     test "$(git -C "$sdk" rev-parse HEAD)" = "$base"
     test "$(git -C "$sdk" write-tree)" = "$candidate"
@@ -90,7 +99,9 @@ test "$(git -C "$sdk" rev-parse "$candidate:Sources/LuxoClient")" = "$candidate_
 printf 'diagnosticHead=%s\nbase=%s\ncandidateTree=%s\nbaseSourceTree=%s\ncandidateSourceTree=%s\npatchSHA256=%s\nlockSHA256=%s\n' \
     "$GITHUB_SHA" "$base" "$candidate" "$base_sources" "$candidate_sources" "$patch_digest" "$lock_digest" > "$out/source.txt"
 git -C "$sdk" diff --cached --name-status > "$out/changed-paths.txt"
-git -C "$sdk" diff --name-status "$prior" "$candidate" > "$out/changed-paths-from-p.txt"
+git -C "$sdk" diff --name-status "$attributed_candidate" "$candidate" > "$out/changed-paths-from-r.txt"
+printf 'attributedCandidateTree=%s\nattributedCandidateSourceTree=%s\nvoidOperationPatchSHA256=%s\n' \
+    "$attributed_candidate" "$attributed_sources" "$void_patch_digest" >> "$out/source.txt"
 printf 'diagnosticParent=%s\npriorCandidateTree=%s\npriorCandidateSourceTree=%s\ncomparisonBaseTree=%s\ncomparisonBaseSourceTree=%s\noptimizationPatchSHA256=%s\n' \
     "$diagnostic_parent" "$prior" "$prior_sources" "$base" "$base_sources" "$optimization_patch_digest" >> "$out/source.txt"
 cp "$input/inputs.sha256" "$input/pins.json" "$out/"

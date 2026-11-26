@@ -18,7 +18,7 @@ LEAVES = {
     ("parallel-one", "json"): 24,
     ("expiry", "json"): 24,
 }
-COMPARISONS = {"AA": ("base", "base"), "RR": ("next", "next"), "AR": ("base", "next")}
+COMPARISONS = {"AA": ("base", "base"), "VV": ("next", "next"), "AV": ("base", "next")}
 PAIRS = 3
 EVENTS = re.compile(r"\n(?=(?:ALLOC|FREE|VM_ALLOC|VM_DEALLOC) )")
 SIZE = re.compile(r"\[size=(\d+)\]")
@@ -91,7 +91,7 @@ def paired_samples(capture, equivalent):
                 for comparison in schedule:
                     roles = COMPARISONS[comparison]
                     meta = dict(block=block + 1, pair=index + 1, scenario=scenario, codec=codec,
-                                comparison=comparison, order="RA" if flip else "AR")
+                                comparison=comparison, order="VA" if flip else "AV")
                     arms = [None, None]
                     for arm in (1, 0) if flip else (0, 1):
                         arms[arm] = capture(roles[arm], scenario, codec, LEAVES[scenario, codec], meta, arm)
@@ -155,7 +155,7 @@ def main():
     def trace(role, scenario, codec, count, meta, arm):
         def read_history(history):
             row = attribute(history, original, sites)
-            if (meta["comparison"], meta["block"], meta["pair"]) == ("AR", 1, 1):
+            if (meta["comparison"], meta["block"], meta["pair"]) == ("AV", 1, 1):
                 name = f"{scenario}-{codec}-{role}.txt.gz"
                 record_history(witness / name, history)
                 row["rawWitness"] = name
