@@ -298,6 +298,46 @@ final class HTTPBackendTests: XCTestCase {
         }
     }
 
+    func testRetiredRefreshReleasesTransportBeforeCallbackReturns() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let entered = expectation(description: "refresh entered")
+            let released = expectation(description: "transport released while refresh waits")
+            let returned = expectation(description: "retired callback returned")
+            let callbacks = RefreshBatch(entered: entered)
+            let owner = RequestReference()
+            var transport: HTTPTransport<Backend>? = HTTPTransport(
+                backend: Backend(onDeinit: { released.fulfill() }), token: "old")
+            owner.observe(try XCTUnwrap(transport))
+            transport?.setMode(mode)
+            try transport?.setSchema(["viewer": APISchema(id: 1)])
+            transport?.onTokenExpired = {
+                let token = await callbacks.receive()
+                returned.fulfill()
+                return token
+            }
+
+            let worker = Task { [transport] in
+                do {
+                    _ = try await XCTUnwrap(transport).call("viewer")
+                    XCTFail("cancelled \(mode) request succeeded")
+                } catch is CancellationError {
+                } catch {
+                    XCTFail("unexpected error: \(error)")
+                }
+            }
+            await fulfillment(of: [entered], timeout: 2)
+            worker.cancel()
+            await worker.value
+            transport = nil
+            await fulfillment(of: [released], timeout: 2)
+            XCTAssertFalse(owner.isRetained, "retired \(mode) callback retained its transport")
+            await callbacks.release()
+            await fulfillment(of: [returned], timeout: 2)
+            let calls = await callbacks.calls
+            XCTAssertEqual(calls, 1)
+        }
+    }
+
     func testDeadlineFinishesPendingRefreshAndIgnoresLateToken() async throws {
         for mode in [TransportMode.json, .binary] {
             let backend = Backend()
@@ -554,6 +594,12 @@ final class HTTPBackendTests: XCTestCase {
     private actor Backend: HTTPBackend {
         var tokens: [String?] = []
         var beforeFirstResponse: (@Sendable () -> Void)?
+        private let onDeinit: (@Sendable () -> Void)?
+
+        init(onDeinit: (@Sendable () -> Void)? = nil) { self.onDeinit = onDeinit }
+
+        deinit { onDeinit?() }
+
         func beforeFirstResponse(_ action: @escaping @Sendable () -> Void) {
             beforeFirstResponse = action
         }

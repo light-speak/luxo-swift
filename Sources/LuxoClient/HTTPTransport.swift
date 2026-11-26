@@ -81,6 +81,7 @@ public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Se
 
     // One worker owns this snapshot of the configured callback. The inherited refresh context does not retain it.
     private struct RefreshCallback: @unchecked Sendable {
+        weak var transport: HTTPTransport?
         let call: () async -> String?
     }
 
@@ -233,11 +234,11 @@ public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Se
         let refresh = Refresh()
         refresh.waiters.insert(continuation, for: key)
         activeRefresh = refresh
-        let callback = RefreshCallback(call: handler)
-        refresh.task = Task { [weak self, callback] in
-            guard self?.mayStartRefresh(refresh) == true else { return }
+        let callback = RefreshCallback(transport: self, call: handler)
+        refresh.task = Task { [callback] in
+            guard callback.transport?.mayStartRefresh(refresh) == true else { return }
             let token = await HTTPRefreshContext.$current.withValue(refresh, operation: callback.call)
-            self?.finishRefresh(refresh, token: token, cancelled: Task.isCancelled)
+            callback.transport?.finishRefresh(refresh, token: token, cancelled: Task.isCancelled)
         }
         return nil
     }
