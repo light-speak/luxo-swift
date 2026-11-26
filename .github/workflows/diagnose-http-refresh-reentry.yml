@@ -1,4 +1,4 @@
-name: Native HTTP successful JSON hot-alignment comparison
+name: Native HTTP three-source cold refresh attribution
 
 on:
   push:
@@ -16,22 +16,29 @@ env:
 
 jobs:
   qualify:
-    name: Apple / successful JSON hot alignment
+    name: Apple / cold refresh allocation attribution
     runs-on: macos-26
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 13
+          fetch-depth: 14
           persist-credentials: false
 
-      - name: Verify exact Mach-O alignment and compare the successful JSON leaf
-        run: bash .github/diagnostics/http-refresh-reentry/run.sh r-hot-alignment
+      - uses: actions/checkout@v7
+        with:
+          ref: 2a8108bbe2692c349069d71b2f5eb2f9a501c171
+          path: .tmp/s-product
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify retired owner lifetime and trace the original cold refresh workload
+        run: bash .github/diagnostics/http-refresh-reentry/run.sh r-s-cold-stacks
 
       - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: swift-http-refresh-reentry-ar-hot-alignment-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swift-http-refresh-reentry-ars-cold-stacks-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/refresh-reentry-evidence
           if-no-files-found: error
           include-hidden-files: true

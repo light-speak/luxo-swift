@@ -12,3 +12,4 @@ aa73a8136e432549414a296a03555c84b78020903502f36a5aa0957d1f644c04  void-operation
 c5101970f6f976d323ef86a8bebd88dc69d0d2533a35be409a3af3b991317dbf  qualify-r-residual.py
 ebd6de0917ef0f48e9bc146dc3bcd1f27059141ee72b355269b3746ecfb404fa  qualify-r-hot-placement.py
 ec24cbfc53a1a1820fa5b4f5354e7f98555650c54e72c06babfafad0050fa136  qualify-r-hot-alignment.py
+ae1a7f6a87c9a58bf23b53af5bf1b4bd4089eae720d5c8266999b29bb4eb3ec4  qualify-r-s-cold-stacks.py
