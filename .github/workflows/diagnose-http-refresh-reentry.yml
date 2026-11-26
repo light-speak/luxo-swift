@@ -1,4 +1,4 @@
-name: Native HTTP successful JSON executable-placement comparison
+name: Native HTTP successful JSON hot-alignment comparison
 
 on:
   push:
@@ -16,22 +16,22 @@ env:
 
 jobs:
   qualify:
-    name: Apple / successful JSON placement
+    name: Apple / successful JSON hot alignment
     runs-on: macos-26
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 12
+          fetch-depth: 13
           persist-credentials: false
 
-      - name: Compare exact A/R and same-binary placement controls
-        run: bash .github/diagnostics/http-refresh-reentry/run.sh r-hot-placement
+      - name: Verify exact Mach-O alignment and compare the successful JSON leaf
+        run: bash .github/diagnostics/http-refresh-reentry/run.sh r-hot-alignment
 
       - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: swift-http-refresh-reentry-ar-hot-placement-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swift-http-refresh-reentry-ar-hot-alignment-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/refresh-reentry-evidence
           if-no-files-found: error
           include-hidden-files: true
