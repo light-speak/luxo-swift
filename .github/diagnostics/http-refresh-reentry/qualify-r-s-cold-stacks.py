@@ -15,6 +15,7 @@ COMPARISONS = {"AA": ("A", "A"), "RR": ("R", "R"), "SS": ("S", "S"),
                "AR": ("A", "R"), "RS": ("R", "S"), "AS": ("A", "S")}
 IMAGES = {"A": "base", "R": "next", "S": "s"}
 SOURCE_LINES = {"A": (212, 215), "R": (233, 237), "S": (234, 238)}
+DIRECT_SIZES = {"A": (64, 48, 24), "R": (56, 64, 24), "S": (56, 64, 0)}
 REGISTER = "specialized HTTPTransport.registerRefresh(_:_:after:)"
 S_BINDINGS = {"bin/s", "s-sources.sha256", "s-source.txt", "qualify-r-s-cold-stacks.py"}
 
@@ -22,8 +23,10 @@ S_BINDINGS = {"bin/s", "s-sources.sha256", "s-source.txt", "qualify-r-s-cold-sta
 def components(arm, sites):
     registry = Counter(dict.fromkeys(("all24", "all1016", "taskSlabs1016", "callbackSlab",
                                       "register24", "weakBox", "refreshObjectCount",
-                                      "refreshObjectBytes", "workerClosureCount", "workerClosureBytes"), 0))
+                                      "refreshObjectBytes", "workerClosureCount", "workerClosureBytes",
+                                      "symbolOnlyAllocations", "unattributedDirectAllocations"), 0))
     context_line, capture_line = SOURCE_LINES[arm["arm"]]
+    context_size, capture_size, expected_weak = DIRECT_SIZES[arm["arm"]]
     for signature, hist in arm["stackCountsBySize"].items():
         frames = sites[signature]["frames"]
         registry["all24"] += hist.get(24, hist.get("24", 0))
@@ -38,23 +41,33 @@ def components(arm, sites):
         if len(frames) < 5 or "swift_allocObject" not in frames[3] or REGISTER not in frames[4]:
             continue
         caller = frames[4]
-        if caller.endswith("/<compiler-generated>:0"):
-            registry["weakBox"] += hist.get(24, hist.get("24", 0))
-        for name, line in (("refreshObject", context_line), ("workerClosure", capture_line)):
-            if caller.endswith(f"HTTPTransport.swift:{line}"):
-                registry[name + "Count"] += sum(hist.values())
-                registry[name + "Bytes"] += sum(int(size) * count for size, count in hist.items())
+        symbol_only = caller == f"4 {arm['role']} @ {REGISTER}"
+        for size, count in hist.items():
+            size = int(size)
+            if symbol_only:
+                # malloc_history can merge direct call sites when it omits source locations.
+                registry["symbolOnlyAllocations"] += count
+            if size == 24 and (caller.endswith("/<compiler-generated>:0") or (symbol_only and expected_weak)):
+                registry["weakBox"] += count
+            elif size == context_size and (symbol_only or caller.endswith(f"HTTPTransport.swift:{context_line}")):
+                registry["refreshObjectCount"] += count
+                registry["refreshObjectBytes"] += size * count
+            elif size == capture_size and (symbol_only or caller.endswith(f"HTTPTransport.swift:{capture_line}")):
+                registry["workerClosureCount"] += count
+                registry["workerClosureBytes"] += size * count
+            else:
+                registry["unattributedDirectAllocations"] += count
     return dict(registry)
 
 
-def require_components(result, arm):
-    expected = WORKLOAD[2]
-    width = {"A": (64, 48, 24), "R": (56, 64, 24), "S": (56, 64, 0)}
-    context, closure, weak = width[arm]
-    assert result["refreshObjectCount"] == result["workerClosureCount"] == expected
-    assert result["refreshObjectBytes"] == context * expected
-    assert result["workerClosureBytes"] == closure * expected
-    assert result.get("weakBox", 0) == result["register24"] == weak, (arm, result)
+def require_components(result, arm, expected=WORKLOAD[2]):
+    context, closure, weak = DIRECT_SIZES[arm]
+    assert result["unattributedDirectAllocations"] == 0, (arm, result)
+    assert result["refreshObjectCount"] == result["workerClosureCount"] == expected, (arm, result)
+    assert result["refreshObjectBytes"] == context * expected, (arm, result)
+    assert result["workerClosureBytes"] == closure * expected, (arm, result)
+    expected_weak = expected if weak else 0
+    assert result["weakBox"] == result["register24"] == expected_weak, (arm, result)
 
 
 def schedule():

@@ -2,11 +2,14 @@
 set -euo pipefail
 umask 077
 phase=${1:?Expected a native diagnostic phase}
-case "$phase" in test|performance|allocation-stacks|allocation-attribution|r-residual|r-hot-placement|r-hot-alignment|r-s-cold-stacks|s-performance) ;; *) exit 2 ;; esac
+case "$phase" in test|performance|allocation-stacks|allocation-attribution|r-residual|r-hot-placement|r-hot-alignment|r-s-cold-stacks|s-performance|s-cold-attribution) ;; *) exit 2 ;; esac
+exact_s=false
+case "$phase" in s-performance|s-cold-attribution) exact_s=true ;; esac
 cd "${GITHUB_WORKSPACE:?}"
 repo=$(pwd -P)
 base=d6578969bcef258141c7c99cb6cface30a22a0e2
-diagnostic_parent=cd5a269858e88104e999c379c74a6e38c73814d6
+diagnostic_parent=18c26f7bc4b7ffe892ba4d98c425d6014d9d7d0e
+s_performance_parent=cd5a269858e88104e999c379c74a6e38c73814d6
 cold_stacks_parent=c78264f5306cdcd757a29bd1e1ac0d5dddff6754
 alignment_parent=7ae6f660bc38efd47c89615602644418c64bedbe
 placement_parent=f0e72b136f157e6b9d7ba9b92040b2dfa7c4537a
@@ -41,7 +44,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 test "$(git rev-parse HEAD)" = "${GITHUB_SHA:?}"
 test "$(git show -s --format=%P HEAD)" = "$diagnostic_parent"
-test "$(git show -s --format=%P "$diagnostic_parent")" = "$cold_stacks_parent"
+test "$(git show -s --format=%P "$diagnostic_parent")" = "$s_performance_parent"
+test "$(git show -s --format=%P "$s_performance_parent")" = "$cold_stacks_parent"
 test "$(git show -s --format=%P "$cold_stacks_parent")" = "$alignment_parent"
 test "$(git show -s --format=%P "$alignment_parent")" = "$placement_parent"
 test "$(git show -s --format=%P "$placement_parent")" = "$residual_parent"
@@ -69,7 +73,7 @@ test "$(sw_vers -productVersion | cut -d. -f1)" = 26
 } > "$out/toolchain.txt"
 grep -Eq '^Apple Swift version 6\.3\.3 ' "$out/toolchain.txt"
 grep -Fx 'Xcode 26.6' "$out/toolchain.txt"
-if { [ "$phase" = r-hot-placement ] || [ "$phase" = r-hot-alignment ] || [ "$phase" = r-s-cold-stacks ] || [ "$phase" = s-performance ]; } && ! grep -Fxq 'Apple M1 (Virtual)' "$out/toolchain.txt"; then
+if { [ "$phase" = r-hot-placement ] || [ "$phase" = r-hot-alignment ] || [ "$phase" = r-s-cold-stacks ] || [ "$exact_s" = true ]; } && ! grep -Fxq 'Apple M1 (Virtual)' "$out/toolchain.txt"; then
     printf '%s\n' 'CPU did not match; no benchmark binaries or samples were produced.' > "$out/status.txt"
     exit 0
 fi
@@ -101,7 +105,7 @@ git -C "$sdk" apply --index --whitespace=error-all "$work/optimization.patch"
 test "$(git -C "$sdk" write-tree)" = "$attributed_candidate"
 test "$(git -C "$sdk" rev-parse "$attributed_candidate:Sources/LuxoClient")" = "$attributed_sources"
 void_applied=false
-if [ "$phase" = r-residual ] || [ "$phase" = r-hot-placement ] || [ "$phase" = r-hot-alignment ] || [ "$phase" = r-s-cold-stacks ] || [ "$phase" = s-performance ]; then
+if [ "$phase" = r-residual ] || [ "$phase" = r-hot-placement ] || [ "$phase" = r-hot-alignment ] || [ "$phase" = r-s-cold-stacks ] || [ "$exact_s" = true ]; then
     candidate=$attributed_candidate
     candidate_sources=$attributed_sources
 else
@@ -177,7 +181,7 @@ else
     flags=(-sdk "$sdk_path" -swift-version 6 -j 2 -module-cache-path "$work/module-cache" -target arm64-apple-macosx13.0
            -parse-as-library -O -whole-module-optimization -g -module-name LuxoClient)
     for arm in base next; do
-        if [ "$phase" = s-performance ] && [ "$arm" = next ]; then continue; fi
+        if [ "$exact_s" = true ] && [ "$arm" = next ]; then continue; fi
         tree=$base
         if [ "$arm" = next ]; then tree=$candidate; fi
         checkout="$work/$arm"
@@ -191,7 +195,7 @@ else
                 -o "$perf/bin/$arm-aligned" > "$out/build-$arm-aligned.log" 2>&1
         fi
     done
-    if [ "$phase" = r-s-cold-stacks ] || [ "$phase" = s-performance ]; then
+    if [ "$phase" = r-s-cold-stacks ] || [ "$exact_s" = true ]; then
         r_commit=341bb89c0d13457452fd45f64f4ed8fab149b64c
         s_commit=2a8108bbe2692c349069d71b2f5eb2f9a501c171
         s_tree=e86fd9264f0d875ca10967a4b56124c8dbc18e79
@@ -212,7 +216,7 @@ else
         (cd "$s_src" && shasum -a 256 Sources/LuxoClient/*.swift) > "$perf/s-sources.sha256"
         printf 'rCommit=%s\nsCommit=%s\nsTree=%s\nsClientTree=%s\nrToSPatchSHA256=%s\nlifecycleSHA256=%s\n' \
             "$r_commit" "$s_commit" "$s_tree" "$s_client" "$s_patch" "$lifecycle_sha" > "$perf/s-source.txt"
-        if [ "$phase" = s-performance ]; then
+        if [ "$exact_s" = true ]; then
             mv "$perf/s-sources.sha256" "$perf/next-sources.sha256"
             cp "$perf/s-source.txt" "$out/"
             printf 'benchmarkTestedCommit=%s\nbenchmarkTestedTree=%s\nbenchmarkTestedSourceTree=%s\n'                 "$s_commit" "$s_tree" "$s_client" >> "$out/source.txt"
@@ -256,6 +260,11 @@ SWIFT
         cp s-binding.sha256 s-source.txt s-sources.sha256 "$out/"
         python3 qualify-r-s-cold-stacks.py 2>&1 | tee "$out/r-s-cold-stacks.log" || status=$?
         if [ -d r-s-cold-stacks ]; then mv r-s-cold-stacks "$out/"; fi
+        test "$status" = 0
+    elif [ "$phase" = s-cold-attribution ]; then
+        cp "$input"/{allocation-attribution.py,qualify-r-hot-placement.py,qualify-r-s-cold-stacks.py,qualify-s-cold-attribution.py} "$perf/"
+        python3 qualify-s-cold-attribution.py 2>&1 | tee "$out/s-cold-attribution.log" || status=$?
+        if [ -d s-cold-attribution ]; then mv s-cold-attribution "$out/"; fi
         test "$status" = 0
     elif [ "$phase" = r-hot-alignment ]; then
         cp "$input"/{qualify-r-hot-placement.py,qualify-r-hot-alignment.py} "$perf/"
