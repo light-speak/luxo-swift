@@ -6,7 +6,8 @@ case "$phase" in test|performance|allocation-stacks) ;; *) exit 2 ;; esac
 cd "${GITHUB_WORKSPACE:?}"
 repo=$(pwd -P)
 base=d6578969bcef258141c7c99cb6cface30a22a0e2
-diagnostic_parent=d7869d4c2a4e6737d863322596b42589186bd118
+diagnostic_parent=6f7f917eeae867a7e3ba54d514504e3e5d41f731
+stacks_parent=d7869d4c2a4e6737d863322596b42589186bd118
 allocation_parent=c42a1abda08d57ad58daaed502ec6ddaad3f36a1
 direct_parent=611c80754edcdd5413fc7d1a67b4c9d7d6c1626d
 pq_initial=1a1b3fc090e8dbe06ff309aab7d37d78cd452c22
@@ -30,7 +31,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 test "$(git rev-parse HEAD)" = "${GITHUB_SHA:?}"
 test "$(git show -s --format=%P HEAD)" = "$diagnostic_parent"
-test "$(git show -s --format=%P "$diagnostic_parent")" = "$allocation_parent"
+test "$(git show -s --format=%P "$diagnostic_parent")" = "$stacks_parent"
+test "$(git show -s --format=%P "$stacks_parent")" = "$allocation_parent"
 test "$(git show -s --format=%P "$allocation_parent")" = "$direct_parent"
 test "$(git show -s --format=%P "$direct_parent")" = "$pq_initial"
 test "$(git show -s --format=%P "$pq_initial")" = "$initial_diagnostic"
