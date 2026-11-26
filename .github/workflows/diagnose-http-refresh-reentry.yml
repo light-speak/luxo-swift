@@ -1,0 +1,60 @@
+name: Native HTTP refresh reentry qualification
+
+on:
+  push:
+    branches: [diagnostics/http-refresh-reentry-native]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: http-refresh-reentry-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  LUXO_CORE_FIXTURE_REVISION: a2c411b7b83ca233881ace0c5bf3bec0b9646e1d
+
+jobs:
+  qualify:
+    name: Apple / ${{ matrix.phase }}
+    runs-on: macos-26
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        phase: [test, performance]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - if: matrix.phase == 'test'
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - if: matrix.phase == 'test'
+        uses: actions/checkout@v7
+        with:
+          repository: light-speak/luxo
+          ref: ${{ env.LUXO_CORE_FIXTURE_REVISION }}
+          path: .tmp/luxo-core
+          persist-credentials: false
+
+      - name: Restore and qualify exact product tree
+        env:
+          PHASE: ${{ matrix.phase }}
+        run: |
+          bash .github/diagnostics/http-refresh-reentry/run.sh "$PHASE"
+
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: swift-http-refresh-reentry-${{ matrix.phase }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/refresh-reentry-evidence
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
