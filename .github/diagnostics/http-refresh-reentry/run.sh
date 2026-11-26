@@ -6,13 +6,14 @@ case "$phase" in test|performance) ;; *) exit 2 ;; esac
 cd "${GITHUB_WORKSPACE:?}"
 repo=$(pwd -P)
 base=d6578969bcef258141c7c99cb6cface30a22a0e2
-diagnostic_parent=35e593a50854cc208ac52f8aad9e5be3f06b9138
+diagnostic_parent=1a1b3fc090e8dbe06ff309aab7d37d78cd452c22
+initial_diagnostic=35e593a50854cc208ac52f8aad9e5be3f06b9138
 prior=c106719f7f78608173fcbe522f90064552f32b4a
-candidate=99748563e29d030e6e009cc593ffa0919d213f0e
-optimization_patch_digest=86fa46aea5ddc1af996ec876a7de6b17283626d6b7b4977986a4be767ead49e7
+candidate=8dd7fd238fbbb4bd195f2083650174339946d50a
+optimization_patch_digest=ba9e4d01f2d6b665d77e19cd973fdfd9e7f5c84f8ebec9de4f7ffedf99e207fd
 base_sources=dbdaed8acd534ea691215f839b6e57a4504c333a
 prior_sources=e89a325d40b0e0cd334cb0ffbf9c428dc9b2e6e2
-candidate_sources=1e66c92437837b795e52b03c477437f12a07425a
+candidate_sources=e8bfbe73d97942739a3de11033202fcb5f5b437a
 patch_digest=5c26ee2f33344a2554faa9f905df4c9eed999d142b2fe5d3ae4745e9a9096024
 lock_digest=b591abc67a0576311e15869bc841db99743f9f0398b6a8828e78984a86079fd2
 core_revision=a2c411b7b83ca233881ace0c5bf3bec0b9646e1d
@@ -26,7 +27,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 test "$(git rev-parse HEAD)" = "${GITHUB_SHA:?}"
 test "$(git show -s --format=%P HEAD)" = "$diagnostic_parent"
-test "$(git show -s --format=%P "$diagnostic_parent")" = "$base"
+test "$(git show -s --format=%P "$diagnostic_parent")" = "$initial_diagnostic"
+test "$(git show -s --format=%P "$initial_diagnostic")" = "$base"
 test "$(uname -s)/$(uname -m)" = 'Darwin/arm64'
 test "${RUNNER_OS:?}/${RUNNER_ARCH:?}" = 'macOS/ARM64'
 test "${DEVELOPER_DIR:?}" = '/Applications/Xcode_26.6.app/Contents/Developer'
