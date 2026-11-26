@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
-phase=${1:?Expected test, performance, allocation-stacks or allocation-attribution}
-case "$phase" in test|performance|allocation-stacks|allocation-attribution) ;; *) exit 2 ;; esac
+phase=${1:?Expected a native diagnostic phase}
+case "$phase" in test|performance|allocation-stacks|allocation-attribution|r-residual) ;; *) exit 2 ;; esac
 cd "${GITHUB_WORKSPACE:?}"
 repo=$(pwd -P)
 base=d6578969bcef258141c7c99cb6cface30a22a0e2
-diagnostic_parent=3018b942b4c477b10c424072695d7278b739aafa
+diagnostic_parent=2745c87626cfb3f0d05060f5a2c278ad27f4c930
+av_parent=3018b942b4c477b10c424072695d7278b739aafa
 attribution_parent=6db74f84ef60aa2ea4046ef7a6e76f73097b4263
 performance_parent=6f7f917eeae867a7e3ba54d514504e3e5d41f731
 stacks_parent=d7869d4c2a4e6737d863322596b42589186bd118
@@ -36,7 +37,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 test "$(git rev-parse HEAD)" = "${GITHUB_SHA:?}"
 test "$(git show -s --format=%P HEAD)" = "$diagnostic_parent"
-test "$(git show -s --format=%P "$diagnostic_parent")" = "$attribution_parent"
+test "$(git show -s --format=%P "$diagnostic_parent")" = "$av_parent"
+test "$(git show -s --format=%P "$av_parent")" = "$attribution_parent"
 test "$(git show -s --format=%P "$attribution_parent")" = "$performance_parent"
 test "$(git show -s --format=%P "$performance_parent")" = "$stacks_parent"
 test "$(git show -s --format=%P "$stacks_parent")" = "$allocation_parent"
@@ -86,7 +88,14 @@ test "$(git -C "$sdk" rev-parse "$prior:Sources/LuxoClient")" = "$prior_sources"
 git -C "$sdk" apply --index --whitespace=error-all "$work/optimization.patch"
 test "$(git -C "$sdk" write-tree)" = "$attributed_candidate"
 test "$(git -C "$sdk" rev-parse "$attributed_candidate:Sources/LuxoClient")" = "$attributed_sources"
-git -C "$sdk" apply --index --whitespace=error-all "$work/void-operation.patch"
+void_applied=false
+if [ "$phase" = r-residual ]; then
+    candidate=$attributed_candidate
+    candidate_sources=$attributed_sources
+else
+    git -C "$sdk" apply --index --whitespace=error-all "$work/void-operation.patch"
+    void_applied=true
+fi
 check_tree() {
     test "$(git -C "$sdk" rev-parse HEAD)" = "$base"
     test "$(git -C "$sdk" write-tree)" = "$candidate"
@@ -100,8 +109,8 @@ printf 'diagnosticHead=%s\nbase=%s\ncandidateTree=%s\nbaseSourceTree=%s\ncandida
     "$GITHUB_SHA" "$base" "$candidate" "$base_sources" "$candidate_sources" "$patch_digest" "$lock_digest" > "$out/source.txt"
 git -C "$sdk" diff --cached --name-status > "$out/changed-paths.txt"
 git -C "$sdk" diff --name-status "$attributed_candidate" "$candidate" > "$out/changed-paths-from-r.txt"
-printf 'attributedCandidateTree=%s\nattributedCandidateSourceTree=%s\nvoidOperationPatchSHA256=%s\n' \
-    "$attributed_candidate" "$attributed_sources" "$void_patch_digest" >> "$out/source.txt"
+printf 'attributedCandidateTree=%s\nattributedCandidateSourceTree=%s\nvoidOperationPatchSHA256=%s\nvoidOperationApplied=%s\n' \
+    "$attributed_candidate" "$attributed_sources" "$void_patch_digest" "$void_applied" >> "$out/source.txt"
 printf 'diagnosticParent=%s\npriorCandidateTree=%s\npriorCandidateSourceTree=%s\ncomparisonBaseTree=%s\ncomparisonBaseSourceTree=%s\noptimizationPatchSHA256=%s\n' \
     "$diagnostic_parent" "$prior" "$prior_sources" "$base" "$base_sources" "$optimization_patch_digest" >> "$out/source.txt"
 cp "$input/inputs.sha256" "$input/pins.json" "$out/"
@@ -173,7 +182,17 @@ else
     python3 measure.py smoke 2>&1 | tee "$out/smoke.log" || status=$?
     if [ -f smoke.json ]; then cp smoke.json "$out/"; fi
     test "$status" = 0
-    if [ "$phase" = allocation-attribution ]; then
+    if [ "$phase" = r-residual ]; then
+        cp "$input"/{allocation-attribution.py,qualify-r-residual.py} "$perf/"
+        for residual_phase in timing allocation; do
+            python3 qualify-r-residual.py "$residual_phase" 2>&1 |
+                tee "$out/r-residual-$residual_phase.log" || status=$?
+            for file in "r-residual-$residual_phase.json" "r-residual-$residual_phase.partial.jsonl" r-residual-raw; do
+                if [ -e "$file" ]; then mv "$file" "$out/"; fi
+            done
+            test "$status" = 0
+        done
+    elif [ "$phase" = allocation-attribution ]; then
         cp "$input/allocation-attribution.py" "$perf/"
         python3 allocation-attribution.py 2>&1 | tee "$out/allocation-attribution.log" || status=$?
         for file in allocation-attribution.json allocation-attribution.partial.jsonl allocation-attribution-raw; do
