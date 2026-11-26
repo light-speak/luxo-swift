@@ -1,0 +1,40 @@
+name: Native HTTP backend Thread Sanitizer diagnosis
+
+on:
+  push:
+    branches: [diagnostics/http-refresh-reentry-tsan]
+
+permissions:
+  contents: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
+jobs:
+  sanitize:
+    name: HTTPBackendTests TSan / ${{ matrix.arm }}
+    runs-on: macos-26
+    timeout-minutes: 24
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [A, Q]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 5
+          persist-credentials: false
+
+      - name: Run exact sanitized suite with bounded test progress logging
+        env:
+          ARM: ${{ matrix.arm }}
+        run: python3 -I -B .github/diagnostics/http-refresh-reentry/tsan-only.py "$ARM"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: swift-http-tsan-${{ matrix.arm }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/http-refresh-tsan-${{ matrix.arm }}/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
