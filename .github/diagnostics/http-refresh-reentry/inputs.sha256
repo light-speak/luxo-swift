@@ -15,3 +15,4 @@ ec24cbfc53a1a1820fa5b4f5354e7f98555650c54e72c06babfafad0050fa136  qualify-r-hot-
 dbf85262535775d42bbc6f12f4b17d066388a1c72600e2ccf83fa37f4a8c76c0  qualify-s-allocations.py
 65057f2d039083504d348e2e9fce3b4f6937fee3afd9f5224f0508c3dbde85bf  qualify-r-s-cold-stacks.py
 5e5c005f8a44aad71802c6fd3bc04ff0921953bf37cf108460476bde754f68a5  qualify-s-cold-attribution.py
+cc3549b2626c88603b9bc26501c08ad062fb980612cbd5f64b0cd957e1ae4bc9  qualify-s-parallel-followup.py

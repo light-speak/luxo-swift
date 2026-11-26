@@ -1,4 +1,4 @@
-name: Native Swift #11 S cold allocation attribution
+name: Native Swift #11 parallel refresh Binary follow-up
 
 on:
   push:
@@ -16,13 +16,13 @@ env:
 
 jobs:
   qualify:
-    name: Apple / exact S cold allocations
+    name: Apple / exact parallel Binary and probe isolation
     runs-on: macos-26
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 16
+          fetch-depth: 18
           persist-credentials: false
 
       - uses: actions/checkout@v7
@@ -32,13 +32,13 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
 
-      - name: Attribute exact S refresh allocations
-        run: bash .github/diagnostics/http-refresh-reentry/run.sh s-cold-attribution
+      - name: Replay the exact Binary leaf and isolate probe WMO
+        run: bash .github/diagnostics/http-refresh-reentry/run.sh s-parallel-followup
 
       - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: swift-http-refresh-reentry-s-cold-attribution-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swift-http-refresh-reentry-s-parallel-followup-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/refresh-reentry-evidence
           if-no-files-found: error
           include-hidden-files: true

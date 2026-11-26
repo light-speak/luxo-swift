@@ -2,13 +2,14 @@
 set -euo pipefail
 umask 077
 phase=${1:?Expected a native diagnostic phase}
-case "$phase" in test|performance|allocation-stacks|allocation-attribution|r-residual|r-hot-placement|r-hot-alignment|r-s-cold-stacks|s-performance|s-cold-attribution) ;; *) exit 2 ;; esac
+case "$phase" in test|performance|allocation-stacks|allocation-attribution|r-residual|r-hot-placement|r-hot-alignment|r-s-cold-stacks|s-performance|s-cold-attribution|s-parallel-followup) ;; *) exit 2 ;; esac
 exact_s=false
-case "$phase" in s-performance|s-cold-attribution) exact_s=true ;; esac
+case "$phase" in s-performance|s-cold-attribution|s-parallel-followup) exact_s=true ;; esac
 cd "${GITHUB_WORKSPACE:?}"
 repo=$(pwd -P)
 base=d6578969bcef258141c7c99cb6cface30a22a0e2
 diagnostic_parent=18c26f7bc4b7ffe892ba4d98c425d6014d9d7d0e
+parallel_parent=c016d637536bc43bb3aef10c259c760d03ee9349
 s_performance_parent=cd5a269858e88104e999c379c74a6e38c73814d6
 cold_stacks_parent=c78264f5306cdcd757a29bd1e1ac0d5dddff6754
 alignment_parent=7ae6f660bc38efd47c89615602644418c64bedbe
@@ -43,7 +44,12 @@ trap 'rm -rf -- "$work"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 test "$(git rev-parse HEAD)" = "${GITHUB_SHA:?}"
-test "$(git show -s --format=%P HEAD)" = "$diagnostic_parent"
+if [ "$phase" = s-parallel-followup ]; then
+    test "$(git show -s --format=%P HEAD)" = "$parallel_parent"
+    test "$(git show -s --format=%P "$parallel_parent")" = "$diagnostic_parent"
+else
+    test "$(git show -s --format=%P HEAD)" = "$diagnostic_parent"
+fi
 test "$(git show -s --format=%P "$diagnostic_parent")" = "$s_performance_parent"
 test "$(git show -s --format=%P "$s_performance_parent")" = "$cold_stacks_parent"
 test "$(git show -s --format=%P "$cold_stacks_parent")" = "$alignment_parent"
@@ -76,6 +82,13 @@ grep -Fx 'Xcode 26.6' "$out/toolchain.txt"
 if { [ "$phase" = r-hot-placement ] || [ "$phase" = r-hot-alignment ] || [ "$phase" = r-s-cold-stacks ] || [ "$exact_s" = true ]; } && ! grep -Fxq 'Apple M1 (Virtual)' "$out/toolchain.txt"; then
     printf '%s\n' 'CPU did not match; no benchmark binaries or samples were produced.' > "$out/status.txt"
     exit 0
+fi
+if [ "$phase" = s-parallel-followup ]; then
+    if [ "$(sw_vers -productVersion)" != 26.7.2 ] || [ "$(sw_vers -buildVersion)" != 25G332 ] ||
+        ! grep -Fxq 'Build version 17F113' "$out/toolchain.txt"; then
+        printf '%s\n' 'OS or Xcode build did not match the prior timing and attribution host.' > "$out/status.txt"
+        exit 0
+    fi
 fi
 (
     cd "$input"
@@ -249,7 +262,8 @@ SWIFT
         next-sources.sha256 toolchain.txt bin/base bin/next > binding.sha256
     cp binding.sha256 base-sources.sha256 next-sources.sha256 "$out/"
     status=0
-    if [ "$phase" != r-hot-placement ] && [ "$phase" != r-hot-alignment ] && [ "$phase" != r-s-cold-stacks ]; then
+    if [ "$phase" != r-hot-placement ] && [ "$phase" != r-hot-alignment ] &&
+        [ "$phase" != r-s-cold-stacks ] && [ "$phase" != s-parallel-followup ]; then
         python3 measure.py smoke 2>&1 | tee "$out/smoke.log" || status=$?
         if [ -f smoke.json ]; then cp smoke.json "$out/"; fi
         test "$status" = 0
@@ -266,6 +280,27 @@ SWIFT
         python3 qualify-s-cold-attribution.py 2>&1 | tee "$out/s-cold-attribution.log" || status=$?
         if [ -d s-cold-attribution ]; then mv s-cold-attribution "$out/"; fi
         test "$status" = 0
+    elif [ "$phase" = s-parallel-followup ]; then
+        cp "$input"/{allocation-attribution.py,qualify-r-hot-placement.py,qualify-s-parallel-followup.py} "$perf/"
+        python3 qualify-s-parallel-followup.py timing "$out" 2>&1 | tee "$out/parallel-timing.log"
+
+        # This second layout is used only to localize the measured allocation.
+        mkdir split split/bin split/base split/next
+        { printf '%s\n' 'import LuxoClient'; cat Probe.swift; } > split/Probe.swift
+        app_flags=("${flags[@]}")
+        app_flags[${#app_flags[@]}-1]=LuxoRefreshProbe
+        for arm in base next; do
+            checkout="$work/base"
+            if [ "$arm" = next ]; then checkout="$s_src"; fi
+            library="$perf/split/$arm"
+            "$swift" "${flags[@]}" -disable-cmo -emit-library -static -emit-module \
+                -emit-module-path "$library/LuxoClient.swiftmodule" \
+                "$checkout"/Sources/LuxoClient/*.swift -o "$library/libLuxoClient.a" \
+                > "$out/build-split-library-$arm.log" 2>&1
+            "$swift" "${app_flags[@]}" -disable-cmo -I "$library" split/Probe.swift "$library/libLuxoClient.a" \
+                -o "split/bin/$arm" > "$out/build-split-probe-$arm.log" 2>&1
+        done
+        python3 qualify-s-parallel-followup.py allocations "$out" 2>&1 | tee "$out/parallel-allocations.log"
     elif [ "$phase" = r-hot-alignment ]; then
         cp "$input"/{qualify-r-hot-placement.py,qualify-r-hot-alignment.py} "$perf/"
         python3 qualify-r-hot-alignment.py 2>&1 | tee "$out/r-hot-alignment.log" || status=$?
