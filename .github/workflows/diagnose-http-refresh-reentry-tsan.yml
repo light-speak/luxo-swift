@@ -1,8 +1,8 @@
-name: Native HTTP backend Thread Sanitizer diagnosis
+name: Native HTTP thread sanitizer with callback-scoped context
 
 on:
   push:
-    branches: [diagnostics/http-refresh-reentry-tsan]
+    branches: [diagnostics/http-refresh-reentry-direct-operation]
 
 permissions:
   contents: read
@@ -18,11 +18,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arm: [A, Q]
+        arm: [R]
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 5
+          fetch-depth: 6
           persist-credentials: false
 
       - name: Run exact sanitized suite with bounded test progress logging

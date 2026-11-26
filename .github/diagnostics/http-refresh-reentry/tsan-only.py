@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 
-PARENT = "611c80754edcdd5413fc7d1a67b4c9d7d6c1626d"
+PARENT = "5b8e3c8e946cd1c9059624a6f1e225f486ed90b3"
 BASE = "d6578969bcef258141c7c99cb6cface30a22a0e2"
 PINS = "b591abc67a0576311e15869bc841db99743f9f0398b6a8828e78984a86079fd2"
 PATCHES = (
@@ -25,10 +25,13 @@ PATCHES = (
     ("optimization.patch", "ba9e4d01f2d6b665d77e19cd973fdfd9e7f5c84f8ebec9de4f7ffedf99e207fd",
      "8dd7fd238fbbb4bd195f2083650174339946d50a"),
 )
+DIRECT_OPERATION = ("direct-operation.patch", "ba174285c5bfc5b3d380d1e94fdc04f3062584106734d9eea4dd7bcf7d5722ca", "168f4f54dfeda7ae37d6a06c0754645ae98c792e")
 ARMS = {
     "A": ("49921cd4b64e1b0fefef5d8440c1496406c3166e", "dbdaed8acd534ea691215f839b6e57a4504c333a", 34,
           "e680ff51fd60a4727aee06314bcc6e75ea902ffafab9f7cb37f2824f5599700c"),
     "Q": ("8dd7fd238fbbb4bd195f2083650174339946d50a", "e8bfbe73d97942739a3de11033202fcb5f5b437a", 37,
+          "7bb72634c1c646bbb6601376807ad0c92e0ca53b32f64e780f475274454098bb"),
+    "R": ("168f4f54dfeda7ae37d6a06c0754645ae98c792e", "bc45cfd3ea3c107c494fb3a76a9274e1a8324318", 37,
           "7bb72634c1c646bbb6601376807ad0c92e0ca53b32f64e780f475274454098bb"),
 }
 TEST_SOURCE = "Tests/LuxoClientTests/HTTPBackendTests.swift"
@@ -69,8 +72,9 @@ def prepare(repo, input_dir, work, arm):
     sdk = work / "sdk"
     subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(repo), str(sdk)], check=True)
     git(sdk, "switch", "-q", "--detach", BASE)
-    if arm == "Q":
-        for name, digest_pin, tree in PATCHES:
+    if arm != "A":
+        patches = (*PATCHES, DIRECT_OPERATION) if arm == "R" else PATCHES
+        for name, digest_pin, tree in patches:
             raw = base64.b64decode(b"".join((input_dir / (name + ".base64")).read_bytes().splitlines()), validate=True)
             assert sha256(raw).hexdigest() == digest_pin, name
             patch = work / name
