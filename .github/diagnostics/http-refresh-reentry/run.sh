@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
-phase=${1:?Expected test, performance or allocation-stacks}
-case "$phase" in test|performance|allocation-stacks) ;; *) exit 2 ;; esac
+phase=${1:?Expected test, performance, allocation-stacks or allocation-attribution}
+case "$phase" in test|performance|allocation-stacks|allocation-attribution) ;; *) exit 2 ;; esac
 cd "${GITHUB_WORKSPACE:?}"
 repo=$(pwd -P)
 base=d6578969bcef258141c7c99cb6cface30a22a0e2
-diagnostic_parent=6f7f917eeae867a7e3ba54d514504e3e5d41f731
+diagnostic_parent=6db74f84ef60aa2ea4046ef7a6e76f73097b4263
+performance_parent=6f7f917eeae867a7e3ba54d514504e3e5d41f731
 stacks_parent=d7869d4c2a4e6737d863322596b42589186bd118
 allocation_parent=c42a1abda08d57ad58daaed502ec6ddaad3f36a1
 direct_parent=611c80754edcdd5413fc7d1a67b4c9d7d6c1626d
@@ -31,7 +32,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 test "$(git rev-parse HEAD)" = "${GITHUB_SHA:?}"
 test "$(git show -s --format=%P HEAD)" = "$diagnostic_parent"
-test "$(git show -s --format=%P "$diagnostic_parent")" = "$stacks_parent"
+test "$(git show -s --format=%P "$diagnostic_parent")" = "$performance_parent"
+test "$(git show -s --format=%P "$performance_parent")" = "$stacks_parent"
 test "$(git show -s --format=%P "$stacks_parent")" = "$allocation_parent"
 test "$(git show -s --format=%P "$allocation_parent")" = "$direct_parent"
 test "$(git show -s --format=%P "$direct_parent")" = "$pq_initial"
@@ -160,7 +162,14 @@ else
     python3 measure.py smoke 2>&1 | tee "$out/smoke.log" || status=$?
     if [ -f smoke.json ]; then cp smoke.json "$out/"; fi
     test "$status" = 0
-    if [ "$phase" = allocation-stacks ]; then
+    if [ "$phase" = allocation-attribution ]; then
+        cp "$input/allocation-attribution.py" "$perf/"
+        python3 allocation-attribution.py 2>&1 | tee "$out/allocation-attribution.log" || status=$?
+        for file in allocation-attribution.json allocation-attribution.partial.jsonl allocation-attribution-raw; do
+            if [ -e "$file" ]; then mv "$file" "$out/"; fi
+        done
+        test "$status" = 0
+    elif [ "$phase" = allocation-stacks ]; then
         cp "$input/allocation-stacks.py" "$perf/"
         python3 allocation-stacks.py 2>&1 | tee "$out/allocation-stacks.log" || status=$?
         for file in allocation-stacks.json allocation-stacks.partial.jsonl; do
