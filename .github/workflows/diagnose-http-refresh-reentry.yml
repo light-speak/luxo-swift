@@ -2,13 +2,13 @@ name: Native HTTP refresh allocation stack attribution
 
 on:
   push:
-    branches: [diagnostics/http-refresh-reentry-aq-stacks]
+    branches: [diagnostics/http-refresh-reentry-ar-stacks]
 
 permissions:
   contents: read
 
 concurrency:
-  group: http-refresh-reentry-aq-stacks-${{ github.ref }}
+  group: http-refresh-reentry-ar-stacks-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 6
+          fetch-depth: 7
           persist-credentials: false
 
       - name: Compare the pinned upstream SDK and exact candidate
@@ -31,7 +31,7 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: swift-http-refresh-reentry-aq-stacks-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swift-http-refresh-reentry-ar-stacks-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/refresh-reentry-evidence
           if-no-files-found: error
           include-hidden-files: true
