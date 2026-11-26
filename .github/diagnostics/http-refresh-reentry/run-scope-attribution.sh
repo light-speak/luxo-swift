@@ -3,7 +3,11 @@ set -euo pipefail
 umask 077
 input=$(cd "$(dirname "$0")" && pwd -P)
 repo=$(cd "$input/../../.." && pwd -P)
-parent=eb87139514e817df579c9b34dcd75422e09f0412
+parent=7c967646035cad007d36226d4cce1c16cc346f95
+a=d6578969bcef258141c7c99cb6cface30a22a0e2
+a_tree=49921cd4b64e1b0fefef5d8440c1496406c3166e
+a_client=dbdaed8acd534ea691215f839b6e57a4504c333a
+a_manifest=a62dfb5670bc942eb82e9bf9db26a0befa819d3c44a7e044b1d02c80a43f4739
 s=2a8108bbe2692c349069d71b2f5eb2f9a501c171
 s_tree=e86fd9264f0d875ca10967a4b56124c8dbc18e79
 s_client=a76077acde23e0da5936e20c3b20acbd6024ae50
@@ -18,9 +22,10 @@ minus_manifest=5239e6b2f2a32a672a43e790bfad63b8b3a1a7a9711e28aff0d6a1b56d47b8e1
 sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 
 if [[ "${1:-}" == --verify ]]; then
-    test "$#" = 2
+    test "$#" = 3
     verify_only=true
     product=$(cd "$2" && pwd -P)
+    baseline=$(cd "$3" && pwd -P)
     cd "$repo"
     test "$(git rev-parse HEAD)" = "$parent"
 else
@@ -28,6 +33,7 @@ else
     verify_only=false
     cd "$repo"
     product="$repo/.tmp/s-product"
+    baseline="$repo/.tmp/a-product"
     out="$repo/.tmp/refresh-reentry-evidence"
     mkdir "$out"
     test "${GITHUB_EVENT_NAME:?}/${GITHUB_REPOSITORY:?}/${GITHUB_REF:?}" = \
@@ -37,10 +43,10 @@ else
     test "$(git --no-replace-objects show -s --format=%P HEAD)" = "$parent"
     git --no-replace-objects diff --name-status "$parent" HEAD > "$out/diagnostic-paths.txt"
     diff -u "$out/diagnostic-paths.txt" - <<'PATHS'
-A	.github/diagnostics/http-refresh-reentry/hosted-s-sources.sha256
-A	.github/diagnostics/http-refresh-reentry/minus-scope.patch.base64
-A	.github/diagnostics/http-refresh-reentry/qualify-scope.py
-A	.github/diagnostics/http-refresh-reentry/run-scope-attribution.sh
+M	.github/diagnostics/http-refresh-reentry/inputs.sha256
+M	.github/diagnostics/http-refresh-reentry/qualify-s-cold-attribution.py
+M	.github/diagnostics/http-refresh-reentry/qualify-scope.py
+M	.github/diagnostics/http-refresh-reentry/run-scope-attribution.sh
 M	.github/workflows/diagnose-http-refresh-reentry.yml
 PATHS
     test "${DEVELOPER_DIR:?}" = '/Applications/Xcode_26.6.app/Contents/Developer'
@@ -77,6 +83,9 @@ test "$(git --no-replace-objects -C "$product" rev-parse --show-toplevel)" = "$p
 test "$(git --no-replace-objects -C "$product" rev-parse HEAD 'HEAD^{tree}')" = "$s"$'\n'"$s_tree"
 test "$(git --no-replace-objects -C "$product" rev-parse "$s:Sources/LuxoClient" "$s:$transport")" = "$s_client"$'\n'"$s_blob"
 test -z "$(git --no-replace-objects -C "$product" status --porcelain)"
+test "$(git --no-replace-objects -C "$baseline" rev-parse --show-toplevel HEAD 'HEAD^{tree}' HEAD:Sources/LuxoClient)" = \
+    "$baseline"$'\n'"$a"$'\n'"$a_tree"$'\n'"$a_client"
+test -z "$(git --no-replace-objects -C "$baseline" status --porcelain)"
 (cd "$input" && shasum -a 256 -c inputs.sha256)
 test "$(sha256 "$input/hosted-s-sources.sha256")" = "$s_manifest"
 python3 -I -B - "$input/minus-scope.patch.base64" "$work/ablation.patch" <<'PY'
@@ -99,19 +108,23 @@ test "$(git -C "$sdk" rev-parse "$minus_tree:Sources/LuxoClient" ":$transport")"
 git -C "$sdk" diff --quiet
 git -C "$sdk" apply --index --reverse --check "$work/ablation.patch"
 
-mkdir "$work/source-s" "$work/source-minus"
+mkdir "$work/source-base" "$work/source-s" "$work/source-minus"
+git --no-replace-objects -C "$baseline" archive "$a" Sources/LuxoClient | tar -xf - -C "$work/source-base"
 git -C "$sdk" archive "$s" Sources/LuxoClient | tar -xf - -C "$work/source-s"
 git -C "$sdk" archive "$minus_tree" Sources/LuxoClient | tar -xf - -C "$work/source-minus"
 ordered=()
 while read -r hash name; do ordered+=("$name"); done < "$input/hosted-s-sources.sha256"
 test "${#ordered[@]}" = 29
-for arm in source-s source-minus; do
+for arm in source-base source-s source-minus; do
     (cd "$work/$arm" && shasum -a 256 "${ordered[@]}") > "$out/$arm.sha256"
 done
+test "$(sha256 "$out/source-base.sha256")" = "$a_manifest"
 test "$(sha256 "$out/source-s.sha256")" = "$s_manifest"
 test "$(sha256 "$out/source-minus.sha256")" = "$minus_manifest"
 printf 'productCommit=%s\nA_intactTree=%s\nS_ablatedTree=%s\npatchSHA256=%s\n' \
     "$s" "$s_tree" "$minus_tree" "$patch_sha" > "$out/source.txt"
+printf 'noRefreshBaseCommit=%s\nnoRefreshBaseTree=%s\nnoRefreshProductTree=%s\n' \
+    "$a" "$a_tree" "$s_tree" >> "$out/source.txt"
 if [[ "$verify_only" == true ]]; then
     cat "$out/source.txt"
     exit 0
@@ -148,5 +161,30 @@ done
 shasum -a 256 Probe.swift measure.py verify-timing.py allocation-helper.py base-sources.sha256 \
     next-sources.sha256 toolchain.txt bin/base bin/next > binding.sha256
 cp binding.sha256 "$out/"
-python3 -I -B qualify-scope.py "$out" 2>&1 | tee "$out/allocations.log"
-printf 'matched=true\nallocation_pairs=36\n' > "$out/status.txt"
+if python3 -I -B qualify-scope.py "$out" 2>&1 | tee "$out/allocations.log"; then
+    scope_status=0
+else
+    scope_status=$?
+fi
+printf 'matched=true\nscope_status=%s\n' "$scope_status" > "$out/status.txt"
+if [[ -f "$out/scope-count.txt" ]]; then
+    cat "$out/scope-count.txt" >> "$out/status.txt"
+fi
+
+normal="$work/no-refresh"
+mkdir -p "$normal/bin" "$out/no-refresh"
+cp "$input/"{qualify-s-cold-attribution.py,qualify-r-s-cold-stacks.py} "$normal/"
+cp "$perf/"{Probe.swift,measure.py,verify-timing.py,allocation-helper.py,allocation-attribution.py,qualify-r-hot-placement.py,toolchain.txt} "$normal/"
+cp "$perf/bin/base" "$normal/bin/next"
+cp "$out/source-base.sha256" "$normal/base-sources.sha256"
+cp "$out/source-s.sha256" "$normal/next-sources.sha256"
+files=()
+for name in "${ordered[@]}"; do files+=("$work/source-base/$name"); done
+cd "$normal"
+"$swift" "${flags[@]}" "${files[@]}" "$normal/Probe.swift" -o bin/base > "$out/no-refresh/build-base.log" 2>&1
+shasum -a 256 Probe.swift measure.py verify-timing.py allocation-helper.py base-sources.sha256 \
+    next-sources.sha256 toolchain.txt bin/base bin/next > binding.sha256
+cp binding.sha256 "$out/no-refresh/"
+python3 -I -B qualify-s-cold-attribution.py --normal-off "$out/no-refresh" 2>&1 | tee "$out/no-refresh/allocations.log"
+cat "$out/no-refresh/placement-count.txt" >> "$out/status.txt"
+exit "$scope_status"
