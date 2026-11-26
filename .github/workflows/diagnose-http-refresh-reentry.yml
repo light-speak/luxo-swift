@@ -1,4 +1,4 @@
-name: Attribute Swift #11 refresh and success-path allocations
+name: Attribute the Swift #11 expiry JSON allocation window
 
 on:
   push:
@@ -18,7 +18,7 @@ jobs:
   qualify:
     name: Apple / matched refresh scope comparison
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
@@ -39,15 +39,15 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Trace the three refresh fixtures and the no-refresh JSON placements
+      - name: Trace the real expiry JSON fixture in both executable placements
         env:
           RUNNER_KIND: ${{ runner.environment }}
-        run: bash .github/diagnostics/http-refresh-reentry/run-scope-attribution.sh
+        run: bash .github/diagnostics/http-refresh-reentry/run-scope-attribution.sh --expiry-json
 
       - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: swift-http-refresh-reentry-scope-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swift-http-refresh-expiry-window-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/refresh-reentry-evidence
           if-no-files-found: error
           include-hidden-files: true

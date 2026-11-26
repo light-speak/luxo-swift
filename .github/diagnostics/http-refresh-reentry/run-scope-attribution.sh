@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 input=$(cd "$(dirname "$0")" && pwd -P)
 repo=$(cd "$input/../../.." && pwd -P)
-parent=7c967646035cad007d36226d4cce1c16cc346f95
+parent=a708313111e2dd60c97c2b1ccefd9d8f2b8d3b58
 a=d6578969bcef258141c7c99cb6cface30a22a0e2
 a_tree=49921cd4b64e1b0fefef5d8440c1496406c3166e
 a_client=dbdaed8acd534ea691215f839b6e57a4504c333a
@@ -21,7 +21,8 @@ s_manifest=d7d481636279149af83d6c04e7450e0d2297f53fdc5e333e273fd14d722bb311
 minus_manifest=5239e6b2f2a32a672a43e790bfad63b8b3a1a7a9711e28aff0d6a1b56d47b8e1
 sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 
-if [[ "${1:-}" == --verify ]]; then
+mode="${1:-}"
+if [[ "$mode" == --verify ]]; then
     test "$#" = 3
     verify_only=true
     product=$(cd "$2" && pwd -P)
@@ -29,7 +30,7 @@ if [[ "${1:-}" == --verify ]]; then
     cd "$repo"
     test "$(git rev-parse HEAD)" = "$parent"
 else
-    test "$#" = 0
+    test "$#" = 0 || { test "$#" = 1 && test "$mode" = --expiry-json; }
     verify_only=false
     cd "$repo"
     product="$repo/.tmp/s-product"
@@ -45,7 +46,6 @@ else
     diff -u "$out/diagnostic-paths.txt" - <<'PATHS'
 M	.github/diagnostics/http-refresh-reentry/inputs.sha256
 M	.github/diagnostics/http-refresh-reentry/qualify-s-cold-attribution.py
-M	.github/diagnostics/http-refresh-reentry/qualify-scope.py
 M	.github/diagnostics/http-refresh-reentry/run-scope-attribution.sh
 M	.github/workflows/diagnose-http-refresh-reentry.yml
 PATHS
@@ -133,14 +133,50 @@ fi
 perf="$work/performance"
 mkdir -p "$perf/bin" "$perf/split/bin" "$perf/split/base" "$perf/split/next" "$work/module-cache" "$work/tmp"
 export TMPDIR="$work/tmp"
-cp "$input/"{Probe.swift,measure.py,verify-timing.py,allocation-helper.py,allocation-attribution.py,qualify-r-hot-placement.py,qualify-s-parallel-followup.py,qualify-scope.py} "$perf/"
-cp "$out/toolchain.txt" "$perf/"
-cp "$out/source-s.sha256" "$perf/base-sources.sha256"
-cp "$out/source-minus.sha256" "$perf/next-sources.sha256"
 swift=$(xcrun --find swiftc)
 sdk_path=$(xcrun --sdk macosx --show-sdk-path)
 flags=(-sdk "$sdk_path" -swift-version 6 -j 2 -module-cache-path "$work/module-cache" -target arm64-apple-macosx13.0
        -parse-as-library -O -whole-module-optimization -g -module-name LuxoClient)
+
+compare_actual_product() (
+    local scenario="$1" destination="$out/$1" existing_s="$2"
+    local stock="$work/$1"
+    mkdir -p "$stock/bin" "$destination"
+    cp "$input/"{Probe.swift,measure.py,verify-timing.py,allocation-helper.py,allocation-attribution.py,qualify-r-hot-placement.py,qualify-s-cold-attribution.py,qualify-r-s-cold-stacks.py} "$stock/"
+    cp "$out/toolchain.txt" "$stock/"
+    cp "$out/source-base.sha256" "$stock/base-sources.sha256"
+    cp "$out/source-s.sha256" "$stock/next-sources.sha256"
+    cd "$stock"
+    for arm in base next; do
+        arm_source="$work/source-base"
+        if [[ "$arm" == next ]]; then
+            if [[ -n "$existing_s" ]]; then
+                cp "$existing_s" bin/next
+                continue
+            fi
+            arm_source="$work/source-s"
+        fi
+        files=()
+        for name in "${ordered[@]}"; do files+=("$arm_source/$name"); done
+        "$swift" "${flags[@]}" "${files[@]}" "$stock/Probe.swift" -o "bin/$arm" > "$destination/build-$arm.log" 2>&1
+    done
+    shasum -a 256 Probe.swift measure.py verify-timing.py allocation-helper.py base-sources.sha256 \
+        next-sources.sha256 toolchain.txt bin/base bin/next > binding.sha256
+    cp binding.sha256 "$destination/"
+    python3 -I -B qualify-s-cold-attribution.py "--$scenario" "$destination" 2>&1 | tee "$destination/allocations.log"
+    cat "$destination/placement-count.txt" >> "$out/status.txt"
+)
+
+if [[ "$mode" == --expiry-json ]]; then
+    printf 'matched=true\n' > "$out/status.txt"
+    compare_actual_product expiry-json ""
+    exit 0
+fi
+
+cp "$input/"{Probe.swift,measure.py,verify-timing.py,allocation-helper.py,allocation-attribution.py,qualify-r-hot-placement.py,qualify-s-parallel-followup.py,qualify-scope.py} "$perf/"
+cp "$out/toolchain.txt" "$perf/"
+cp "$out/source-s.sha256" "$perf/base-sources.sha256"
+cp "$out/source-minus.sha256" "$perf/next-sources.sha256"
 app_flags=("${flags[@]}")
 app_flags[${#app_flags[@]}-1]=LuxoRefreshProbe
 cd "$perf"
@@ -171,20 +207,5 @@ if [[ -f "$out/scope-count.txt" ]]; then
     cat "$out/scope-count.txt" >> "$out/status.txt"
 fi
 
-normal="$work/no-refresh"
-mkdir -p "$normal/bin" "$out/no-refresh"
-cp "$input/"{qualify-s-cold-attribution.py,qualify-r-s-cold-stacks.py} "$normal/"
-cp "$perf/"{Probe.swift,measure.py,verify-timing.py,allocation-helper.py,allocation-attribution.py,qualify-r-hot-placement.py,toolchain.txt} "$normal/"
-cp "$perf/bin/base" "$normal/bin/next"
-cp "$out/source-base.sha256" "$normal/base-sources.sha256"
-cp "$out/source-s.sha256" "$normal/next-sources.sha256"
-files=()
-for name in "${ordered[@]}"; do files+=("$work/source-base/$name"); done
-cd "$normal"
-"$swift" "${flags[@]}" "${files[@]}" "$normal/Probe.swift" -o bin/base > "$out/no-refresh/build-base.log" 2>&1
-shasum -a 256 Probe.swift measure.py verify-timing.py allocation-helper.py base-sources.sha256 \
-    next-sources.sha256 toolchain.txt bin/base bin/next > binding.sha256
-cp binding.sha256 "$out/no-refresh/"
-python3 -I -B qualify-s-cold-attribution.py --normal-off "$out/no-refresh" 2>&1 | tee "$out/no-refresh/allocations.log"
-cat "$out/no-refresh/placement-count.txt" >> "$out/status.txt"
+compare_actual_product normal-off "$perf/bin/base"
 exit "$scope_status"

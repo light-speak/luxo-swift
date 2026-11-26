@@ -19,6 +19,10 @@ WORKLOADS = {
 }
 COMPARISONS = ("AA", "SS", "AS")
 PLACEMENT_COMPARISONS = (*COMPARISONS, "SA")
+PLACEMENT_WORKLOADS = {
+    "--normal-off": ("normal-off", "json"),
+    "--expiry-json": ("expiry", "json"),
+}
 STOCK = (("A", "base"), ("S", "next"))
 PRIOR = {
     "qualification": "45866208304",
@@ -119,8 +123,8 @@ def collect(tools, images, scratch, out, workloads=WORKLOADS, comparisons=COMPAR
 
 
 def main():
-    placement_only = len(sys.argv) == 3 and sys.argv[1] == "--normal-off"
-    assert placement_only or len(sys.argv) == 1
+    placement_workload = PLACEMENT_WORKLOADS.get(sys.argv[1]) if len(sys.argv) == 3 else None
+    assert placement_workload or len(sys.argv) == 1
     tools = tuple(runpy.run_path(str(ROOT / file)) for file in (
         "measure.py", "allocation-helper.py", "allocation-attribution.py",
         "qualify-r-hot-placement.py", "qualify-r-s-cold-stacks.py"))
@@ -129,8 +133,8 @@ def main():
     images = {"A": bindings["bin/base"], "S": bindings["bin/next"]}
     assert images["A"] != images["S"]
     runtime = placement["runtime"]()
-    out = Path(sys.argv[2]).resolve(strict=True) if placement_only else ROOT / "s-cold-attribution"
-    if placement_only:
+    out = Path(sys.argv[2]).resolve(strict=True) if placement_workload else ROOT / "s-cold-attribution"
+    if placement_workload:
         assert all(bindings[name] == digest for name, digest in {
             "base-sources.sha256": "a62dfb5670bc942eb82e9bf9db26a0befa819d3c44a7e044b1d02c80a43f4739",
             "next-sources.sha256": "d7d481636279149af83d6c04e7450e0d2297f53fdc5e333e273fd14d722bb311",
@@ -141,9 +145,9 @@ def main():
         out.mkdir()
     (out / "runtime-before.json").write_text(json.dumps(runtime, indent=2) + "\n")
     with TemporaryDirectory(prefix="s-cold-attribution.", dir=ROOT) as scratch:
-        if placement_only:
+        if placement_workload:
             rows, sites = collect(tools, images, Path(scratch), out,
-                                  {("normal-off", "json"): 160}, PLACEMENT_COMPARISONS)
+                                  {placement_workload: WORKLOADS[placement_workload]}, PLACEMENT_COMPARISONS)
         else:
             rows, sites = collect(tools, images, Path(scratch), out)
     after = placement["runtime"]()
@@ -158,13 +162,21 @@ def main():
                   sites=sites, samples=rows, units=["allocations", "requested bytes"],
                   deltasPerOperationOrBatch=attribution["summarize"](rows, sites),
                   fullWindow=measure["summary"](rows, ("allocations", "requested_bytes")))
-    if placement_only:
-        assert not unclassified and all(arm["refreshes"] == 0 for row in rows for arm in (row["left"], row["right"]))
+    if placement_workload == ("normal-off", "json"):
+        assert all(arm["refreshes"] == 0 for row in rows for arm in (row["left"], row["right"]))
         result["dispatchWorker4096"] = dispatch_worker_deltas(rows, sites)
+    elif placement_workload == ("expiry", "json"):
+        expected = (24, 72, 144, 24)
+        for row in rows:
+            for arm in (row["left"], row["right"]):
+                assert tuple(arm[field] for field in measure["COUNTS"]) == expected
+        result["runtimePages4096"] = runtime_page_deltas(rows, sites)
     (out / "allocations.json").write_text(json.dumps(result, separators=(",", ":")) + "\n")
-    if placement_only:
+    if placement_workload:
+        assert not unclassified, unclassified
         assert len(rows) == 24
-        (out / "placement-count.txt").write_text(f"no_refresh_placement_pairs={len(rows)}\n")
+        key = "expiry_json_placement_pairs" if placement_workload[0] == "expiry" else "no_refresh_placement_pairs"
+        (out / "placement-count.txt").write_text(f"{key}={len(rows)}\n")
     print(f"Captured {2 * len(rows)} traced processes, with both same-image controls.")
     if unclassified:
         print("Unclassified direct allocation shapes:", json.dumps(unclassified, sort_keys=True))
@@ -186,6 +198,38 @@ def dispatch_worker_deltas(rows, sites):
         pages = left - right if row["comparison"] == "SA" else right - left
         result.append({key: row[key] for key in ("block", "pair", "order", "comparison")}
                       | dict(pagesLeft=left, pagesRight=right, pagesSigned=pages, bytesSigned=4096 * pages))
+    return result
+
+
+def runtime_page_deltas(rows, sites):
+    classes = {}
+    for key, site in sites.items():
+        frames = "\n".join(site["frames"])
+        if ("AutoreleasePoolPage::autoreleaseNoPage" in frames and
+                "_dispatch_last_resort_autorelease_pool_push" in frames):
+            classes[key] = "dispatchWorker"
+        elif ("AutoreleasePoolPage::autoreleaseFullPage" in frames and
+              "swift::runJobInEstablishedExecutorContext" in frames and "_dispatch_root_queue_drain" in frames):
+            classes[key] = "swiftExecutorFullPage"
+        elif "@ AutoreleasePoolPage::" in frames:
+            classes[key] = "otherAutorelease"
+        elif "NaiveTaskGroupQueue<" in frames and "AccumulatingTaskGroup::offer" in frames:
+            classes[key] = "taskGroupReady"
+    result = []
+    for row in rows:
+        arms = {}
+        for side in ("left", "right"):
+            counts = Counter()
+            for signature, histogram in row[side]["stackCountsBySize"].items():
+                if signature in classes:
+                    counts[classes[signature]] += sum(n for size, n in histogram.items() if int(size) == 4096)
+            arms[side] = counts
+        sign = -1 if row["comparison"] == "SA" else 1
+        names = ("dispatchWorker", "swiftExecutorFullPage", "otherAutorelease", "taskGroupReady")
+        pages = {key: sign * (arms["right"][key] - arms["left"][key]) for key in names}
+        result.append({key: row[key] for key in ("block", "pair", "order", "comparison")}
+                      | dict(pagesLeft=arms["left"], pagesRight=arms["right"], pagesSigned=pages,
+                             bytesSigned={name: 4096 * n for name, n in pages.items()}))
     return result
 
 
