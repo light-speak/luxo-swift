@@ -1,4 +1,4 @@
-name: Native HTTP refresh follow-up measurements
+name: Native HTTP successful JSON executable-placement comparison
 
 on:
   push:
@@ -16,22 +16,22 @@ env:
 
 jobs:
   qualify:
-    name: Apple / remaining runtime measurements
+    name: Apple / successful JSON placement
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 11
+          fetch-depth: 12
           persist-credentials: false
 
-      - name: Check the remaining timing and allocation paths on the pinned SDK
-        run: bash .github/diagnostics/http-refresh-reentry/run.sh r-residual
+      - name: Compare exact A/R and same-binary placement controls
+        run: bash .github/diagnostics/http-refresh-reentry/run.sh r-hot-placement
 
       - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: swift-http-refresh-reentry-ar-residual-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swift-http-refresh-reentry-ar-hot-placement-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/refresh-reentry-evidence
           if-no-files-found: error
           include-hidden-files: true

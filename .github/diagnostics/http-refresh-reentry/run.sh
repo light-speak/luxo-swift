@@ -2,11 +2,12 @@
 set -euo pipefail
 umask 077
 phase=${1:?Expected a native diagnostic phase}
-case "$phase" in test|performance|allocation-stacks|allocation-attribution|r-residual) ;; *) exit 2 ;; esac
+case "$phase" in test|performance|allocation-stacks|allocation-attribution|r-residual|r-hot-placement) ;; *) exit 2 ;; esac
 cd "${GITHUB_WORKSPACE:?}"
 repo=$(pwd -P)
 base=d6578969bcef258141c7c99cb6cface30a22a0e2
-diagnostic_parent=2745c87626cfb3f0d05060f5a2c278ad27f4c930
+diagnostic_parent=f0e72b136f157e6b9d7ba9b92040b2dfa7c4537a
+residual_parent=2745c87626cfb3f0d05060f5a2c278ad27f4c930
 av_parent=3018b942b4c477b10c424072695d7278b739aafa
 attribution_parent=6db74f84ef60aa2ea4046ef7a6e76f73097b4263
 performance_parent=6f7f917eeae867a7e3ba54d514504e3e5d41f731
@@ -37,7 +38,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 test "$(git rev-parse HEAD)" = "${GITHUB_SHA:?}"
 test "$(git show -s --format=%P HEAD)" = "$diagnostic_parent"
-test "$(git show -s --format=%P "$diagnostic_parent")" = "$av_parent"
+test "$(git show -s --format=%P "$diagnostic_parent")" = "$residual_parent"
+test "$(git show -s --format=%P "$residual_parent")" = "$av_parent"
 test "$(git show -s --format=%P "$av_parent")" = "$attribution_parent"
 test "$(git show -s --format=%P "$attribution_parent")" = "$performance_parent"
 test "$(git show -s --format=%P "$performance_parent")" = "$stacks_parent"
@@ -61,6 +63,10 @@ test "$(sw_vers -productVersion | cut -d. -f1)" = 26
 } > "$out/toolchain.txt"
 grep -Eq '^Apple Swift version 6\.3\.3 ' "$out/toolchain.txt"
 grep -Fx 'Xcode 26.6' "$out/toolchain.txt"
+if [ "$phase" = r-hot-placement ] && ! grep -Fxq 'Apple M1 (Virtual)' "$out/toolchain.txt"; then
+    printf '%s\n' 'CPU did not match; no benchmark binaries or samples were produced.' > "$out/status.txt"
+    exit 0
+fi
 (
     cd "$input"
     shasum -a 256 -c inputs.sha256
@@ -89,7 +95,7 @@ git -C "$sdk" apply --index --whitespace=error-all "$work/optimization.patch"
 test "$(git -C "$sdk" write-tree)" = "$attributed_candidate"
 test "$(git -C "$sdk" rev-parse "$attributed_candidate:Sources/LuxoClient")" = "$attributed_sources"
 void_applied=false
-if [ "$phase" = r-residual ]; then
+if [ "$phase" = r-residual ] || [ "$phase" = r-hot-placement ]; then
     candidate=$attributed_candidate
     candidate_sources=$attributed_sources
 else
@@ -179,10 +185,19 @@ else
         next-sources.sha256 toolchain.txt bin/base bin/next > binding.sha256
     cp binding.sha256 base-sources.sha256 next-sources.sha256 "$out/"
     status=0
-    python3 measure.py smoke 2>&1 | tee "$out/smoke.log" || status=$?
-    if [ -f smoke.json ]; then cp smoke.json "$out/"; fi
-    test "$status" = 0
-    if [ "$phase" = r-residual ]; then
+    if [ "$phase" != r-hot-placement ]; then
+        python3 measure.py smoke 2>&1 | tee "$out/smoke.log" || status=$?
+        if [ -f smoke.json ]; then cp smoke.json "$out/"; fi
+        test "$status" = 0
+    fi
+    if [ "$phase" = r-hot-placement ]; then
+        cp "$input/qualify-r-hot-placement.py" "$perf/"
+        python3 qualify-r-hot-placement.py 2>&1 | tee "$out/r-hot-placement.log" || status=$?
+        for file in r-hot-placement.json r-hot-placement.partial.jsonl r-hot-images; do
+            if [ -e "$file" ]; then mv "$file" "$out/"; fi
+        done
+        test "$status" = 0
+    elif [ "$phase" = r-residual ]; then
         cp "$input"/{allocation-attribution.py,qualify-r-residual.py} "$perf/"
         for residual_phase in timing allocation; do
             python3 qualify-r-residual.py "$residual_phase" 2>&1 |
