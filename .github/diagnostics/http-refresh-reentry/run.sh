@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
-phase=${1:?Expected test or performance}
-case "$phase" in test|performance) ;; *) exit 2 ;; esac
+phase=${1:?Expected test, performance or allocation-stacks}
+case "$phase" in test|performance|allocation-stacks) ;; *) exit 2 ;; esac
 cd "${GITHUB_WORKSPACE:?}"
 repo=$(pwd -P)
 base=d6578969bcef258141c7c99cb6cface30a22a0e2
-diagnostic_parent=611c80754edcdd5413fc7d1a67b4c9d7d6c1626d
+diagnostic_parent=c42a1abda08d57ad58daaed502ec6ddaad3f36a1
+direct_parent=611c80754edcdd5413fc7d1a67b4c9d7d6c1626d
 pq_initial=1a1b3fc090e8dbe06ff309aab7d37d78cd452c22
 initial_diagnostic=35e593a50854cc208ac52f8aad9e5be3f06b9138
 prior=c106719f7f78608173fcbe522f90064552f32b4a
@@ -28,7 +29,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 test "$(git rev-parse HEAD)" = "${GITHUB_SHA:?}"
 test "$(git show -s --format=%P HEAD)" = "$diagnostic_parent"
-test "$(git show -s --format=%P "$diagnostic_parent")" = "$pq_initial"
+test "$(git show -s --format=%P "$diagnostic_parent")" = "$direct_parent"
+test "$(git show -s --format=%P "$direct_parent")" = "$pq_initial"
 test "$(git show -s --format=%P "$pq_initial")" = "$initial_diagnostic"
 test "$(git show -s --format=%P "$initial_diagnostic")" = "$base"
 test "$(uname -s)/$(uname -m)" = 'Darwin/arm64'
@@ -154,15 +156,24 @@ else
     python3 measure.py smoke 2>&1 | tee "$out/smoke.log" || status=$?
     if [ -f smoke.json ]; then cp smoke.json "$out/"; fi
     test "$status" = 0
-    python3 measure.py timing 2>&1 | tee "$out/timing.log" || status=$?
-    for file in timing.json timing.partial.jsonl; do
-        if [ -f "$file" ]; then cp "$file" "$out/"; fi
-    done
-    test "$status" = 0
-    python3 verify-timing.py 2>&1 | tee "$out/timing-verified.log"
-    cp timing-verified.json "$out/"
-    python3 measure.py allocations 2>&1 | tee "$out/allocations.log"
-    cp allocations.json "$out/"
+    if [ "$phase" = allocation-stacks ]; then
+        cp "$input/allocation-stacks.py" "$perf/"
+        python3 allocation-stacks.py 2>&1 | tee "$out/allocation-stacks.log" || status=$?
+        for file in allocation-stacks.json allocation-stacks.partial.jsonl; do
+            if [ -f "$file" ]; then cp "$file" "$out/"; fi
+        done
+        test "$status" = 0
+    else
+        python3 measure.py timing 2>&1 | tee "$out/timing.log" || status=$?
+        for file in timing.json timing.partial.jsonl; do
+            if [ -f "$file" ]; then cp "$file" "$out/"; fi
+        done
+        test "$status" = 0
+        python3 verify-timing.py 2>&1 | tee "$out/timing-verified.log"
+        cp timing-verified.json "$out/"
+        python3 measure.py allocations 2>&1 | tee "$out/allocations.log"
+        cp allocations.json "$out/"
+    fi
 fi
 check_tree
 printf '%s\n' passed > "$out/status.txt"
