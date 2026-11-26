@@ -1,14 +1,14 @@
-name: Native HTTP refresh reentry qualification
+name: Native HTTP refresh task inheritance qualification
 
 on:
   push:
-    branches: [diagnostics/http-refresh-reentry-native]
+    branches: [diagnostics/http-refresh-reentry-pq]
 
 permissions:
   contents: read
 
 concurrency:
-  group: http-refresh-reentry-${{ github.ref }}
+  group: http-refresh-reentry-pq-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
 
       - if: matrix.phase == 'test'
@@ -53,7 +53,7 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: swift-http-refresh-reentry-${{ matrix.phase }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swift-http-refresh-reentry-pq-${{ matrix.phase }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/refresh-reentry-evidence
           if-no-files-found: error
           include-hidden-files: true

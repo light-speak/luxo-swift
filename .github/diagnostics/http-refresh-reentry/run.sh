@@ -6,9 +6,13 @@ case "$phase" in test|performance) ;; *) exit 2 ;; esac
 cd "${GITHUB_WORKSPACE:?}"
 repo=$(pwd -P)
 base=d6578969bcef258141c7c99cb6cface30a22a0e2
-candidate=c106719f7f78608173fcbe522f90064552f32b4a
+diagnostic_parent=35e593a50854cc208ac52f8aad9e5be3f06b9138
+prior=c106719f7f78608173fcbe522f90064552f32b4a
+candidate=99748563e29d030e6e009cc593ffa0919d213f0e
+optimization_patch_digest=86fa46aea5ddc1af996ec876a7de6b17283626d6b7b4977986a4be767ead49e7
 base_sources=dbdaed8acd534ea691215f839b6e57a4504c333a
-candidate_sources=e89a325d40b0e0cd334cb0ffbf9c428dc9b2e6e2
+prior_sources=e89a325d40b0e0cd334cb0ffbf9c428dc9b2e6e2
+candidate_sources=1e66c92437837b795e52b03c477437f12a07425a
 patch_digest=5c26ee2f33344a2554faa9f905df4c9eed999d142b2fe5d3ae4745e9a9096024
 lock_digest=b591abc67a0576311e15869bc841db99743f9f0398b6a8828e78984a86079fd2
 core_revision=a2c411b7b83ca233881ace0c5bf3bec0b9646e1d
@@ -21,7 +25,8 @@ trap 'rm -rf -- "$work"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 test "$(git rev-parse HEAD)" = "${GITHUB_SHA:?}"
-test "$(git show -s --format=%P HEAD)" = "$base"
+test "$(git show -s --format=%P HEAD)" = "$diagnostic_parent"
+test "$(git show -s --format=%P "$diagnostic_parent")" = "$base"
 test "$(uname -s)/$(uname -m)" = 'Darwin/arm64'
 test "${RUNNER_OS:?}/${RUNNER_ARCH:?}" = 'macOS/ARM64'
 test "${DEVELOPER_DIR:?}" = '/Applications/Xcode_26.6.app/Contents/Developer'
@@ -42,19 +47,25 @@ grep -Fx 'Xcode 26.6' "$out/toolchain.txt"
     shasum -a 256 -c inputs.sha256
 )
 sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
-python3 - "$input/candidate.patch.base64" "$work/candidate.patch" <<'PY'
+python3 - "$input" "$work" <<'PY'
 import base64
 from pathlib import Path
 import sys
-data = b"".join(Path(sys.argv[1]).read_bytes().splitlines())
-Path(sys.argv[2]).write_bytes(base64.b64decode(data, validate=True))
+for patch in ("candidate.patch", "optimization.patch"):
+    source = Path(sys.argv[1]) / (patch + ".base64")
+    data = b"".join(source.read_bytes().splitlines())
+    (Path(sys.argv[2]) / patch).write_bytes(base64.b64decode(data, validate=True))
 PY
 test "$(sha256 "$work/candidate.patch")" = "$patch_digest"
+test "$(sha256 "$work/optimization.patch")" = "$optimization_patch_digest"
 test "$(sha256 "$input/pins.json")" = "$lock_digest"
 sdk="$work/sdk"
 git clone -q --shared --no-checkout "$repo" "$sdk"
 git -C "$sdk" switch -q --detach "$base"
 git -C "$sdk" apply --index --whitespace=error-all "$work/candidate.patch"
+test "$(git -C "$sdk" write-tree)" = "$prior"
+test "$(git -C "$sdk" rev-parse "$prior:Sources/LuxoClient")" = "$prior_sources"
+git -C "$sdk" apply --index --whitespace=error-all "$work/optimization.patch"
 check_tree() {
     test "$(git -C "$sdk" rev-parse HEAD)" = "$base"
     test "$(git -C "$sdk" write-tree)" = "$candidate"
@@ -67,6 +78,9 @@ test "$(git -C "$sdk" rev-parse "$candidate:Sources/LuxoClient")" = "$candidate_
 printf 'diagnosticHead=%s\nbase=%s\ncandidateTree=%s\nbaseSourceTree=%s\ncandidateSourceTree=%s\npatchSHA256=%s\nlockSHA256=%s\n' \
     "$GITHUB_SHA" "$base" "$candidate" "$base_sources" "$candidate_sources" "$patch_digest" "$lock_digest" > "$out/source.txt"
 git -C "$sdk" diff --cached --name-status > "$out/changed-paths.txt"
+git -C "$sdk" diff --name-status "$prior" "$candidate" > "$out/changed-paths-from-p.txt"
+printf 'diagnosticParent=%s\npriorCandidateTree=%s\npriorCandidateSourceTree=%s\ncomparisonBaseTree=%s\ncomparisonBaseSourceTree=%s\noptimizationPatchSHA256=%s\n' \
+    "$diagnostic_parent" "$prior" "$prior_sources" "$prior" "$prior_sources" "$optimization_patch_digest" >> "$out/source.txt"
 cp "$input/inputs.sha256" "$input/pins.json" "$out/"
 mkdir "$work/tmp"
 export TMPDIR="$work/tmp"
@@ -119,7 +133,7 @@ else
     flags=(-sdk "$sdk_path" -swift-version 6 -j 2 -module-cache-path "$work/module-cache" -target arm64-apple-macosx13.0
            -parse-as-library -O -whole-module-optimization -g -module-name LuxoClient)
     for arm in base next; do
-        tree=$base
+        tree=$prior
         if [ "$arm" = next ]; then tree=$candidate; fi
         checkout="$work/$arm"
         mkdir "$checkout"
