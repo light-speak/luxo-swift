@@ -1,4 +1,4 @@
-name: Native HTTP three-source cold refresh attribution
+name: Native Swift #11 S release performance
 
 on:
   push:
@@ -16,13 +16,13 @@ env:
 
 jobs:
   qualify:
-    name: Apple / cold refresh allocation attribution
+    name: Apple / exact S performance
     runs-on: macos-26
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 14
+          fetch-depth: 15
           persist-credentials: false
 
       - uses: actions/checkout@v7
@@ -32,13 +32,13 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
 
-      - name: Verify retired owner lifetime and trace the original cold refresh workload
-        run: bash .github/diagnostics/http-refresh-reentry/run.sh r-s-cold-stacks
+      - name: Replay exact S timing and unmeasured allocations
+        run: bash .github/diagnostics/http-refresh-reentry/run.sh s-performance
 
       - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: swift-http-refresh-reentry-ars-cold-stacks-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swift-http-refresh-reentry-s-performance-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/refresh-reentry-evidence
           if-no-files-found: error
           include-hidden-files: true
