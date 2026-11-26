@@ -1,14 +1,14 @@
-name: Native Swift #11 parallel refresh Binary follow-up
+name: Attribute the Swift #11 refresh scope allocation
 
 on:
   push:
-    branches: [diagnostics/http-refresh-reentry-ar]
+    branches: [diagnostics/http-refresh-reentry-scope]
 
 permissions:
   contents: read
 
 concurrency:
-  group: http-refresh-reentry-ar-${{ github.ref }}
+  group: http-refresh-reentry-scope-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -16,13 +16,13 @@ env:
 
 jobs:
   qualify:
-    name: Apple / exact parallel Binary and probe isolation
+    name: Apple / matched refresh scope comparison
     runs-on: macos-26
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 18
+          fetch-depth: 2
           persist-credentials: false
 
       - uses: actions/checkout@v7
@@ -32,13 +32,15 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
 
-      - name: Replay the exact Binary leaf and isolate probe WMO
-        run: bash .github/diagnostics/http-refresh-reentry/run.sh s-parallel-followup
+      - name: Trace the exact parallel Binary fixture
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: bash .github/diagnostics/http-refresh-reentry/run-scope-attribution.sh
 
       - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: swift-http-refresh-reentry-s-parallel-followup-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swift-http-refresh-reentry-scope-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/refresh-reentry-evidence
           if-no-files-found: error
           include-hidden-files: true
