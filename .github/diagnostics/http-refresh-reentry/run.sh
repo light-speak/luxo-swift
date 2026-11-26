@@ -6,7 +6,8 @@ case "$phase" in test|performance) ;; *) exit 2 ;; esac
 cd "${GITHUB_WORKSPACE:?}"
 repo=$(pwd -P)
 base=d6578969bcef258141c7c99cb6cface30a22a0e2
-diagnostic_parent=1a1b3fc090e8dbe06ff309aab7d37d78cd452c22
+diagnostic_parent=611c80754edcdd5413fc7d1a67b4c9d7d6c1626d
+pq_initial=1a1b3fc090e8dbe06ff309aab7d37d78cd452c22
 initial_diagnostic=35e593a50854cc208ac52f8aad9e5be3f06b9138
 prior=c106719f7f78608173fcbe522f90064552f32b4a
 candidate=8dd7fd238fbbb4bd195f2083650174339946d50a
@@ -27,7 +28,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 test "$(git rev-parse HEAD)" = "${GITHUB_SHA:?}"
 test "$(git show -s --format=%P HEAD)" = "$diagnostic_parent"
-test "$(git show -s --format=%P "$diagnostic_parent")" = "$initial_diagnostic"
+test "$(git show -s --format=%P "$diagnostic_parent")" = "$pq_initial"
+test "$(git show -s --format=%P "$pq_initial")" = "$initial_diagnostic"
 test "$(git show -s --format=%P "$initial_diagnostic")" = "$base"
 test "$(uname -s)/$(uname -m)" = 'Darwin/arm64'
 test "${RUNNER_OS:?}/${RUNNER_ARCH:?}" = 'macOS/ARM64'
@@ -82,7 +84,7 @@ printf 'diagnosticHead=%s\nbase=%s\ncandidateTree=%s\nbaseSourceTree=%s\ncandida
 git -C "$sdk" diff --cached --name-status > "$out/changed-paths.txt"
 git -C "$sdk" diff --name-status "$prior" "$candidate" > "$out/changed-paths-from-p.txt"
 printf 'diagnosticParent=%s\npriorCandidateTree=%s\npriorCandidateSourceTree=%s\ncomparisonBaseTree=%s\ncomparisonBaseSourceTree=%s\noptimizationPatchSHA256=%s\n' \
-    "$diagnostic_parent" "$prior" "$prior_sources" "$prior" "$prior_sources" "$optimization_patch_digest" >> "$out/source.txt"
+    "$diagnostic_parent" "$prior" "$prior_sources" "$base" "$base_sources" "$optimization_patch_digest" >> "$out/source.txt"
 cp "$input/inputs.sha256" "$input/pins.json" "$out/"
 mkdir "$work/tmp"
 export TMPDIR="$work/tmp"
@@ -135,7 +137,7 @@ else
     flags=(-sdk "$sdk_path" -swift-version 6 -j 2 -module-cache-path "$work/module-cache" -target arm64-apple-macosx13.0
            -parse-as-library -O -whole-module-optimization -g -module-name LuxoClient)
     for arm in base next; do
-        tree=$prior
+        tree=$base
         if [ "$arm" = next ]; then tree=$candidate; fi
         checkout="$work/$arm"
         mkdir "$checkout"
