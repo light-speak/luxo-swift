@@ -298,6 +298,46 @@ final class HTTPBackendTests: XCTestCase {
         }
     }
 
+    func testRetiredRefreshReleasesTransportBeforeCallbackReturns() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let entered = expectation(description: "refresh entered")
+            let released = expectation(description: "transport released while refresh waits")
+            let returned = expectation(description: "retired callback returned")
+            let callbacks = RefreshBatch(entered: entered)
+            let owner = RequestReference()
+            var transport: HTTPTransport<Backend>? = HTTPTransport(
+                backend: Backend(onDeinit: { released.fulfill() }), token: "old")
+            owner.observe(try XCTUnwrap(transport))
+            transport?.setMode(mode)
+            try transport?.setSchema(["viewer": APISchema(id: 1)])
+            transport?.onTokenExpired = {
+                let token = await callbacks.receive()
+                returned.fulfill()
+                return token
+            }
+
+            let worker = Task { [transport] in
+                do {
+                    _ = try await XCTUnwrap(transport).call("viewer")
+                    XCTFail("cancelled \(mode) request succeeded")
+                } catch is CancellationError {
+                } catch {
+                    XCTFail("unexpected error: \(error)")
+                }
+            }
+            await fulfillment(of: [entered], timeout: 2)
+            worker.cancel()
+            await worker.value
+            transport = nil
+            await fulfillment(of: [released], timeout: 2)
+            XCTAssertFalse(owner.isRetained, "retired \(mode) callback retained its transport")
+            await callbacks.release()
+            await fulfillment(of: [returned], timeout: 2)
+            let calls = await callbacks.calls
+            XCTAssertEqual(calls, 1)
+        }
+    }
+
     func testDeadlineFinishesPendingRefreshAndIgnoresLateToken() async throws {
         for mode in [TransportMode.json, .binary] {
             let backend = Backend()
@@ -554,6 +594,12 @@ final class HTTPBackendTests: XCTestCase {
     private actor Backend: HTTPBackend {
         var tokens: [String?] = []
         var beforeFirstResponse: (@Sendable () -> Void)?
+        private let onDeinit: (@Sendable () -> Void)?
+
+        init(onDeinit: (@Sendable () -> Void)? = nil) { self.onDeinit = onDeinit }
+
+        deinit { onDeinit?() }
+
         func beforeFirstResponse(_ action: @escaping @Sendable () -> Void) {
             beforeFirstResponse = action
         }
@@ -826,6 +872,143 @@ extension HTTPBackendTests {
             let json = #"{"error":"Unauthorized","code":401,"message":"\#(message)"}"#
             return HTTPBackendResponse(status: 401, body: Data(json.utf8))
         }
+    }
+
+    func testRefreshCallbackReturnsItsNestedUnauthorizedErrorWithoutWaitingOnItself() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let arrived = expectation(description: "the protected request reached the backend")
+            let backend = ConcurrentUnauthorizedBackend(arrived: arrived)
+            await backend.release("first")
+            await backend.release("fresh")
+            let transport = try makeRefreshTransport(backend, mode: mode)
+            defer { transport.onTokenExpired = nil }
+            let refreshed = expectation(description: "one refresh callback ran")
+            refreshed.assertForOverFulfill = true
+            transport.onTokenExpired = { [weak transport] in
+                guard let transport else { return nil }
+                refreshed.fulfill()
+                do {
+                    _ = try await transport.call("fresh")
+                    XCTFail("the nested request must keep its original unauthorized error")
+                } catch let error as LuxoError {
+                    XCTAssertEqual(error.code, 401)
+                    XCTAssertEqual(error.name, "Unauthorized")
+                    XCTAssertEqual(error.message, "expired")
+                } catch { XCTFail("unexpected nested error: \(error)") }
+                return "renewed"
+            }
+
+            let result = try await transport.call("first")
+            XCTAssertEqual(result.mode, mode)
+            XCTAssertEqual(result.data, mode == .binary ? Data([84]) : Data("42".utf8))
+            await fulfillment(of: [arrived, refreshed], timeout: 1)
+            let attempts = await backend.attempts
+            XCTAssertEqual(attempts["fresh"]?.map(\.token), ["Bearer old"])
+            XCTAssertEqual(attempts["first"]?.map(\.token), ["Bearer old", "Bearer renewed"])
+        }
+    }
+
+    func testNestedTransportRefreshKeepsTheAncestorUnauthorizedError() async throws {
+        for mode in [TransportMode.json, .binary] {
+            let firstArrived = expectation(description: "first transport received its call")
+            let secondArrived = expectation(description: "second transport received its call")
+            let firstBackend = ConcurrentUnauthorizedBackend(arrived: firstArrived)
+            let secondBackend = ConcurrentUnauthorizedBackend(arrived: secondArrived)
+            await firstBackend.release("first")
+            await firstBackend.release("fresh")
+            await secondBackend.release("second")
+            let first = try makeRefreshTransport(firstBackend, mode: mode)
+            let second = try makeRefreshTransport(secondBackend, mode: mode)
+            defer {
+                first.onTokenExpired = nil
+                second.onTokenExpired = nil
+            }
+            let expected = mode == .binary ? Data([84]) : Data("42".utf8)
+            first.onTokenExpired = { [weak second] in
+                guard let second else { return nil }
+                do {
+                    let result = try await second.call("second")
+                    XCTAssertEqual(result.data, expected)
+                    return "first-renewed"
+                } catch {
+                    XCTFail("the second transport could not finish its refresh: \(error)")
+                    return nil
+                }
+            }
+            second.onTokenExpired = { [weak first] in
+                guard let first else { return nil }
+                do {
+                    _ = try await first.call("fresh")
+                    XCTFail("the ancestor transport's nested call must remain unauthorized")
+                } catch let error as LuxoError {
+                    XCTAssertEqual(error.code, 401)
+                    XCTAssertEqual(error.name, "Unauthorized")
+                    XCTAssertEqual(error.message, "expired")
+                } catch { XCTFail("unexpected ancestor error: \(error)") }
+                return "second-renewed"
+            }
+
+            let result = try await first.call("first")
+            XCTAssertEqual(result.data, expected)
+            await fulfillment(of: [firstArrived, secondArrived], timeout: 1)
+            let firstAttempts = await firstBackend.attempts
+            let secondAttempts = await secondBackend.attempts
+            XCTAssertEqual(firstAttempts["fresh"]?.map(\.token), ["Bearer old"])
+            XCTAssertEqual(firstAttempts["first"]?.map(\.token), ["Bearer old", "Bearer first-renewed"])
+            XCTAssertEqual(secondAttempts["second"]?.map(\.token), ["Bearer old", "Bearer second-renewed"])
+        }
+    }
+
+    func testTaskInheritingRetiredRefreshCanRefreshTheNewCredentialRevision() async throws {
+        for mode in [TransportMode.json, .binary] {
+            try await verifyRetiredRefreshDescendant(mode)
+        }
+    }
+
+    private func verifyRetiredRefreshDescendant(_ mode: TransportMode) async throws {
+        let arrived = expectation(description: "the protected request reached the backend")
+        let backend = ConcurrentUnauthorizedBackend(arrived: arrived)
+        await backend.release("first")
+        await backend.release("fresh")
+        let transport = try makeRefreshTransport(backend, mode: mode)
+        defer { transport.onTokenExpired = nil }
+        let oldRefresh = RefreshGate()
+        let allowDescendant = RefreshGate()
+        let retiredRefreshEntered = expectation(description: "original refresh spawned a descendant")
+        let descendantFinished = expectation(description: "descendant retried under the new revision")
+        let newRefreshRan = expectation(description: "new revision triggered its own refresh")
+        newRefreshRan.assertForOverFulfill = true
+        transport.onTokenExpired = { [weak transport] in
+            guard let transport else { return nil }
+            Task {
+                defer { descendantFinished.fulfill() }
+                _ = await allowDescendant.wait()
+                do {
+                    let result = try await transport.call("fresh")
+                    XCTAssertEqual(result.data, mode == .binary ? Data([84]) : Data("42".utf8))
+                } catch { XCTFail("the retired refresh blocked a subsequent refresh: \(error)") }
+            }
+            retiredRefreshEntered.fulfill()
+            return await oldRefresh.wait()
+        }
+
+        let first = Task { try await transport.call("first") }
+        await fulfillment(of: [arrived, retiredRefreshEntered], timeout: 2)
+        transport.setToken("old")
+        transport.onTokenExpired = {
+            newRefreshRan.fulfill()
+            return "renewed"
+        }
+        await allowDescendant.release()
+        switch await first.result {
+        case .success: XCTFail("the retired refresh retried its original call")
+        case .failure(let error): XCTAssertEqual((error as? LuxoError)?.code, 401)
+        }
+        await fulfillment(of: [descendantFinished, newRefreshRan], timeout: 6)
+        await oldRefresh.release()
+        let attempts = await backend.attempts
+        XCTAssertEqual(attempts["first"]?.map(\.token), ["Bearer old"])
+        XCTAssertEqual(attempts["fresh"]?.map(\.token), ["Bearer old", "Bearer renewed"])
     }
 
     func testThreeRequestsShareRefreshAndLate401RetriesOnlyOnce() async throws {

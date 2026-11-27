@@ -15,6 +15,23 @@ public struct HTTPBackendResponse: Sendable {
     }
 }
 
+private class HTTPRefreshContext: @unchecked Sendable {
+    @TaskLocal static var current: HTTPRefreshContext? = nil
+
+    private let inherited: HTTPRefreshContext?
+
+    init() { inherited = HTTPRefreshContext.current }
+
+    static func contains(_ refresh: HTTPRefreshContext) -> Bool {
+        var ancestor = current
+        while let context = ancestor {
+            if context === refresh { return true }
+            ancestor = context.inherited
+        }
+        return false
+    }
+}
+
 public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Sendable {
     private final class CredentialRevision: @unchecked Sendable {
         private let original: CredentialRevision?
@@ -56,13 +73,16 @@ public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Se
         }
     }
 
-    private final class Refresh: @unchecked Sendable {
-        let handler: () async -> String?
+    private final class Refresh: HTTPRefreshContext, @unchecked Sendable {
         // The transport lock protects registration, retirement and settlement.
         var waiters = RefreshWaiters()
         var task: Task<Void, Never>?
+    }
 
-        init(handler: @escaping () async -> String?) { self.handler = handler }
+    // One worker owns this snapshot of the configured callback. The inherited refresh context does not retain it.
+    private struct RefreshCallback: @unchecked Sendable {
+        weak var transport: HTTPTransport?
+        let call: () async -> String?
     }
 
     private final class RefreshWaiter: @unchecked Sendable {
@@ -205,17 +225,20 @@ public final class HTTPTransport<Backend: HTTPBackend>: Transport, @unchecked Se
         if let succeeded = revision.refreshSucceeded { return .success(succeeded) }
         let key = ObjectIdentifier(waiter)
         if let refresh = activeRefresh {
+            // An ancestor callback cannot finish while the nested call waits for it.
+            guard !HTTPRefreshContext.contains(refresh) else { return .success(false) }
             refresh.waiters.insert(continuation, for: key)
             return nil
         }
         guard let handler = tokenExpiredHandler else { return .success(false) }
-        let refresh = Refresh(handler: handler)
+        let refresh = Refresh()
         refresh.waiters.insert(continuation, for: key)
         activeRefresh = refresh
-        refresh.task = Task { [weak self] in
-            guard self?.mayStartRefresh(refresh) == true else { return }
-            let token = await refresh.handler()
-            self?.finishRefresh(refresh, token: token, cancelled: Task.isCancelled)
+        let callback = RefreshCallback(transport: self, call: handler)
+        refresh.task = Task { [callback] in
+            guard callback.transport?.mayStartRefresh(refresh) == true else { return }
+            let token = await HTTPRefreshContext.$current.withValue(refresh, operation: callback.call)
+            callback.transport?.finishRefresh(refresh, token: token, cancelled: Task.isCancelled)
         }
         return nil
     }
