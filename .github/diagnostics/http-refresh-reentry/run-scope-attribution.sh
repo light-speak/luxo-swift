@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 input=$(cd "$(dirname "$0")" && pwd -P)
 repo=$(cd "$input/../../.." && pwd -P)
-parent=a708313111e2dd60c97c2b1ccefd9d8f2b8d3b58
+parent=90498ca583863641cd7c230ff4c2c15e86a5ad9b
 a=d6578969bcef258141c7c99cb6cface30a22a0e2
 a_tree=49921cd4b64e1b0fefef5d8440c1496406c3166e
 a_client=dbdaed8acd534ea691215f839b6e57a4504c333a
@@ -30,7 +30,7 @@ if [[ "$mode" == --verify ]]; then
     cd "$repo"
     test "$(git rev-parse HEAD)" = "$parent"
 else
-    test "$#" = 0 || { test "$#" = 1 && test "$mode" = --expiry-json; }
+    test "$#" = 0 || { test "$#" = 1 && [[ "$mode" == --expiry-json || "$mode" == --remaining-refresh ]]; }
     verify_only=false
     cd "$repo"
     product="$repo/.tmp/s-product"
@@ -167,9 +167,9 @@ compare_actual_product() (
     cat "$destination/placement-count.txt" >> "$out/status.txt"
 )
 
-if [[ "$mode" == --expiry-json ]]; then
+if [[ "$mode" == --expiry-json || "$mode" == --remaining-refresh ]]; then
     printf 'matched=true\n' > "$out/status.txt"
-    compare_actual_product expiry-json ""
+    compare_actual_product "${mode#--}" ""
     exit 0
 fi
 

@@ -1,4 +1,4 @@
-name: Attribute the Swift #11 expiry JSON allocation window
+name: Attribute Swift #11 parallel JSON and expiry Binary allocation windows
 
 on:
   push:
@@ -39,15 +39,15 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Trace the real expiry JSON fixture in both executable placements
+      - name: Trace both refresh fixtures in both executable placements
         env:
           RUNNER_KIND: ${{ runner.environment }}
-        run: bash .github/diagnostics/http-refresh-reentry/run-scope-attribution.sh --expiry-json
+        run: bash .github/diagnostics/http-refresh-reentry/run-scope-attribution.sh --remaining-refresh
 
       - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: swift-http-refresh-expiry-window-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swift-http-refresh-remaining-window-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/refresh-reentry-evidence
           if-no-files-found: error
           include-hidden-files: true
