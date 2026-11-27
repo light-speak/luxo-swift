@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 input=$(cd "$(dirname "$0")" && pwd -P)
 repo=$(cd "$input/../../.." && pwd -P)
-parent=90498ca583863641cd7c230ff4c2c15e86a5ad9b
+parent=a4fa801e267999ca00dee4a244602ed678c2cb04
 a=d6578969bcef258141c7c99cb6cface30a22a0e2
 a_tree=49921cd4b64e1b0fefef5d8440c1496406c3166e
 a_client=dbdaed8acd534ea691215f839b6e57a4504c333a
@@ -30,7 +30,7 @@ if [[ "$mode" == --verify ]]; then
     cd "$repo"
     test "$(git rev-parse HEAD)" = "$parent"
 else
-    test "$#" = 0 || { test "$#" = 1 && [[ "$mode" == --expiry-json || "$mode" == --remaining-refresh ]]; }
+    test "$#" = 0 || { test "$#" = 1 && [[ "$mode" == --expiry-json || "$mode" == --remaining-refresh || "$mode" == --remaining-scope ]]; }
     verify_only=false
     cd "$repo"
     product="$repo/.tmp/s-product"
@@ -45,7 +45,7 @@ else
     git --no-replace-objects diff --name-status "$parent" HEAD > "$out/diagnostic-paths.txt"
     diff -u "$out/diagnostic-paths.txt" - <<'PATHS'
 M	.github/diagnostics/http-refresh-reentry/inputs.sha256
-M	.github/diagnostics/http-refresh-reentry/qualify-s-cold-attribution.py
+M	.github/diagnostics/http-refresh-reentry/qualify-scope.py
 M	.github/diagnostics/http-refresh-reentry/run-scope-attribution.sh
 M	.github/workflows/diagnose-http-refresh-reentry.yml
 PATHS
@@ -197,7 +197,9 @@ done
 shasum -a 256 Probe.swift measure.py verify-timing.py allocation-helper.py base-sources.sha256 \
     next-sources.sha256 toolchain.txt bin/base bin/next > binding.sha256
 cp binding.sha256 "$out/"
-if python3 -I -B qualify-scope.py "$out" 2>&1 | tee "$out/allocations.log"; then
+scope_args=()
+if [[ "$mode" == --remaining-scope ]]; then scope_args+=("$mode"); fi
+if python3 -I -B qualify-scope.py "${scope_args[@]}" "$out" 2>&1 | tee "$out/allocations.log"; then
     scope_status=0
 else
     scope_status=$?
@@ -207,5 +209,5 @@ if [[ -f "$out/scope-count.txt" ]]; then
     cat "$out/scope-count.txt" >> "$out/status.txt"
 fi
 
-compare_actual_product normal-off "$perf/bin/base"
+if [[ "$mode" != --remaining-scope ]]; then compare_actual_product normal-off "$perf/bin/base"; fi
 exit "$scope_status"

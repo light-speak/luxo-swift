@@ -24,6 +24,8 @@ MANIFESTS = {
 SLAB_FIELDS = ("total1016", "probeMain1016", "registerRefresh1016", "other1016")
 WORKLOADS = (("single", "binary", 24, 48), ("single", "json", 24, 48),
              ("expiry", "json", 72, 144))
+REMAINING_WORKLOADS = (("parallel-one", "json", 72, 96), ("expiry", "binary", 72, 144))
+MATCH = "one 1016-byte Probe.main slab per refresh removed by scope ablation in both layouts"
 
 
 def read_driver(name):
@@ -50,12 +52,15 @@ def classify(samples, scenario, codec, counts):
     if all(pair["total1016"] == pair["probeMain1016"] == -counts["refreshes"]
            and pair["registerRefresh1016"] == pair["other1016"] == 0
            for layout in deltas.values() for pair in layout["AS"]):
-        return "one 1016-byte Probe.main slab per refresh removed by scope ablation in both layouts", deltas, True
+        return MATCH, deltas, True
     return "scope ablation did not consistently remove that slab in both layouts", deltas, True
 
 
 def main():
-    out = Path(sys.argv[1]).resolve(strict=True)
+    remaining = len(sys.argv) == 3 and sys.argv[1] == "--remaining-scope"
+    assert len(sys.argv) == 2 or remaining
+    out = Path(sys.argv[-1]).resolve(strict=True)
+    workloads = REMAINING_WORKLOADS if remaining else WORKLOADS
     driver = read_driver("qualify-s-parallel-followup.py")
     measure = read_driver("measure.py")
     placement = read_driver("qualify-r-hot-placement.py")
@@ -69,7 +74,7 @@ def main():
     runtime = placement["runtime"]()
     valid = True
     pairs = 0
-    for scenario, codec, successes, sends in WORKLOADS:
+    for scenario, codec, successes, sends in workloads:
         counts = dict(iterations=24, successes=successes, sends=sends, refreshes=24)
         leaf = out / f"{scenario}-{codec}"
         leaf.mkdir()
@@ -91,8 +96,8 @@ def main():
                       expectedOperationCounts=counts, slabDeltas=deltas, controlsStable=controls, verdict=verdict)
         (leaf / "scope-allocations.json").write_text(json.dumps(result, separators=(",", ":")) + "\n")
         print(f"{scenario}/{codec}: {verdict}", flush=True)
-        valid &= controls
-    assert pairs == 108
+        valid &= controls and (not remaining or verdict == MATCH)
+    assert pairs == 36 * len(workloads)
     (out / "scope-count.txt").write_text(f"scope_pairs={pairs}\n")
     return 0 if valid else 1
 

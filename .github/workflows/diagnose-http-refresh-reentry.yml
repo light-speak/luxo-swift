@@ -1,4 +1,4 @@
-name: Attribute Swift #11 parallel JSON and expiry Binary allocation windows
+name: Isolate Swift #11 parallel JSON and expiry Binary refresh scope
 
 on:
   push:
@@ -39,15 +39,15 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Trace both refresh fixtures in both executable placements
+      - name: Trace both refresh fixtures with and without TaskLocal scope
         env:
           RUNNER_KIND: ${{ runner.environment }}
-        run: bash .github/diagnostics/http-refresh-reentry/run-scope-attribution.sh --remaining-refresh
+        run: bash .github/diagnostics/http-refresh-reentry/run-scope-attribution.sh --remaining-scope
 
       - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: swift-http-refresh-remaining-window-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swift-http-refresh-remaining-scope-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/refresh-reentry-evidence
           if-no-files-found: error
           include-hidden-files: true
